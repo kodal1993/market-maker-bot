@@ -1,0 +1,48 @@
+{
+  "defaults": {
+    "allow_private_tx": true,
+    "allow_cow": false,
+    "allow_guarded_public": true,
+    "public_swap_max_risk": 40.0,
+    "mev_risk_threshold_block": 70.0,
+    "max_quote_deviation_bps": 35.0,
+    "max_twap_deviation_bps": 55.0,
+    "max_price_impact_bps": 45.0,
+    "max_slippage_bps": 40.0,
+    "max_gas_spike_gwei": 35.0,
+    "max_single_swap_usd": 125.0,
+    "slice_count_max": 4,
+    "slice_delay_ms": 250
+  },
+  "profiles": {
+    "safe": {
+      "public_swap_max_risk": 25.0,
+      "max_slippage_bps": 18.0,
+      "max_quote_deviation_bps": 20.0,
+      "max_price_impact_bps": 25.0
+    },
+    "balanced": {
+      "public_swap_max_risk": 40.0,
+      "max_slippage_bps": 40.0
+    },
+    "aggressive": {
+      "public_swap_max_risk": 55.0,
+      "max_slippage_bps": 60.0,
+      "max_quote_deviation_bps": 50.0
+    }
+  },
+  "pairs": {
+    "WETH/USDC": {
+      "cow_supported": false,
+      "cow_min_notional_usd": 150.0,
+      "liquidity_hint_usd": 3000000.0,
+      "preferred_mode": ""
+    }
+  },
+  "routers": {
+    "uniswap_v3": {
+      "allow_guarded_public": true,
+      "slice_delay_ms": 200
+    }
+  }
+}
