@@ -203,6 +203,12 @@ class ActivityTuningConfig:
     auto_loosen_entry_bps: float
     auto_loosen_min_edge_bps: float
     prioritize_range_mode_when_low_activity: bool
+    inactivity_force_entry_minutes: float
+    inactivity_force_entry_threshold_bps: float
+    inactivity_force_min_edge_bps: float
+    inactivity_force_size_multiplier: float
+    allow_micro_edge_entries: bool
+    micro_edge_min_bps: float
 
 
 @dataclass(frozen=True)

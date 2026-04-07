@@ -12,6 +12,7 @@ from bot_runner import (
     trade_log_headers,
 )
 from config import (
+    BOT_CONFIG_PROFILE,
     LOOP_SECONDS,
     MAX_LOOPS,
     TRADES_CSV,
@@ -168,7 +169,7 @@ def main():
         report = build_report(
             summary,
             run_label=Path(TRADES_CSV).stem,
-            variant="paper_live",
+            variant=f"paper_live_{BOT_CONFIG_PROFILE}",
             trade_history_path=str(trades_path),
             equity_curve_path=str(equity_path),
         )

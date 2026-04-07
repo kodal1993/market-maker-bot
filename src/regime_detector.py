@@ -196,6 +196,7 @@ class RegimeDetector:
                 window_low=default_features.window_low,
                 window_mean=default_features.window_mean,
                 price_position_pct=default_features.price_position_pct,
+                shock_active=shock_active,
             )
 
         strong_directional_trend = (
@@ -334,4 +335,5 @@ class RegimeDetector:
             window_low=round(active_features.window_low, 6),
             window_mean=round(active_features.window_mean, 6),
             price_position_pct=round(active_features.price_position_pct, 6),
+            shock_active=shock_active,
         )

@@ -51,6 +51,7 @@ LOSS_STREAK_SENSITIVE_REASONS = {
     "inventory_rebalance",
     "partial_reset",
     "range_buy",
+    "inactivity_range_buy",
     "quoted_sell",
     "range_sell",
     "mean_reversion_exit",
@@ -76,6 +77,7 @@ PASSIVE_BUY_REASONS = {
     "trend_buy",
     "partial_reset",
     "range_buy",
+    "inactivity_range_buy",
 }
 
 

@@ -36,6 +36,14 @@ def extract_signal_log_fields(filter_values: str) -> dict[str, object]:
         "entry_threshold_bps": _rounded_or_blank(payload.get("entry_threshold_bps")),
         "min_edge_bps": _rounded_or_blank(payload.get("min_edge_bps")),
         "inventory_drift_pct": _rounded_or_blank(payload.get("inventory_drift_pct")),
+        "signal_block_reason": str(
+            payload.get("signal_block_reason")
+            or payload.get("gate_blocked_reason")
+            or payload.get("trade_blocked_reason")
+            or payload.get("block_reason")
+            or ""
+        ),
+        "inactivity_fallback_active": bool(payload.get("inactivity_fallback_active")),
         "trade_blocked_reason": str(
             payload.get("trade_blocked_reason")
             or payload.get("gate_blocked_reason")
@@ -61,6 +69,8 @@ def trade_log_headers() -> list[str]:
         "entry_threshold_bps",
         "min_edge_bps",
         "inventory_drift_pct",
+        "signal_block_reason",
+        "inactivity_fallback_active",
         "side",
         "execution_type",
         "execution_mode",
@@ -82,12 +92,15 @@ def trade_log_headers() -> list[str]:
         "fee_usd",
         "slippage_bps",
         "trade_reason",
+        "regime",
         "active_regime",
         "trend_direction",
         "volatility_bucket",
         "inventory_state",
         "trigger_reason",
+        "entry_reason",
         "exit_reason",
+        "used_fallback_mode",
         "entry_edge_bps",
         "entry_edge_usd",
         "hold_minutes",
@@ -112,6 +125,8 @@ def equity_log_headers() -> list[str]:
         "entry_threshold_bps",
         "min_edge_bps",
         "inventory_drift_pct",
+        "signal_block_reason",
+        "inactivity_fallback_active",
         "feed_state",
         "regime",
         "volatility_state",
@@ -251,6 +266,8 @@ def log_cycle(
     entry_threshold_bps = getattr(runtime, "current_entry_threshold_bps", 0.0)
     min_edge_bps = getattr(runtime, "current_min_edge_bps", 0.0)
     inventory_drift_pct = getattr(runtime, "current_inventory_drift_pct", 0.0)
+    inactivity_fallback_active = getattr(runtime, "current_inactivity_fallback_active", False)
+    signal_block_reason = getattr(runtime, "current_signal_block_reason", "") or gate_reason
     trade_blocked_reason = (
         getattr(runtime.last_execution_analytics, "trade_blocked_reason", "")
         or getattr(gate, "blocked_reason", "")
@@ -276,6 +293,8 @@ def log_cycle(
         f"activity {getattr(runtime, 'current_activity_state', 'normal')} | regime_conf {regime_confidence:.1f} | "
         f"entry_threshold_bps {entry_threshold_bps:.2f} | min_edge_bps {min_edge_bps:.2f} | "
         f"inventory_drift_pct {inventory_drift_pct:+.2f} | "
+        f"signal_block_reason {signal_block_reason or '-'} | "
+        f"inactivity_fallback_active {inactivity_fallback_active} | "
         f"upper_tf {upper_tf_bias} | confirm {confirmation_text} | "
         f"edge {edge_score:.1f} | exp_edge {expected_edge_usd:.4f} | "
         f"gate {gate_text} | gate_reason {gate_reason} | trade_blocked_reason {trade_blocked_reason} | "
@@ -425,6 +444,8 @@ def append_equity_row(
             signal_fields["entry_threshold_bps"],
             signal_fields["min_edge_bps"],
             signal_fields["inventory_drift_pct"],
+            signal_fields["signal_block_reason"],
+            int(signal_fields["inactivity_fallback_active"]),
             feed_state,
             regime,
             volatility_state,
@@ -505,12 +526,15 @@ def append_trade_row(
     entry_price: float | None,
     exit_price: float | None,
     max_profit_during_trade: float | None,
+    regime: str,
     active_regime: str,
     trend_direction: str,
     volatility_bucket: str,
     inventory_state: str,
+    entry_reason: str,
     trigger_reason: str,
     exit_reason: str,
+    used_fallback_mode: bool,
     entry_edge_bps: float,
     entry_edge_usd: float,
     hold_minutes: float,
@@ -538,6 +562,8 @@ def append_trade_row(
             signal_fields["entry_threshold_bps"],
             signal_fields["min_edge_bps"],
             signal_fields["inventory_drift_pct"],
+            signal_fields["signal_block_reason"],
+            int(signal_fields["inactivity_fallback_active"]),
             fill.side,
             fill.execution_type,
             execution_analytics.execution_mode,
@@ -559,12 +585,15 @@ def append_trade_row(
             round(fill.fee_usd, 6),
             round(fill.slippage_bps, 6),
             trade_reason_category(mode, fill.trade_reason),
+            regime,
             active_regime,
             trend_direction,
             volatility_bucket,
             inventory_state,
             trigger_reason,
+            entry_reason,
             exit_reason,
+            int(used_fallback_mode),
             round(entry_edge_bps, 6),
             round(entry_edge_usd, 6),
             round(hold_minutes, 6),

@@ -186,7 +186,7 @@ def trade_reason_category(mode: str, trade_reason: str) -> str:
         return "force_trade"
     if trade_reason == "trend_buy":
         return "trend"
-    if trade_reason in {"range_buy", "range_sell", "mean_reversion_exit"}:
+    if trade_reason in {"range_buy", "inactivity_range_buy", "range_sell", "mean_reversion_exit"}:
         return "mean_reversion"
     if trade_reason == "trend_rally_sell":
         return "trend"

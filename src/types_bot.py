@@ -178,6 +178,7 @@ class MarketRegimeAssessment:
     window_low: float = 0.0
     window_mean: float = 0.0
     price_position_pct: float = 0.5
+    shock_active: bool = False
 
 
 @dataclass(frozen=True)

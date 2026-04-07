@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from config import (
+    BOT_CONFIG_PROFILE,
     BOT_MODE,
     CONFIRMATION_TIMEFRAME_SECONDS,
     DECISION_ENGINE_ENABLED,
@@ -15,7 +16,11 @@ from config import (
     ETH_PRESERVATION_FLOOR_MULTIPLIER,
     EXECUTION_TIMEFRAME_SECONDS,
     EXECUTION_ENGINE_ENABLED,
+    EXECUTION_REQUOTE_INTERVAL_MS,
+    EXECUTION_STALE_QUOTE_TIMEOUT_MS,
     FORCE_TRADE_SIZE_FRACTION,
+    INACTIVITY_FORCE_ENTRY_MINUTES,
+    INACTIVITY_FORCE_SIZE_MULTIPLIER,
     INVENTORY_FORCED_REDUCE_AGGRESSION_BPS,
     INVENTORY_NEUTRAL_BAND_PCT,
     INVENTORY_SKEW_ACCELERATION,
@@ -45,6 +50,8 @@ from config import (
     RANGE_ENTRY_MAX_POSITION_PCT,
     RANGE_EXIT_MIN_POSITION_PCT,
     RANGE_MEAN_REVERSION_EXIT_POSITION_PCT,
+    RANGE_MIN_EDGE_BPS,
+    REGIME_MAX_WICK_TO_BODY_RATIO,
     REENTRY_ENGINE_ENABLED,
     REENTRY_INVENTORY_BUFFER_PCT,
     REENTRY_MAX_MISS_BUY_FRACTION,
@@ -273,6 +280,8 @@ class BotRuntime:
     current_zone: str = "mid"
     current_volatility_bucket: str = "NORMAL"
     current_activity_state: str = "normal"
+    current_inactivity_fallback_active: bool = False
+    current_signal_block_reason: str = ""
     current_inventory_limit_state: str = "normal"
     current_soft_inventory_limit_usd: float = 0.0
     current_hard_inventory_limit_usd: float = 0.0
@@ -286,6 +295,9 @@ class BotRuntime:
     open_position_reason: str = ""
     open_position_regime: str = ""
     open_position_price: float = 0.0
+    open_position_entry_edge_bps: float = 0.0
+    open_position_entry_edge_usd: float = 0.0
+    open_position_used_fallback: bool = False
     current_drawdown_pct: float = 0.0
     drawdown_guard_stage: str = "normal"
     daily_reset_date: str = ""
@@ -1063,10 +1075,20 @@ def _record_trade_gate(
     block_reason: str = "",
     filter_values: dict[str, object] | None = None,
 ) -> None:
+    signal_block_reason = ""
+    gate = runtime.current_signal_gate_decision
+    if not allow_trade:
+        signal_block_reason = (
+            block_reason
+            or (gate.blocked_reason if gate is not None and not gate.allow_trade else "")
+            or runtime.last_execution_analytics.trade_blocked_reason
+            or runtime.last_decision_reason
+            or "trade_blocked"
+        )
     trade_blocked_reason = ""
     if not allow_trade:
         trade_blocked_reason = (
-            block_reason
+            signal_block_reason
             or runtime.last_execution_analytics.trade_blocked_reason
             or runtime.last_decision_reason
             or "trade_blocked"
@@ -1089,9 +1111,11 @@ def _record_trade_gate(
     )
     normalized_filter_values = _merge_filter_values(
         normalized_filter_values,
+        signal_block_reason=signal_block_reason,
         trade_blocked_reason=trade_blocked_reason,
     )
     runtime.last_allow_trade = allow_trade
+    runtime.current_signal_block_reason = signal_block_reason
     runtime.last_decision_block_reason = block_reason
     runtime.last_filter_values = _serialize_filter_values(normalized_filter_values)
 
@@ -1141,6 +1165,8 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
         "entry_threshold_bps": round(runtime.current_entry_threshold_bps, 6),
         "min_edge_bps": round(runtime.current_min_edge_bps, 6),
         "inventory_drift_pct": round(runtime.current_inventory_drift_pct, 6),
+        "signal_block_reason": runtime.current_signal_block_reason,
+        "inactivity_fallback_active": runtime.current_inactivity_fallback_active,
         "hold_minutes": round(runtime.current_hold_minutes, 6),
         "raw_signal": runtime.last_raw_signal,
         "trade_blocked_reason": trade_blocked_reason,
@@ -1323,7 +1349,18 @@ def _apply_runtime_regime_context(
         runtime.current_range_location = "middle"
     runtime.current_zone = resolve_logging_zone(runtime.current_range_location)
     runtime.current_volatility_bucket = getattr(intelligence, "volatility_state", "NORMAL")
-    runtime.current_activity_state = getattr(intelligence, "activity_state", "normal")
+    runtime.current_inactivity_fallback_active = _inactivity_fallback_allowed(
+        runtime,
+        intelligence=intelligence,
+        regime_assessment=regime_assessment,
+        inventory_profile=inventory_profile,
+        cycle_index=cycle_index,
+    )
+    runtime.current_activity_state = "inactivity_fallback" if runtime.current_inactivity_fallback_active else getattr(
+        intelligence,
+        "activity_state",
+        "normal",
+    )
     runtime.current_entry_threshold_bps = resolve_effective_entry_threshold_bps(
         runtime.current_active_regime,
         runtime.current_volatility_bucket,
@@ -1350,7 +1387,49 @@ def _apply_runtime_regime_context(
     runtime.inventory_drift_samples += 1
 
 
+def _range_entry_distance_bps(regime_assessment: MarketRegimeAssessment | None) -> float:
+    if regime_assessment is None:
+        return 0.0
+    return max(-(regime_assessment.mean_reversion_distance_pct * 100.0), 0.0)
+
+
+def _inactivity_fallback_allowed(
+    runtime: BotRuntime,
+    *,
+    intelligence,
+    regime_assessment: MarketRegimeAssessment | None,
+    inventory_profile,
+    cycle_index: int,
+) -> bool:
+    if regime_assessment is None or inventory_profile is None:
+        return False
+    if INACTIVITY_FORCE_ENTRY_MINUTES <= 0:
+        return False
+    if _intelligence_active_regime(intelligence) != "RANGE":
+        return False
+    if regime_assessment.execution_regime != "RANGE":
+        return False
+    if _minutes_since_last_trade(runtime, cycle_index) < INACTIVITY_FORCE_ENTRY_MINUTES:
+        return False
+    if str(getattr(intelligence, "volatility_state", "")).upper() == "EXTREME":
+        return False
+    if regime_assessment.market_regime == "CHOP":
+        return False
+    if getattr(regime_assessment, "shock_active", False):
+        return False
+    if regime_assessment.body_to_wick_ratio > max(REGIME_MAX_WICK_TO_BODY_RATIO, 0.0):
+        return False
+    if regime_assessment.volatility_score >= 85.0:
+        return False
+    if getattr(inventory_profile, "hard_limit_hit", False):
+        return False
+    if getattr(inventory_profile, "reduction_only", False):
+        return False
+    return True
+
+
 def _range_entry_signal_allowed(
+    runtime: BotRuntime,
     *,
     intelligence,
     regime_assessment: MarketRegimeAssessment | None,
@@ -1364,7 +1443,9 @@ def _range_entry_signal_allowed(
         return False
     if regime_assessment.execution_regime != "RANGE":
         return False
-    if regime_assessment.price_position_pct > RANGE_ENTRY_MAX_POSITION_PCT:
+    if regime_assessment.range_location not in {"bottom", "lower"}:
+        return False
+    if _range_entry_distance_bps(regime_assessment) < max(runtime.current_entry_threshold_bps, 0.0):
         return False
     if in_cooldown or state_requires_reentry_only or not buy_state_allowed:
         return False
@@ -1519,7 +1600,7 @@ def _apply_signal_pipeline(
         cycle_seconds=runtime.cycle_seconds,
         last_sell_price=runtime.reentry_state.last_sell_price,
         current_profit_pct=runtime.last_profit_pct,
-        min_edge_multiplier=getattr(intelligence, "min_edge_multiplier", 1.0),
+        min_edge_multiplier=max(runtime.current_min_edge_bps / max(RANGE_MIN_EDGE_BPS, 0.5), 0.35),
     )
     runtime.current_edge_assessment = edge_assessment
     runtime.current_entry_edge_bps = edge_assessment.expected_edge_bps
@@ -2240,7 +2321,7 @@ def _append_trade_row(
     fill,
     portfolio: Portfolio,
     execution_analytics: ExecutionAnalyticsRecord,
-    trade_analysis: dict[str, float | None] | None = None,
+    trade_analysis: dict[str, object] | None = None,
 ) -> None:
     trade_analysis = trade_analysis or {}
     logging_helpers.append_trade_row(
@@ -2260,12 +2341,15 @@ def _append_trade_row(
         trade_analysis.get("entry_price"),
         trade_analysis.get("exit_price"),
         trade_analysis.get("max_profit_during_trade"),
+        str(trade_analysis.get("regime", "")),
         str(trade_analysis.get("active_regime", "")),
         str(trade_analysis.get("trend_direction", "")),
         str(trade_analysis.get("volatility_bucket", "")),
         str(trade_analysis.get("inventory_state", "")),
+        str(trade_analysis.get("entry_reason", "")),
         str(trade_analysis.get("trigger_reason", "")),
         str(trade_analysis.get("exit_reason", "")),
+        bool(trade_analysis.get("used_fallback_mode", False)),
         float(trade_analysis.get("entry_edge_bps") or 0.0),
         float(trade_analysis.get("entry_edge_usd") or 0.0),
         float(trade_analysis.get("hold_minutes") or 0.0),
@@ -2273,24 +2357,27 @@ def _append_trade_row(
     )
 
 
-def _blank_trade_analysis() -> dict[str, float | None]:
+def _blank_trade_analysis() -> dict[str, object]:
     return {
         "entry_price": None,
         "exit_price": None,
         "max_profit_during_trade": None,
         "active_regime": None,
+        "regime": None,
         "trend_direction": None,
         "volatility_bucket": None,
         "inventory_state": None,
+        "entry_reason": None,
         "trigger_reason": None,
         "exit_reason": None,
+        "used_fallback_mode": False,
         "entry_edge_bps": None,
         "entry_edge_usd": None,
         "hold_minutes": None,
     }
 
 
-def _resolve_trade_analysis(runtime: BotRuntime, cycle_index: int, fill) -> dict[str, float | None]:
+def _resolve_trade_analysis(runtime: BotRuntime, cycle_index: int, fill) -> dict[str, object]:
     if not fill or not fill.filled:
         return _blank_trade_analysis()
 
@@ -2301,11 +2388,14 @@ def _resolve_trade_analysis(runtime: BotRuntime, cycle_index: int, fill) -> dict
             "exit_price": None,
             "max_profit_during_trade": 0.0,
             "active_regime": runtime.current_active_regime,
+            "regime": runtime.current_active_regime,
             "trend_direction": runtime.current_trend_direction,
             "volatility_bucket": runtime.current_volatility_bucket,
             "inventory_state": runtime.current_inventory_state,
+            "entry_reason": fill.trade_reason,
             "trigger_reason": fill.trade_reason,
             "exit_reason": "",
+            "used_fallback_mode": runtime.current_inactivity_fallback_active,
             "entry_edge_bps": runtime.current_entry_edge_bps,
             "entry_edge_usd": runtime.current_entry_edge_usd,
             "hold_minutes": 0.0,
@@ -2325,13 +2415,16 @@ def _resolve_trade_analysis(runtime: BotRuntime, cycle_index: int, fill) -> dict
         "exit_price": fill.price,
         "max_profit_during_trade": max_profit_during_trade,
         "active_regime": runtime.current_active_regime,
+        "regime": runtime.open_position_regime or runtime.current_active_regime,
         "trend_direction": runtime.current_trend_direction,
         "volatility_bucket": runtime.current_volatility_bucket,
         "inventory_state": runtime.current_inventory_state,
+        "entry_reason": runtime.open_position_reason or runtime.last_decision_reason,
         "trigger_reason": runtime.open_position_reason or runtime.last_decision_reason,
         "exit_reason": fill.trade_reason,
-        "entry_edge_bps": runtime.current_entry_edge_bps,
-        "entry_edge_usd": runtime.current_entry_edge_usd,
+        "used_fallback_mode": runtime.open_position_used_fallback,
+        "entry_edge_bps": runtime.open_position_entry_edge_bps,
+        "entry_edge_usd": runtime.open_position_entry_edge_usd,
         "hold_minutes": _position_hold_minutes(runtime, cycle_index),
     }
 
@@ -2342,7 +2435,7 @@ def _record_fill(
     mode: str,
     fill,
     realized_pnl_delta: float,
-) -> dict[str, float | None]:
+) -> dict[str, object]:
     if not fill or not fill.filled:
         return _blank_trade_analysis()
 
@@ -2388,6 +2481,7 @@ def _record_fill(
             "detected_regime": runtime.current_detected_regime,
             "zone": runtime.current_zone,
             "trade_reason_category": runtime.last_trade_reason,
+            "regime": trade_analysis.get("regime") or runtime.current_active_regime,
             "active_regime": trade_analysis.get("active_regime") or runtime.current_active_regime,
             "trend_direction": trade_analysis.get("trend_direction") or runtime.current_trend_direction,
             "volatility_bucket": trade_analysis.get("volatility_bucket") or runtime.current_volatility_bucket,
@@ -2395,6 +2489,9 @@ def _record_fill(
             "entry_threshold_bps": runtime.current_entry_threshold_bps,
             "min_edge_bps": runtime.current_min_edge_bps,
             "inventory_drift_pct": runtime.current_inventory_drift_pct,
+            "inactivity_fallback_active": runtime.current_inactivity_fallback_active,
+            "used_fallback_mode": bool(trade_analysis.get("used_fallback_mode", False)),
+            "entry_reason": trade_analysis.get("entry_reason") or fill.trade_reason,
             "trade_blocked_reason": runtime.last_decision_block_reason or runtime.last_execution_analytics.trade_blocked_reason,
             "trigger_reason": trade_analysis.get("trigger_reason") or fill.trade_reason,
             "exit_reason": trade_analysis.get("exit_reason") or "",
@@ -2440,7 +2537,7 @@ def _record_fill(
         trend_direction=str(trade_analysis.get("trend_direction") or runtime.current_trend_direction),
         volatility_bucket=str(trade_analysis.get("volatility_bucket") or runtime.current_volatility_bucket),
         inventory_state=str(trade_analysis.get("inventory_state") or runtime.current_inventory_state),
-        trigger_reason=str(trade_analysis.get("trigger_reason") or fill.trade_reason),
+        trigger_reason=str(trade_analysis.get("entry_reason") or trade_analysis.get("trigger_reason") or fill.trade_reason),
         exit_reason=str(trade_analysis.get("exit_reason") or ""),
         entry_edge_bps=float(trade_analysis.get("entry_edge_bps") or 0.0),
         entry_edge_usd=float(trade_analysis.get("entry_edge_usd") or 0.0),
@@ -2453,6 +2550,9 @@ def _record_fill(
         runtime.open_position_reason = fill.trade_reason
         runtime.open_position_regime = runtime.current_active_regime
         runtime.open_position_price = fill.price
+        runtime.open_position_entry_edge_bps = runtime.current_entry_edge_bps
+        runtime.open_position_entry_edge_usd = runtime.current_entry_edge_usd
+        runtime.open_position_used_fallback = runtime.current_inactivity_fallback_active
         runtime.current_hold_minutes = 0.0
         sizing = _current_sizing(runtime)
         min_notional_usd = sizing.min_notional_usd if sizing is not None else MIN_ORDER_SIZE_USD
@@ -2501,6 +2601,9 @@ def _record_fill(
             runtime.open_position_reason = ""
             runtime.open_position_regime = ""
             runtime.open_position_price = 0.0
+            runtime.open_position_entry_edge_bps = 0.0
+            runtime.open_position_entry_edge_usd = 0.0
+            runtime.open_position_used_fallback = False
             runtime.current_hold_minutes = 0.0
 
     notifier = runtime.telegram_notifier
@@ -2621,6 +2724,7 @@ def _process_price_tick_with_decision_engine(
     runtime.current_signal_gate_decision = None
     runtime.current_entry_edge_bps = 0.0
     runtime.current_entry_edge_usd = 0.0
+    runtime.current_signal_block_reason = ""
 
     min_notional_usd = sizing.min_notional_usd
     available_quote_usd = sizing.available_quote_to_trade_usd
@@ -2744,6 +2848,7 @@ def _process_price_tick_with_decision_engine(
 
     strategy_buy_candidate = None
     range_entry_allowed = _range_entry_signal_allowed(
+        runtime,
         intelligence=intelligence,
         regime_assessment=runtime.current_regime_assessment,
         buy_state_allowed=buy_state_allowed,
@@ -2753,21 +2858,28 @@ def _process_price_tick_with_decision_engine(
     if (
         range_entry_allowed
         and not getattr(inventory_profile, "reduction_only", False)
-        and trade_size_usd >= min_notional_usd
         and runtime.current_regime_assessment is not None
     ):
+        range_buy_size_usd = trade_size_usd
+        range_buy_reason = "range_buy"
+        if runtime.current_inactivity_fallback_active:
+            range_buy_size_usd *= max(min(INACTIVITY_FORCE_SIZE_MULTIPLIER, 1.0), 0.0)
+            range_buy_reason = "inactivity_range_buy"
+        if range_buy_size_usd < min_notional_usd:
+            range_buy_size_usd = 0.0
         range_buy_price = min(
             strategy_mid,
             max(strategy_buy_price, runtime.current_regime_assessment.window_low * 1.0008),
         )
-        strategy_buy_candidate = DecisionOutcome(
-            action="BUY",
-            size_usd=trade_size_usd,
-            reason="range_buy",
-            source="strategy",
-            order_price=range_buy_price,
-            inventory_cap_usd=default_buy_inventory_cap,
-        )
+        if range_buy_size_usd >= min_notional_usd:
+            strategy_buy_candidate = DecisionOutcome(
+                action="BUY",
+                size_usd=range_buy_size_usd,
+                reason=range_buy_reason,
+                source="strategy",
+                order_price=range_buy_price,
+                inventory_cap_usd=default_buy_inventory_cap,
+            )
     elif buy_state_allowed and not state_requires_reentry_only and trend_signal_allows_buy and not getattr(inventory_profile, "reduction_only", False):
         strategy_buy_candidate = DecisionOutcome(
             action="BUY",
@@ -3579,6 +3691,7 @@ def process_price_tick(
     runtime.current_signal_gate_decision = None
     runtime.current_entry_edge_bps = 0.0
     runtime.current_entry_edge_usd = 0.0
+    runtime.current_signal_block_reason = ""
 
     min_notional_usd = sizing.min_notional_usd
     available_quote_usd = sizing.available_quote_to_trade_usd
@@ -4666,6 +4779,7 @@ def build_summary(runtime: BotRuntime) -> dict:
 
     summary = {
         **performance_summary,
+        "config_profile": BOT_CONFIG_PROFILE,
         "final_mid": final_mid,
         "return_pct": (
             (performance_summary["final_pnl"] / performance_summary["start_equity"]) * 100.0
@@ -4720,6 +4834,7 @@ def build_summary(runtime: BotRuntime) -> dict:
         "active_regime": runtime.current_active_regime,
         "trend_direction": runtime.current_trend_direction,
         "activity_state": runtime.current_activity_state,
+        "inactivity_fallback_active": runtime.current_inactivity_fallback_active,
         "regime_confidence": 0.0 if regime is None else regime.regime_confidence,
         "range_width_pct": 0.0 if regime is None else regime.range_width_pct,
         "net_move_pct": 0.0 if regime is None else regime.net_move_pct,
@@ -4736,6 +4851,8 @@ def build_summary(runtime: BotRuntime) -> dict:
         "execution_timeframe_seconds": runtime.execution_timeframe_seconds,
         "trend_timeframe_seconds": runtime.trend_timeframe_seconds,
         "confirmation_timeframe_seconds": runtime.confirmation_timeframe_seconds,
+        "requote_interval_ms": EXECUTION_REQUOTE_INTERVAL_MS,
+        "stale_quote_timeout_ms": EXECUTION_STALE_QUOTE_TIMEOUT_MS,
         "trend_filter_enabled": runtime.enable_trend_timeframe_filter,
         "confirmation_filter_enabled": runtime.enable_confirmation_filter,
         "upper_tf_short_ma": runtime.current_trend_short_ma,
@@ -4775,6 +4892,7 @@ def build_summary(runtime: BotRuntime) -> dict:
 
 def log_summary(summary: dict) -> None:
     log("========================================")
+    log(f"Config profile: {summary.get('config_profile', 'unknown')}")
     log(f"Final price: {summary['final_mid']:.2f}")
     log(f"Return: {summary['return_pct']:.2f}%")
     log(f"BUY count: {summary['buy_count']}")

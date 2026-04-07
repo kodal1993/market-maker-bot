@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from config import (
+    ALLOW_MICRO_EDGE_ENTRIES,
     ACTIVITY_AUTO_LOOSEN_ENTRY_BPS,
     ACTIVITY_AUTO_LOOSEN_MIN_EDGE_BPS,
     EXECUTION_BASE_ENTRY_THRESHOLD_BPS,
+    INACTIVITY_FORCE_ENTRY_THRESHOLD_BPS,
+    INACTIVITY_FORCE_MIN_EDGE_BPS,
+    MICRO_EDGE_MIN_BPS,
     RANGE_ENTRY_THRESHOLD_BPS,
     RANGE_MAX_HOLD_MINUTES,
     RANGE_MID_NO_TRADE_ZONE_PCT,
@@ -47,6 +51,10 @@ def _normalized_volatility_bucket(volatility_bucket: str) -> str:
     if bucket in {"HIGH", "EXTREME"}:
         return "HIGH"
     return "MID"
+
+
+def _normalized_activity_state(activity_state: str) -> str:
+    return str(activity_state).strip().lower()
 
 
 def resolve_range_location(price_position_pct: float) -> str:
@@ -107,7 +115,10 @@ def resolve_effective_entry_threshold_bps(
     activity_state: str = "normal",
 ) -> float:
     threshold_bps = resolve_entry_threshold_bps(active_regime, volatility_bucket)
-    if str(activity_state).strip().lower() == "low_activity_relax":
+    normalized_activity_state = _normalized_activity_state(activity_state)
+    if normalized_activity_state == "inactivity_fallback" and _normalized_regime(active_regime) == "RANGE":
+        threshold_bps = min(threshold_bps, max(INACTIVITY_FORCE_ENTRY_THRESHOLD_BPS, 0.0))
+    elif normalized_activity_state == "low_activity_relax":
         threshold_bps *= resolve_low_activity_entry_factor(active_regime, volatility_bucket)
     return max(threshold_bps, 0.0)
 
@@ -129,8 +140,13 @@ def resolve_low_activity_edge_factor(active_regime: str) -> float:
 
 def resolve_effective_min_edge_bps(active_regime: str, activity_state: str = "normal") -> float:
     required_edge_bps = resolve_min_edge_bps(active_regime)
-    if str(activity_state).strip().lower() == "low_activity_relax":
+    normalized_activity_state = _normalized_activity_state(activity_state)
+    if normalized_activity_state == "inactivity_fallback" and _normalized_regime(active_regime) == "RANGE":
+        required_edge_bps = min(required_edge_bps, max(INACTIVITY_FORCE_MIN_EDGE_BPS, 0.0))
+    elif normalized_activity_state == "low_activity_relax":
         required_edge_bps *= resolve_low_activity_edge_factor(active_regime)
+    if _normalized_regime(active_regime) == "RANGE" and ALLOW_MICRO_EDGE_ENTRIES:
+        required_edge_bps = min(required_edge_bps, max(MICRO_EDGE_MIN_BPS, 0.0))
     return max(required_edge_bps, 0.0)
 
 

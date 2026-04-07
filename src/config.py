@@ -52,6 +52,22 @@ def _bars_from_directional_consistency(consistency: float, lookback_bars: int) -
     return max(int(round(max(consistency, 0.0) * directional_steps)), 1)
 
 
+_BOT_CONFIG_PROFILE = (_env_str("BOT_CONFIG_PROFILE", "v8_activity").strip().lower() or "v8_activity")
+_V8_ACTIVITY_PROFILE_ENABLED = _BOT_CONFIG_PROFILE in {"v8_activity", "activity_v8", "v8"}
+
+
+def _profile_float(name: str, baseline_default: float, v8_default: float) -> float:
+    return _env_float(name, v8_default if _V8_ACTIVITY_PROFILE_ENABLED else baseline_default)
+
+
+def _profile_int(name: str, baseline_default: int, v8_default: int) -> int:
+    return _env_int(name, v8_default if _V8_ACTIVITY_PROFILE_ENABLED else baseline_default)
+
+
+def _profile_bool(name: str, baseline_default: bool, v8_default: bool) -> bool:
+    return _env_bool(name, v8_default if _V8_ACTIVITY_PROFILE_ENABLED else baseline_default)
+
+
 CORE = CoreConfig(
     bot_mode=_env_str("BOT_MODE", "paper"),
     chain=_env_str("CHAIN", "base"),
@@ -89,7 +105,7 @@ PORTFOLIO = PortfolioConfig(
 )
 
 EXECUTION = ExecutionConfig(
-    trade_size_usd=_env_float("TRADE_SIZE_USD", 30.0),
+    trade_size_usd=_profile_float("TRADE_SIZE_USD", 30.0, 25.0),
     max_trade_size_usd=max(_env_float("MAX_TRADE_SIZE_USD", 75.0), 0.0),
     account_reference_mode=_env_str("ACCOUNT_REFERENCE_MODE", "dynamic"),
     trade_size_pct=max(_env_float("TRADE_SIZE_PCT", 0.10), 0.0),
@@ -415,8 +431,8 @@ RANGE_STRATEGY = RangeStrategyConfig(
         "RANGE_BOTTOM_ZONE_PCT",
         _env_float("RANGE_ENTRY_MAX_POSITION_PCT", 0.25),
     ),
-    range_mid_no_trade_zone_pct=_env_float("RANGE_MID_NO_TRADE_ZONE_PCT", 0.20),
-    entry_threshold_bps=_env_float("RANGE_ENTRY_THRESHOLD_BPS", 5.0),
+    range_mid_no_trade_zone_pct=_profile_float("RANGE_MID_NO_TRADE_ZONE_PCT", 0.20, 0.15),
+    entry_threshold_bps=_profile_float("RANGE_ENTRY_THRESHOLD_BPS", 5.0, 4.5),
     min_edge_bps=_env_float("RANGE_MIN_EDGE_BPS", _env_float("EXPECTED_EDGE_MIN_BPS", 3.0)),
     take_profit_bps=_env_float("RANGE_TAKE_PROFIT_BPS", _env_float("RANGE_PROFIT_LOCK_LEVEL_2_BPS", 13.0)),
     soft_take_profit_bps=_env_float("RANGE_SOFT_TAKE_PROFIT_BPS", _env_float("RANGE_PROFIT_LOCK_LEVEL_1_BPS", 8.0)),
@@ -436,8 +452,8 @@ TREND_STRATEGY = TrendStrategyConfig(
 
 EXECUTION_TUNING = ExecutionTuningConfig(
     base_entry_threshold_bps=_env_float("EXECUTION_BASE_ENTRY_THRESHOLD_BPS", 10.0),
-    requote_interval_ms=max(_env_int("EXECUTION_REQUOTE_INTERVAL_MS", 2500), 0),
-    stale_quote_timeout_ms=max(_env_int("EXECUTION_STALE_QUOTE_TIMEOUT_MS", 4000), 0),
+    requote_interval_ms=max(_profile_int("EXECUTION_REQUOTE_INTERVAL_MS", 2500, 1500), 0),
+    stale_quote_timeout_ms=max(_profile_int("EXECUTION_STALE_QUOTE_TIMEOUT_MS", 4000, 2500), 0),
     cancel_if_far_from_mid_bps=_env_float("EXECUTION_CANCEL_IF_FAR_FROM_MID_BPS", 8.0),
     reprice_on_mid_move_bps=_env_float("EXECUTION_REPRICE_ON_MID_MOVE_BPS", _env_float("TREND_BUY_REQUOTE_BPS", 4.0)),
     max_position_hold_minutes=_env_float("EXECUTION_MAX_POSITION_HOLD_MINUTES", _env_float("MAX_POSITION_HOLD_MINUTES", 25.0)),
@@ -467,7 +483,10 @@ INVENTORY_TUNING = InventoryTuningConfig(
 )
 
 SIZING_TUNING = SizingTuningConfig(
-    base_order_size_usd=_env_float("SIZING_BASE_ORDER_SIZE_USD", _env_float("TRADE_SIZE_USD", 30.0)),
+    base_order_size_usd=_env_float(
+        "SIZING_BASE_ORDER_SIZE_USD",
+        _env_float("TRADE_SIZE_USD", 25.0 if _V8_ACTIVITY_PROFILE_ENABLED else 30.0),
+    ),
     range_order_size_multiplier=_env_float("SIZING_RANGE_ORDER_SIZE_MULTIPLIER", _env_float("RANGE_SIZE_MULTIPLIER", 1.0)),
     trend_order_size_multiplier=_env_float("SIZING_TREND_ORDER_SIZE_MULTIPLIER", _env_float("TREND_SIZE_MULTIPLIER", 0.9)),
     high_vol_order_size_multiplier=_env_float("SIZING_HIGH_VOL_ORDER_SIZE_MULTIPLIER", 0.7),
@@ -492,16 +511,23 @@ VOLATILITY_TUNING = VolatilityTuningConfig(
 ACTIVITY_TUNING = ActivityTuningConfig(
     activity_window_hours=_env_float("ACTIVITY_WINDOW_HOURS", _env_float("LOW_ACTIVITY_LOOKBACK_HOURS", 6.0)),
     min_trades_per_activity_window=_env_int("ACTIVITY_MIN_TRADES_PER_ACTIVITY_WINDOW", _env_int("LOW_ACTIVITY_MIN_TRADES", 6)),
-    daily_min_trade_target=_env_int("ACTIVITY_DAILY_MIN_TRADE_TARGET", 15),
+    daily_min_trade_target=_profile_int("ACTIVITY_DAILY_MIN_TRADE_TARGET", 15, 10),
     daily_good_trade_target=_env_int("ACTIVITY_DAILY_GOOD_TRADE_TARGET", 20),
     daily_aggressive_trade_cap=_env_int("ACTIVITY_DAILY_AGGRESSIVE_TRADE_CAP", _env_int("MAX_TRADES_PER_DAY", 40)),
     auto_loosen_if_low_activity=_env_bool("ACTIVITY_AUTO_LOOSEN_IF_LOW_ACTIVITY", _env_bool("LOW_ACTIVITY_GUARD_ENABLED", True)),
-    auto_loosen_entry_bps=_env_float("ACTIVITY_AUTO_LOOSEN_ENTRY_BPS", 3.0),
-    auto_loosen_min_edge_bps=_env_float("ACTIVITY_AUTO_LOOSEN_MIN_EDGE_BPS", 2.0),
+    auto_loosen_entry_bps=_profile_float("ACTIVITY_AUTO_LOOSEN_ENTRY_BPS", 3.0, 1.0),
+    auto_loosen_min_edge_bps=_profile_float("ACTIVITY_AUTO_LOOSEN_MIN_EDGE_BPS", 2.0, 0.5),
     prioritize_range_mode_when_low_activity=_env_bool("ACTIVITY_PRIORITIZE_RANGE_MODE_WHEN_LOW_ACTIVITY", True),
+    inactivity_force_entry_minutes=_env_float("INACTIVITY_FORCE_ENTRY_MINUTES", 10.0),
+    inactivity_force_entry_threshold_bps=_env_float("INACTIVITY_FORCE_ENTRY_THRESHOLD_BPS", 3.5),
+    inactivity_force_min_edge_bps=_env_float("INACTIVITY_FORCE_MIN_EDGE_BPS", 2.5),
+    inactivity_force_size_multiplier=_env_float("INACTIVITY_FORCE_SIZE_MULTIPLIER", 0.7),
+    allow_micro_edge_entries=_profile_bool("ALLOW_MICRO_EDGE_ENTRIES", False, True),
+    micro_edge_min_bps=_env_float("MICRO_EDGE_MIN_BPS", 2.5),
 )
 
 # Backward-compatible aliases for the rest of the codebase.
+BOT_CONFIG_PROFILE = _BOT_CONFIG_PROFILE
 BOT_MODE = CORE.bot_mode
 CHAIN = CORE.chain
 RPC_URL = CORE.rpc_url or (CORE.rpc_urls[0] if CORE.rpc_urls else "")
@@ -967,6 +993,12 @@ ACTIVITY_AUTO_LOOSEN_IF_LOW_ACTIVITY = ACTIVITY_TUNING.auto_loosen_if_low_activi
 ACTIVITY_AUTO_LOOSEN_ENTRY_BPS = ACTIVITY_TUNING.auto_loosen_entry_bps
 ACTIVITY_AUTO_LOOSEN_MIN_EDGE_BPS = ACTIVITY_TUNING.auto_loosen_min_edge_bps
 ACTIVITY_PRIORITIZE_RANGE_MODE_WHEN_LOW_ACTIVITY = ACTIVITY_TUNING.prioritize_range_mode_when_low_activity
+INACTIVITY_FORCE_ENTRY_MINUTES = ACTIVITY_TUNING.inactivity_force_entry_minutes
+INACTIVITY_FORCE_ENTRY_THRESHOLD_BPS = ACTIVITY_TUNING.inactivity_force_entry_threshold_bps
+INACTIVITY_FORCE_MIN_EDGE_BPS = ACTIVITY_TUNING.inactivity_force_min_edge_bps
+INACTIVITY_FORCE_SIZE_MULTIPLIER = ACTIVITY_TUNING.inactivity_force_size_multiplier
+ALLOW_MICRO_EDGE_ENTRIES = ACTIVITY_TUNING.allow_micro_edge_entries
+MICRO_EDGE_MIN_BPS = ACTIVITY_TUNING.micro_edge_min_bps
 
 NEWS_RSS_URLS = FEEDS.news_rss_urls
 NEWS_LOOKBACK_HOURS = FEEDS.news_lookback_hours
