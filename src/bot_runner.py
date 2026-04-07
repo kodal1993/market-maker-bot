@@ -2,7 +2,6 @@ import json
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from config import (
     BOT_CONFIG_PROFILE,
@@ -118,6 +117,7 @@ import runtime_strategy as strategy_helpers
 from signal_gate import SignalGate, capped_loss_pause_minutes, loss_pause_cycles, loss_pause_remaining_minutes
 from sizing_engine import SizingSnapshot, as_log_fields as sizing_log_fields, build_sizing_snapshot
 from state_machine import StateMachineEngine
+from telegram_notifier import TelegramNotifier
 from strategy_profile import (
     resolve_effective_entry_threshold_bps,
     resolve_effective_min_edge_bps,
@@ -149,9 +149,6 @@ from types_bot import (
     StateMachineContext,
     StrategyState,
 )
-
-if TYPE_CHECKING:
-    from telegram_notifier import TelegramNotifier
 
 PRICE_WINDOW_SIZE = max(INTELLIGENCE_WARMUP_ROWS, LONG_MA_WINDOW, VOL_WINDOW + 1)
 REENTRY_ZONE_LEVELS = (
