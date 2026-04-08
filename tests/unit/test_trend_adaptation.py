@@ -56,29 +56,32 @@ class TrendAdaptationTests(unittest.TestCase):
                     inventory_usd=40.0,
                 )
 
-    def test_uptrend_allows_only_buy_side(self) -> None:
+    def test_uptrend_keeps_buy_side_aggressive_and_softens_sell_side(self) -> None:
         prices = [100.0 + (index * 0.35) for index in range(30)]
 
         snapshot = self._build_snapshot(prices)
 
         self.assertGreater(snapshot.short_ma, snapshot.long_ma)
         self.assertTrue(snapshot.buy_enabled)
-        self.assertFalse(snapshot.sell_enabled)
+        self.assertTrue(snapshot.sell_enabled)
         self.assertEqual(snapshot.mode, "TREND_UP")
+        self.assertEqual(snapshot.mm_mode, "aggressive")
         self.assertEqual(snapshot.current_mode, "TREND_UP")
-        self.assertIn("ema_uptrend_buy_only", snapshot.reason)
+        self.assertIn("trend_up_buy_bias", snapshot.blockers)
+        self.assertIn("strong_rally_sell_soft_guard", snapshot.blockers)
 
-    def test_downtrend_allows_only_sell_side(self) -> None:
+    def test_downtrend_keeps_quotes_but_biases_to_sell_side(self) -> None:
         prices = [110.0 - (index * 0.35) for index in range(30)]
 
         snapshot = self._build_snapshot(prices)
 
         self.assertLess(snapshot.short_ma, snapshot.long_ma)
-        self.assertFalse(snapshot.buy_enabled)
+        self.assertTrue(snapshot.buy_enabled)
         self.assertTrue(snapshot.sell_enabled)
         self.assertEqual(snapshot.current_mode, "TREND_DOWN")
-        self.assertIn("trend_down_sell_priority", snapshot.reason)
-        self.assertIn("ema_downtrend_sell_only", snapshot.reason)
+        self.assertEqual(snapshot.mm_mode, "aggressive")
+        self.assertIn("trend_down_defensive_skew", snapshot.blockers)
+        self.assertIn("ema_downtrend_sell_bias", snapshot.blockers)
 
     def test_range_keeps_both_sides_enabled(self) -> None:
         prices = [
@@ -119,9 +122,10 @@ class TrendAdaptationTests(unittest.TestCase):
         self.assertEqual(snapshot.current_mode, "RANGE")
         self.assertTrue(snapshot.buy_enabled)
         self.assertTrue(snapshot.sell_enabled)
-        self.assertIn("ema_range_dual_side", snapshot.reason)
+        self.assertEqual(snapshot.mm_mode, "base_mm")
+        self.assertIn("ema_range_dual_side", snapshot.blockers)
 
-    def test_strong_drop_blocks_buy_even_in_range_snapshot(self) -> None:
+    def test_strong_drop_softens_buy_even_in_range_snapshot(self) -> None:
         prices = [100.0] * 26 + [99.5, 99.2, 98.9, 98.6]
         snapshot = self._build_snapshot(
             prices,
@@ -136,10 +140,10 @@ class TrendAdaptationTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(snapshot.buy_enabled)
-        self.assertIn("strong_drop_buy_block", snapshot.reason)
+        self.assertTrue(snapshot.buy_enabled)
+        self.assertIn("strong_drop_buy_soft_guard", snapshot.blockers)
 
-    def test_strong_rally_blocks_sell_even_in_range_snapshot(self) -> None:
+    def test_strong_rally_softens_sell_even_in_range_snapshot(self) -> None:
         prices = [100.0] * 26 + [100.5, 100.8, 101.1, 101.4]
         snapshot = self._build_snapshot(
             prices,
@@ -154,8 +158,8 @@ class TrendAdaptationTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(snapshot.sell_enabled)
-        self.assertIn("strong_rally_sell_block", snapshot.reason)
+        self.assertTrue(snapshot.sell_enabled)
+        self.assertIn("strong_rally_sell_soft_guard", snapshot.blockers)
 
 
 if __name__ == "__main__":

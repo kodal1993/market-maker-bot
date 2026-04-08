@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 
 from config import (
+    COOLDOWN_AGGRESSIVE_SEC,
+    COOLDOWN_BASE_SEC,
+    COOLDOWN_DEFENSIVE_SEC,
     LOW_ACTIVITY_LOOKBACK_HOURS,
     MAX_TRADES_PER_DAY,
     MIN_TRADE_DISTANCE_PCT,
@@ -47,6 +50,7 @@ ANTI_OVERTRADING_EXEMPT_REASONS = {
 }
 
 LOSS_STREAK_SENSITIVE_REASONS = {
+    "base_mm_buy",
     "force_trade_buy",
     "inventory_rebalance",
     "partial_reset",
@@ -74,6 +78,7 @@ PASSIVE_SELL_REASONS = {
 }
 
 PASSIVE_BUY_REASONS = {
+    "base_mm_buy",
     "trend_buy",
     "partial_reset",
     "range_buy",
@@ -96,10 +101,33 @@ class TradeFilter:
     def __init__(self, cycle_seconds: float):
         self.cycle_seconds = max(cycle_seconds, 1.0)
 
-    def _cooldown_cycles(self) -> int:
-        if TRADE_COOLDOWN_MINUTES <= 0:
+    @staticmethod
+    def _base_cooldown_seconds(market_mode: str) -> float:
+        normalized_mode = str(market_mode).strip().lower()
+        if normalized_mode == "aggressive":
+            return max(COOLDOWN_AGGRESSIVE_SEC, 0.0)
+        if normalized_mode == "defensive_mm":
+            return max(COOLDOWN_DEFENSIVE_SEC, 0.0)
+        if normalized_mode == "base_mm":
+            return max(COOLDOWN_BASE_SEC, 0.0)
+        return max(TRADE_COOLDOWN_MINUTES * 60.0, 0.0)
+
+    def _cooldown_cycles(
+        self,
+        *,
+        market_mode: str,
+        activity_boost: float = 0.0,
+        freeze_recovery_mode: bool = False,
+        cooldown_multiplier: float = 1.0,
+    ) -> int:
+        cooldown_seconds = self._base_cooldown_seconds(market_mode)
+        if cooldown_seconds <= 0:
             return 0
-        return max(int(math.ceil((TRADE_COOLDOWN_MINUTES * 60.0) / self.cycle_seconds)), 0)
+        cooldown_seconds *= max(cooldown_multiplier, 0.1)
+        cooldown_seconds *= max(1.0 - (max(activity_boost, 0.0) * 0.18), 0.55)
+        if freeze_recovery_mode:
+            cooldown_seconds *= 0.82
+        return max(int(math.ceil(cooldown_seconds / self.cycle_seconds)), 0)
 
     def _momentum_limit_bps(self, volatility_state: str, low_trade_rate_active: bool) -> float:
         if volatility_state == "LOW":
@@ -129,6 +157,12 @@ class TradeFilter:
         volatility_state: str,
         trade_count: int,
         daily_trade_count: int = 0,
+        market_mode: str = "base_mm",
+        recent_trade_count_60m: int = 0,
+        activity_boost: float = 0.0,
+        freeze_recovery_mode: bool = False,
+        fill_quality_tier: str = "normal",
+        cooldown_multiplier: float = 1.0,
     ) -> TradeFilterResult:
         elapsed_minutes = ((cycle_index + 1) * self.cycle_seconds) / 60.0
         minutes_since_trade = (
@@ -136,19 +170,38 @@ class TradeFilter:
             if last_trade_cycle is not None
             else elapsed_minutes
         )
-        trade_rate_per_hour = trade_count / max(elapsed_minutes / 60.0, 1e-9) if elapsed_minutes > 0 else 0.0
+        estimated_trade_rate = trade_count / max(elapsed_minutes / 60.0, 1e-9) if elapsed_minutes > 0 else 0.0
+        trade_rate_per_hour = recent_trade_count_60m if elapsed_minutes >= 60.0 else estimated_trade_rate
         activity_window_minutes = max(LOW_ACTIVITY_LOOKBACK_HOURS * 60.0, 15.0)
-        low_trade_rate_active = elapsed_minutes >= activity_window_minutes and trade_rate_per_hour < MIN_TRADE_RATE_PER_HOUR
+        low_trade_rate_active = (
+            elapsed_minutes >= min(activity_window_minutes, 60.0)
+            and trade_rate_per_hour < MIN_TRADE_RATE_PER_HOUR
+        )
         force_trade_active = (
             TRADE_FILTER_FORCE_TRADE_MINUTES > 0
             and minutes_since_trade >= TRADE_FILTER_FORCE_TRADE_MINUTES
         )
-        base_cooldown_cycles = self._cooldown_cycles()
-        cooldown_cycles = 0 if low_trade_rate_active else max(int(math.ceil(base_cooldown_cycles * 0.65)), 0)
+        base_cooldown_cycles = self._cooldown_cycles(
+            market_mode=market_mode,
+            activity_boost=activity_boost,
+            freeze_recovery_mode=freeze_recovery_mode,
+            cooldown_multiplier=cooldown_multiplier,
+        )
+        cooldown_cycles = 0 if low_trade_rate_active else max(int(math.ceil(base_cooldown_cycles * 0.70)), 0)
         min_trade_distance_pct = MIN_TRADE_DISTANCE_PCT * (0.45 if low_trade_rate_active else 0.70)
         momentum_limit_bps = self._momentum_limit_bps(volatility_state, low_trade_rate_active) * 1.10
         buy_rsi_max = TRADE_FILTER_BUY_RSI_MAX + (6.0 if low_trade_rate_active else 2.0)
         sell_rsi_min = TRADE_FILTER_SELL_RSI_MIN - (6.0 if low_trade_rate_active else 2.0)
+        if freeze_recovery_mode:
+            min_trade_distance_pct *= 0.85
+            momentum_limit_bps *= 1.12
+            buy_rsi_max += 2.0
+            sell_rsi_min -= 2.0
+        if fill_quality_tier == "poor":
+            min_trade_distance_pct *= 1.05
+            momentum_limit_bps *= 0.94
+        elif fill_quality_tier == "weak":
+            min_trade_distance_pct *= 1.02
         loss_streak_reduce_threshold = max(TRADE_FILTER_LOSS_STREAK_LIMIT, 1)
         loss_streak_pause_threshold = max(STATE_MACHINE_LOSS_STREAK_LIMIT, loss_streak_reduce_threshold + 1)
         size_multiplier = 1.0
@@ -171,10 +224,16 @@ class TradeFilter:
             "daily_trade_count": daily_trade_count,
             "max_trades_per_day": MAX_TRADES_PER_DAY,
             "trade_rate_per_hour": round(trade_rate_per_hour, 4),
+            "recent_trade_count_60m": recent_trade_count_60m,
             "minutes_since_trade": round(minutes_since_trade, 4),
             "min_time_between_trades_minutes": round(MIN_TIME_BETWEEN_TRADES_MINUTES, 4),
             "force_trade_active": force_trade_active,
             "low_trade_rate_active": low_trade_rate_active,
+            "market_mode": market_mode,
+            "activity_boost": round(activity_boost, 4),
+            "freeze_recovery_mode": freeze_recovery_mode,
+            "fill_quality_tier": fill_quality_tier,
+            "cooldown_multiplier": round(cooldown_multiplier, 4),
             "cooldown_cycles": cooldown_cycles,
             "min_trade_distance_pct": round(min_trade_distance_pct, 4),
             "debug_mode": TRADE_FILTER_DEBUG_MODE,
@@ -183,14 +242,9 @@ class TradeFilter:
         anti_overtrading_exempt = trade_reason in ANTI_OVERTRADING_EXEMPT_REASONS
 
         if not anti_overtrading_exempt and MAX_TRADES_PER_DAY > 0 and daily_trade_count >= MAX_TRADES_PER_DAY:
-            filter_values["adjustment_reasons"] = adjustment_reasons
             filter_values["daily_trade_limit_hit"] = True
-            return TradeFilterResult(
-                False,
-                "max_trades_per_day",
-                size_multiplier=size_multiplier,
-                filter_values=filter_values,
-            )
+            size_multiplier *= 0.55
+            adjustment_reasons.append("max_trades_soft_limit")
 
         if (
             not anti_overtrading_exempt
@@ -202,23 +256,14 @@ class TradeFilter:
                 max(MIN_TIME_BETWEEN_TRADES_MINUTES - minutes_since_trade, 0.0),
                 4,
             )
-            filter_values["adjustment_reasons"] = adjustment_reasons
-            return TradeFilterResult(
-                False,
-                "min_time_between_trades",
-                size_multiplier=size_multiplier,
-                filter_values=filter_values,
-            )
+            min_gap_ratio = minutes_since_trade / max(MIN_TIME_BETWEEN_TRADES_MINUTES, 1e-9)
+            size_multiplier *= max(min_gap_ratio, 0.30)
+            adjustment_reasons.append("min_time_between_trades_soft")
 
         if loss_streak >= loss_streak_pause_threshold and trade_reason in LOSS_STREAK_SENSITIVE_REASONS:
-            filter_values["adjustment_reasons"] = adjustment_reasons
             filter_values["loss_streak_pause_active"] = True
-            return TradeFilterResult(
-                False,
-                "loss_streak_pause",
-                size_multiplier=size_multiplier,
-                filter_values=filter_values,
-            )
+            size_multiplier *= 0.35
+            adjustment_reasons.append("loss_streak_pause_soft")
 
         if loss_streak >= loss_streak_reduce_threshold and trade_reason in LOSS_STREAK_SENSITIVE_REASONS:
             size_multiplier *= 0.50
@@ -239,14 +284,9 @@ class TradeFilter:
                 market_score >= TRADE_FILTER_STRONG_TREND_SKIP_SCORE
                 and momentum_bps >= max(momentum_limit_bps * 0.80, 25.0)
             ):
-                filter_values["adjustment_reasons"] = adjustment_reasons
                 filter_values["strong_trend_skip_active"] = True
-                return TradeFilterResult(
-                    False,
-                    "strong_trend_skip",
-                    size_multiplier=size_multiplier,
-                    filter_values=filter_values,
-                )
+                size_multiplier *= 0.35
+                adjustment_reasons.append("strong_trend_skip_soft")
 
             size_multiplier *= max(min(TRADE_FILTER_STRONG_TREND_SIZE_MULTIPLIER, 1.0), 0.10)
             adjustment_reasons.append("strong_trend_size_reduction")
@@ -268,10 +308,11 @@ class TradeFilter:
             cooldown_progress = (cycle_index - last_trade_cycle) / max(cooldown_cycles, 1)
             filter_values["cooldown_progress"] = round(cooldown_progress, 4)
             if cooldown_progress < 0.45:
-                filter_values["adjustment_reasons"] = adjustment_reasons
-                return TradeFilterResult(False, "cooldown", size_multiplier=size_multiplier, filter_values=filter_values)
-            size_multiplier *= 0.45
-            adjustment_reasons.append("cooldown_soft_limit")
+                size_multiplier *= 0.35
+                adjustment_reasons.append("cooldown_soft_floor")
+            else:
+                size_multiplier *= 0.45
+                adjustment_reasons.append("cooldown_soft_limit")
 
         if order_price > 0 and last_trade_price and last_trade_price > 0 and min_trade_distance_pct > 0:
             distance_pct = abs((order_price / last_trade_price) - 1.0) * 100.0
@@ -279,15 +320,7 @@ class TradeFilter:
             if distance_pct < min_trade_distance_pct:
                 distance_ratio = distance_pct / max(min_trade_distance_pct, 1e-9)
                 filter_values["distance_ratio"] = round(distance_ratio, 4)
-                if distance_ratio < 0.35:
-                    filter_values["adjustment_reasons"] = adjustment_reasons
-                    return TradeFilterResult(
-                        False,
-                        "min_trade_distance",
-                        size_multiplier=size_multiplier,
-                        filter_values=filter_values,
-                    )
-                size_multiplier *= max(distance_ratio, 0.35)
+                size_multiplier *= max(distance_ratio, 0.25)
                 adjustment_reasons.append("distance_soft_limit")
 
         if side == "buy":
@@ -295,23 +328,20 @@ class TradeFilter:
                 rsi_excess = rsi_value - buy_rsi_max
                 filter_values["rsi_excess"] = round(rsi_excess, 4)
                 if rsi_excess >= 5.0 and not low_trade_rate_active:
-                    filter_values["adjustment_reasons"] = adjustment_reasons
-                    return TradeFilterResult(False, "rsi_limit", size_multiplier=size_multiplier, filter_values=filter_values)
-                size_multiplier *= 0.55
-                adjustment_reasons.append("rsi_size_reduction")
+                    size_multiplier *= 0.45
+                    adjustment_reasons.append("rsi_soft_limit")
+                else:
+                    size_multiplier *= 0.55
+                    adjustment_reasons.append("rsi_size_reduction")
             if trade_reason in PASSIVE_BUY_REASONS and momentum_bps >= momentum_limit_bps:
                 momentum_excess = momentum_bps - momentum_limit_bps
                 filter_values["momentum_excess_bps"] = round(momentum_excess, 4)
                 if momentum_excess >= (momentum_limit_bps * 0.45) and not low_trade_rate_active:
-                    filter_values["adjustment_reasons"] = adjustment_reasons
-                    return TradeFilterResult(
-                        False,
-                        "momentum_limit",
-                        size_multiplier=size_multiplier,
-                        filter_values=filter_values,
-                    )
-                size_multiplier *= 0.45
-                adjustment_reasons.append("momentum_size_reduction")
+                    size_multiplier *= 0.35
+                    adjustment_reasons.append("momentum_soft_limit")
+                else:
+                    size_multiplier *= 0.45
+                    adjustment_reasons.append("momentum_size_reduction")
             if regime == "RISK_OFF" and trade_reason not in {
                 "reentry_pullback",
                 "reentry_timeout",
@@ -326,23 +356,20 @@ class TradeFilter:
                 rsi_gap = sell_rsi_min - rsi_value
                 filter_values["rsi_gap"] = round(rsi_gap, 4)
                 if rsi_gap >= 5.0 and not low_trade_rate_active:
-                    filter_values["adjustment_reasons"] = adjustment_reasons
-                    return TradeFilterResult(False, "rsi_limit", size_multiplier=size_multiplier, filter_values=filter_values)
-                size_multiplier *= 0.55
-                adjustment_reasons.append("rsi_size_reduction")
+                    size_multiplier *= 0.45
+                    adjustment_reasons.append("rsi_soft_limit")
+                else:
+                    size_multiplier *= 0.55
+                    adjustment_reasons.append("rsi_size_reduction")
             if trade_reason in PASSIVE_SELL_REASONS and momentum_bps <= -momentum_limit_bps:
                 momentum_gap = abs(momentum_bps) - momentum_limit_bps
                 filter_values["momentum_gap_bps"] = round(momentum_gap, 4)
                 if momentum_gap >= (momentum_limit_bps * 0.45) and not low_trade_rate_active:
-                    filter_values["adjustment_reasons"] = adjustment_reasons
-                    return TradeFilterResult(
-                        False,
-                        "momentum_limit",
-                        size_multiplier=size_multiplier,
-                        filter_values=filter_values,
-                    )
-                size_multiplier *= 0.45
-                adjustment_reasons.append("momentum_size_reduction")
+                    size_multiplier *= 0.35
+                    adjustment_reasons.append("momentum_soft_limit")
+                else:
+                    size_multiplier *= 0.45
+                    adjustment_reasons.append("momentum_size_reduction")
             if (
                 trade_reason in PASSIVE_SELL_REASONS
                 and regime == "TREND"

@@ -171,7 +171,7 @@ class RegimeDetector:
         )
 
         default_regime = REGIME_DEFAULT_REGIME if REGIME_DEFAULT_REGIME in {"RANGE", "CHOP"} else "RANGE"
-        default_execution_regime = "NO_TRADE" if default_regime == "CHOP" else "RANGE"
+        default_execution_regime = "RANGE"
         default_features = range_features if default_regime == "RANGE" else trend_features
 
         if not self.enabled:
@@ -308,7 +308,7 @@ class RegimeDetector:
             execution_regime = "TREND"
             trend_direction = "down"
         elif market_regime == "CHOP":
-            execution_regime = "NO_TRADE"
+            execution_regime = "RANGE"
 
         active_features = range_features if market_regime == "RANGE" else trend_features
         if market_regime == "CHOP":

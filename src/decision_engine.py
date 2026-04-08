@@ -100,6 +100,12 @@ class DecisionEngine:
         volatility_state: str,
         trade_count: int,
         daily_trade_count: int = 0,
+        market_mode: str = "base_mm",
+        recent_trade_count_60m: int = 0,
+        activity_boost: float = 0.0,
+        freeze_recovery_mode: bool = False,
+        fill_quality_tier: str = "normal",
+        cooldown_multiplier: float = 1.0,
     ):
         if not trade_filter_enabled:
             return None
@@ -119,6 +125,12 @@ class DecisionEngine:
             volatility_state=volatility_state,
             trade_count=trade_count,
             daily_trade_count=daily_trade_count,
+            market_mode=market_mode,
+            recent_trade_count_60m=recent_trade_count_60m,
+            activity_boost=activity_boost,
+            freeze_recovery_mode=freeze_recovery_mode,
+            fill_quality_tier=fill_quality_tier,
+            cooldown_multiplier=cooldown_multiplier,
         )
         return filter_result
 
@@ -126,11 +138,29 @@ class DecisionEngine:
         self,
         strategy_buy: _DecisionCandidate | None,
         strategy_sell: _DecisionCandidate | None,
+        inventory_profile=None,
+        cycle_index: int = 0,
     ) -> tuple[_DecisionCandidate | None, list[str]]:
         overrides: list[str] = []
         if strategy_sell and self._is_priority_sell_reason(strategy_sell.reason):
             if strategy_buy:
                 overrides.append(self._candidate_tag(strategy_buy))
+            return strategy_sell, overrides
+        if strategy_buy and strategy_sell:
+            inventory_ratio = float(getattr(inventory_profile, "inventory_ratio", 0.5))
+            lower_bound = float(getattr(inventory_profile, "lower_bound", 0.45))
+            upper_bound = float(getattr(inventory_profile, "upper_bound", 0.55))
+            target_ratio = (lower_bound + upper_bound) / 2.0
+            if inventory_ratio > min(target_ratio + 0.01, upper_bound):
+                overrides.append(self._candidate_tag(strategy_buy))
+                return strategy_sell, overrides
+            if inventory_ratio < max(target_ratio - 0.01, lower_bound):
+                overrides.append(self._candidate_tag(strategy_sell))
+                return strategy_buy, overrides
+            if cycle_index % 2 == 0:
+                overrides.append(self._candidate_tag(strategy_sell))
+                return strategy_buy, overrides
+            overrides.append(self._candidate_tag(strategy_buy))
             return strategy_sell, overrides
         if strategy_buy:
             if strategy_sell:
@@ -160,6 +190,12 @@ class DecisionEngine:
         volatility_state: str,
         trade_count: int,
         daily_trade_count: int = 0,
+        market_mode: str = "base_mm",
+        recent_trade_count_60m: int = 0,
+        activity_boost: float = 0.0,
+        freeze_recovery_mode: bool = False,
+        fill_quality_tier: str = "normal",
+        cooldown_multiplier: float = 1.0,
     ) -> DecisionOutcome:
         reentry_signal = self._normalize_candidate(reentry_candidate)
         inventory_signal = self._normalize_candidate(inventory_candidate)
@@ -195,6 +231,8 @@ class DecisionEngine:
                 strategy_candidate, strategy_overrides = self._choose_strategy_candidate(
                     None,
                     strategy_sell_signal,
+                    inventory_profile=inventory_profile,
+                    cycle_index=cycle_index,
                 )
                 overridden_signals.extend(strategy_overrides)
                 if strategy_candidate:
@@ -220,6 +258,8 @@ class DecisionEngine:
             selected, strategy_overrides = self._choose_strategy_candidate(
                 strategy_buy_signal,
                 strategy_sell_signal,
+                inventory_profile=inventory_profile,
+                cycle_index=cycle_index,
             )
             overridden_signals.extend(strategy_overrides)
             if selected is None:
@@ -260,6 +300,12 @@ class DecisionEngine:
             volatility_state=volatility_state,
             trade_count=trade_count,
             daily_trade_count=daily_trade_count,
+            market_mode=market_mode,
+            recent_trade_count_60m=recent_trade_count_60m,
+            activity_boost=activity_boost,
+            freeze_recovery_mode=freeze_recovery_mode,
+            fill_quality_tier=fill_quality_tier,
+            cooldown_multiplier=cooldown_multiplier,
         )
         filter_values = {} if filter_result is None else dict(filter_result.filter_values)
         if filter_result is not None and filter_result.size_multiplier > 0:

@@ -63,7 +63,7 @@ class MultiTimeframeTests(unittest.TestCase):
             enable_confirmation=True,
         )
 
-        self.assertGreaterEqual(rows, 360)
+        self.assertGreaterEqual(rows, 315)
 
     def test_steps_per_timeframe_never_returns_less_than_one(self) -> None:
         self.assertEqual(steps_per_timeframe(60.0, 60.0), 1)

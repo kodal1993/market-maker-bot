@@ -68,6 +68,9 @@ class SignalGate:
         inventory_state = inventory_state_label(inventory_ratio, target_base_pct)
         ema_trend_gap_bps = ema_gap_bps(short_ma, long_ma)
         ema_range_band_bps = max(EMA_RANGE_BAND_BPS, 0.5)
+        gate_size_multiplier = 1.0
+        gate_spread_multiplier = 1.0
+        soft_guard_reasons: list[str] = []
 
         gate_details = {
             "raw_signal": f"{action}:{signal.source or '-'}:{reason or '-'}",
@@ -76,6 +79,10 @@ class SignalGate:
             "edge_score": round(edge_assessment.edge_score, 6),
             "expected_edge_usd": round(edge_assessment.expected_edge_usd, 6),
             "expected_edge_bps": round(edge_assessment.expected_edge_bps, 6),
+            "edge_bucket": edge_assessment.edge_bucket,
+            "edge_size_multiplier": round(edge_assessment.size_multiplier, 6),
+            "edge_spread_multiplier": round(edge_assessment.spread_multiplier, 6),
+            "aggressive_enabled": edge_assessment.aggressive_enabled,
             "mev_risk_score": round(edge_assessment.mev_risk_score, 6),
             "slippage_estimate_bps": round(edge_assessment.slippage_estimate_bps, 6),
             "inventory_state": inventory_state,
@@ -102,38 +109,51 @@ class SignalGate:
             and not protective_exit
             and edge_assessment.edge_score < HIGH_EDGE_OVERRIDE_SCORE
         ):
-            return SignalGateDecision(False, "skip", "losing_streak_pause", gate_details)
+            gate_details["loss_pause_soft_degrade"] = True
+            gate_size_multiplier *= 0.76
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("loss_pause_soft_degrade")
 
         if CHOP_DISABLE_NEW_TRADES and regime_assessment.market_regime == "CHOP" and not protective_exit:
-            return SignalGateDecision(False, "skip", "chop_market", gate_details)
+            gate_size_multiplier *= 0.82
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("chop_market_soft")
 
         if (
             not protective_exit
             and action == "BUY"
             and ema_trend_gap_bps < -ema_range_band_bps
         ):
-            return SignalGateDecision(False, "skip", "ema_downtrend_buy_blocked", gate_details)
+            gate_size_multiplier *= 0.72
+            gate_spread_multiplier *= 1.10
+            soft_guard_reasons.append("ema_downtrend_buy_soft")
 
         if (
             not protective_exit
             and action == "SELL"
             and ema_trend_gap_bps > ema_range_band_bps
         ):
-            return SignalGateDecision(False, "skip", "ema_uptrend_sell_blocked", gate_details)
+            gate_size_multiplier *= 0.74
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("ema_uptrend_sell_soft")
 
         if (
             not protective_exit
             and action == "BUY"
             and momentum_bps <= -max(TREND_MOMENTUM_BLOCK_BPS, 0.0)
         ):
-            return SignalGateDecision(False, "skip", "momentum_drop_buy_blocked", gate_details)
+            gate_size_multiplier *= 0.72
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("momentum_drop_buy_soft")
 
         if (
             not protective_exit
             and action == "SELL"
             and momentum_bps >= max(TREND_MOMENTUM_BLOCK_BPS, 0.0)
         ):
-            return SignalGateDecision(False, "skip", "momentum_rally_sell_blocked", gate_details)
+            gate_size_multiplier *= 0.72
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("momentum_rally_sell_soft")
 
         confirmation_threshold_bps = max(CONFIRMATION_MOMENTUM_SHOCK_BPS, 1.0)
         if (
@@ -143,7 +163,9 @@ class SignalGate:
             and confirmation_momentum_bps <= -confirmation_threshold_bps
             and not confirmation_slowing
         ):
-            return SignalGateDecision(False, "skip", "confirmation_blocks_buy", gate_details)
+            gate_size_multiplier *= 0.78
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("confirmation_blocks_buy_soft")
 
         if (
             confirmation_enabled
@@ -152,7 +174,9 @@ class SignalGate:
             and confirmation_momentum_bps >= confirmation_threshold_bps
             and not confirmation_slowing
         ):
-            return SignalGateDecision(False, "skip", "confirmation_blocks_sell", gate_details)
+            gate_size_multiplier *= 0.78
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("confirmation_blocks_sell_soft")
 
         if (
             TREND_DOWN_DISABLE_RANGE_BUYS
@@ -160,7 +184,9 @@ class SignalGate:
             and regime_assessment.market_regime == "TREND_DOWN"
             and not protective_exit
         ):
-            return SignalGateDecision(False, "skip", "regime_blocks_countertrend_buy", gate_details)
+            gate_size_multiplier *= 0.76
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("regime_blocks_countertrend_buy_soft")
 
         if (
             TREND_UP_DISABLE_COUNTERTREND_SELLS
@@ -169,7 +195,9 @@ class SignalGate:
             and not protective_exit
             and reason == "quoted_sell"
         ):
-            return SignalGateDecision(False, "skip", "regime_blocks_countertrend_sell", gate_details)
+            gate_size_multiplier *= 0.78
+            gate_spread_multiplier *= 1.08
+            soft_guard_reasons.append("regime_blocks_countertrend_sell_soft")
 
         if not edge_assessment.edge_pass:
             return SignalGateDecision(False, "skip", edge_assessment.edge_reject_reason or "edge_filter_reject", gate_details)
@@ -182,6 +210,10 @@ class SignalGate:
         elif action == "SELL" and protective_exit:
             approved_mode = "risk_exit"
 
+        gate_details["gate_size_multiplier"] = round(gate_size_multiplier, 6)
+        gate_details["gate_spread_multiplier"] = round(gate_spread_multiplier, 6)
+        gate_details["soft_guard_reasons"] = soft_guard_reasons
+        gate_details["soft_guard_reason"] = "|".join(soft_guard_reasons)
         gate_details["approved_mode"] = approved_mode
         gate_details["gate_decision"] = "allow"
         return SignalGateDecision(True, approved_mode, "", gate_details)

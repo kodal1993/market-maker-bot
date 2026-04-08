@@ -203,6 +203,12 @@ class EdgeAssessment:
     reentry_penalty_usd: float = 0.0
     inventory_adjustment_usd: float = 0.0
     pullback_depth_pct: float = 0.0
+    edge_bucket: str = "bad"
+    size_multiplier: float = 1.0
+    spread_multiplier: float = 1.0
+    inventory_skew_multiplier: float = 1.0
+    cooldown_multiplier: float = 1.0
+    aggressive_enabled: bool = False
 
 
 @dataclass(frozen=True)

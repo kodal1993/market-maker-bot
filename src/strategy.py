@@ -255,6 +255,10 @@ def build_quotes(
     max_inventory_usd: float,
     inventory_skew_strength: float,
     directional_bias: float = 0.0,
+    inventory_ratio: float | None = None,
+    target_inventory_ratio: float = 0.5,
+    inventory_band_low: float = 0.45,
+    inventory_band_high: float = 0.55,
 ) -> Quote:
     spread_value = mid * (spread_bps / 10000.0)
     half_spread = spread_value / 2.0
@@ -262,6 +266,26 @@ def build_quotes(
     bid_distance = half_spread
     ask_distance = half_spread
     directional_bias = clamp(directional_bias, -1.0, 1.0)
+    target_inventory_ratio = clamp(target_inventory_ratio, 0.0, 1.0)
+    inventory_band_low = clamp(inventory_band_low, 0.0, target_inventory_ratio)
+    inventory_band_high = clamp(inventory_band_high, target_inventory_ratio, 1.0)
+    if inventory_ratio is None:
+        if max_inventory_usd > 0:
+            inventory_ratio = clamp(inventory_usd / max_inventory_usd, 0.0, 1.0)
+        else:
+            inventory_ratio = target_inventory_ratio
+    inventory_ratio = clamp(inventory_ratio, 0.0, 1.0)
+    band_half_width = max(
+        max(target_inventory_ratio - inventory_band_low, inventory_band_high - target_inventory_ratio),
+        0.01,
+    )
+    inventory_deviation = inventory_ratio - target_inventory_ratio
+    normalized_inventory_deviation = clamp(inventory_deviation / band_half_width, -2.5, 2.5)
+    reservation_shift_bps = normalized_inventory_deviation * max(
+        spread_bps * (0.40 + max(inventory_skew_strength, 0.0)),
+        1.0,
+    )
+    reservation_price = mid * (1.0 - (reservation_shift_bps / 10000.0))
 
     if directional_bias > 0:
         bid_distance *= max(0.55, 1.0 - (directional_bias * 0.25))
@@ -271,20 +295,19 @@ def build_quotes(
         bid_distance *= 1.0 + (bearish_bias * 0.20)
         ask_distance *= max(0.55, 1.0 - (bearish_bias * 0.25))
 
-    if max_inventory_usd > 0:
-        ratio = clamp(inventory_usd / max_inventory_usd, -1.0, 1.0)
-        skew_factor = max(inventory_skew_strength, 0.0)
+    inventory_pressure = min(abs(normalized_inventory_deviation), 2.0) / 2.0
+    skew_factor = max(inventory_skew_strength, 0.0)
+    if normalized_inventory_deviation > 0:
+        bid_distance *= 1.0 + (inventory_pressure * (0.45 + (skew_factor * 3.0)))
+        ask_distance *= max(0.28, 1.0 - (inventory_pressure * (0.30 + (skew_factor * 2.5))))
+    elif normalized_inventory_deviation < 0:
+        bid_distance *= max(0.28, 1.0 - (inventory_pressure * (0.30 + (skew_factor * 2.5))))
+        ask_distance *= 1.0 + (inventory_pressure * (0.45 + (skew_factor * 3.0)))
 
-        if ratio > 0:
-            bid_distance *= 1.0 + (ratio * skew_factor)
-            ask_distance *= max(0.35, 1.0 - (ratio * skew_factor))
-        elif ratio < 0:
-            shortage_ratio = abs(ratio)
-            bid_distance *= max(0.35, 1.0 - (shortage_ratio * skew_factor))
-            ask_distance *= 1.0 + (shortage_ratio * skew_factor)
-
-    bid = mid - bid_distance
-    ask = mid + ask_distance
+    bid = reservation_price - bid_distance
+    ask = reservation_price + ask_distance
+    if ask <= bid:
+        ask = bid + max(half_spread * 0.50, mid * 0.0001)
 
     return Quote(
         bid=bid,

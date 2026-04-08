@@ -54,18 +54,52 @@ def _bars_from_directional_consistency(consistency: float, lookback_bars: int) -
 
 _BOT_CONFIG_PROFILE = (_env_str("BOT_CONFIG_PROFILE", "v8_activity").strip().lower() or "v8_activity")
 _V8_ACTIVITY_PROFILE_ENABLED = _BOT_CONFIG_PROFILE in {"v8_activity", "activity_v8", "v8"}
+_V5_AGGRESSIVE_PROFILE_ENABLED = _BOT_CONFIG_PROFILE in {"v5_aggressive", "aggressive_v5", "v5"}
+
+def _profile_default(baseline_default, v8_default=None, v5_default=None):
+    if _V5_AGGRESSIVE_PROFILE_ENABLED and v5_default is not None:
+        return v5_default
+    if _V8_ACTIVITY_PROFILE_ENABLED and v8_default is not None:
+        return v8_default
+    return baseline_default
 
 
-def _profile_float(name: str, baseline_default: float, v8_default: float) -> float:
-    return _env_float(name, v8_default if _V8_ACTIVITY_PROFILE_ENABLED else baseline_default)
+def _profile_float(
+    name: str,
+    baseline_default: float,
+    v8_default: float | None = None,
+    v5_default: float | None = None,
+) -> float:
+    return _env_float(name, _profile_default(baseline_default, v8_default, v5_default))
 
 
-def _profile_int(name: str, baseline_default: int, v8_default: int) -> int:
-    return _env_int(name, v8_default if _V8_ACTIVITY_PROFILE_ENABLED else baseline_default)
+def _profile_int(
+    name: str,
+    baseline_default: int,
+    v8_default: int | None = None,
+    v5_default: int | None = None,
+) -> int:
+    return _env_int(name, _profile_default(baseline_default, v8_default, v5_default))
 
 
-def _profile_bool(name: str, baseline_default: bool, v8_default: bool) -> bool:
-    return _env_bool(name, v8_default if _V8_ACTIVITY_PROFILE_ENABLED else baseline_default)
+def _profile_bool(
+    name: str,
+    baseline_default: bool,
+    v8_default: bool | None = None,
+    v5_default: bool | None = None,
+) -> bool:
+    return _env_bool(name, _profile_default(baseline_default, v8_default, v5_default))
+
+
+def _normalized_drawdown_ratio(value: float) -> float:
+    raw_value = abs(float(value))
+    return raw_value / 100.0 if raw_value > 1.0 else raw_value
+
+
+def _env_drawdown_ratio(primary_name: str, legacy_name: str, default_ratio: float) -> float:
+    if _env_has_value(primary_name):
+        return _normalized_drawdown_ratio(_env_float(primary_name, default_ratio * 100.0))
+    return _normalized_drawdown_ratio(_env_float(legacy_name, default_ratio))
 
 
 CORE = CoreConfig(
@@ -101,11 +135,17 @@ PORTFOLIO = PortfolioConfig(
     start_eth_usd=_env_float("START_ETH_USD", 0.0),
     max_inventory_usd=_env_float("MAX_INVENTORY_USD", 140.0),
     min_order_size_usd=_env_float("MIN_ORDER_SIZE_USD", 10.0),
-    inventory_skew_strength=_env_float("INVENTORY_SKEW_STRENGTH", 0.02),
+    inventory_skew_strength=_env_float(
+        "INVENTORY_SKEW_STRENGTH",
+        _env_float("SKEW_STRENGTH", _profile_default(0.02, 0.02, 0.08)),
+    ),
 )
 
 EXECUTION = ExecutionConfig(
-    trade_size_usd=_profile_float("TRADE_SIZE_USD", 30.0, 25.0),
+    trade_size_usd=_env_float(
+        "TRADE_SIZE_USD",
+        _env_float("BASE_SIZE_USD", _profile_default(30.0, 25.0, 22.0)),
+    ),
     max_trade_size_usd=max(_env_float("MAX_TRADE_SIZE_USD", 75.0), 0.0),
     account_reference_mode=_env_str("ACCOUNT_REFERENCE_MODE", "dynamic"),
     trade_size_pct=max(_env_float("TRADE_SIZE_PCT", 0.10), 0.0),
@@ -132,9 +172,12 @@ EXECUTION = ExecutionConfig(
 )
 
 MARKET = MarketConfig(
-    spread_bps=_env_float("SPREAD_BPS", 9.0),
-    min_spread_bps=_env_float("MIN_SPREAD_BPS", 3.0),
-    max_spread_bps=_env_float("MAX_SPREAD_BPS", 18.0),
+    spread_bps=_env_float(
+        "SPREAD_BPS",
+        _env_float("BASE_SPREAD_BPS", _profile_default(9.0, 9.0, 14.0)),
+    ),
+    min_spread_bps=_profile_float("MIN_SPREAD_BPS", 3.0, 3.0, 8.0),
+    max_spread_bps=_profile_float("MAX_SPREAD_BPS", 18.0, 18.0, 32.0),
     twap_window=_env_int("TWAP_WINDOW", 5),
     vol_window=_env_int("VOL_WINDOW", 10),
     vol_multiplier=_env_float("VOL_MULTIPLIER", 0.55),
@@ -272,7 +315,10 @@ TRADE_FILTER = TradeFilterConfig(
     strong_trend_size_multiplier=_env_float("TRADE_FILTER_STRONG_TREND_SIZE_MULTIPLIER", 0.55),
     force_trade_minutes=_env_float("TRADE_FILTER_FORCE_TRADE_MINUTES", 30.0),
     force_trade_size_fraction=_env_float("FORCE_TRADE_SIZE_FRACTION", 0.25),
-    min_trades_per_hour=_env_float("MIN_TRADE_RATE_PER_HOUR", 5.0),
+    min_trades_per_hour=_env_float(
+        "MIN_TRADES_PER_HOUR",
+        _env_float("MIN_TRADE_RATE_PER_HOUR", _profile_default(5.0, 5.0, 10.0)),
+    ),
     debug_mode=_env_bool("TRADE_FILTER_DEBUG_MODE", True),
 )
 
@@ -321,9 +367,21 @@ INTELLIGENCE = IntelligenceConfig(
     extreme_vol_threshold_multiplier=_env_float("EXTREME_VOL_THRESHOLD_MULTIPLIER", 1.85),
     risk_off_trend_multiplier=_env_float("RISK_OFF_TREND_MULTIPLIER", 1.10),
     overweight_exit_buffer_pct=_env_float("OVERWEIGHT_EXIT_BUFFER_PCT", 0.06),
-    capital_preservation_drawdown_pct=_env_float("CAPITAL_PRESERVATION_DRAWDOWN_PCT", 0.03),
-    risk_block_drawdown_pct=_env_float("RISK_BLOCK_DRAWDOWN_PCT", 0.05),
-    drawdown_pause_pct=_env_float("DRAWDOWN_PAUSE_PCT", 0.08),
+    capital_preservation_drawdown_pct=_env_drawdown_ratio(
+        "SOFT_DD_PCT",
+        "CAPITAL_PRESERVATION_DRAWDOWN_PCT",
+        _profile_default(0.03, 0.03, 0.015),
+    ),
+    risk_block_drawdown_pct=_env_drawdown_ratio(
+        "MEDIUM_DD_PCT",
+        "RISK_BLOCK_DRAWDOWN_PCT",
+        _profile_default(0.05, 0.05, 0.025),
+    ),
+    drawdown_pause_pct=_env_drawdown_ratio(
+        "HARD_DD_PCT",
+        "DRAWDOWN_PAUSE_PCT",
+        _profile_default(0.08, 0.08, 0.035),
+    ),
     adaptive_lookback_cycles=_env_int("ADAPTIVE_LOOKBACK_CYCLES", 18),
     min_inventory_multiplier=_env_float("MIN_INVENTORY_MULTIPLIER", 0.20),
     max_inventory_multiplier=_env_float("MAX_INVENTORY_MULTIPLIER", 1.35),
@@ -381,6 +439,23 @@ _legacy_high_vol_threshold_pct = max(_env_float("HIGH_VOL_THRESHOLD", 0.0055) * 
 _legacy_low_vol_threshold_pct = max(
     _legacy_high_vol_threshold_pct * max(_env_float("LOW_VOL_THRESHOLD_MULTIPLIER", 0.65), 0.05),
     0.01,
+)
+_inventory_target_weight_default = _env_float(
+    "INVENTORY_TARGET_ETH_WEIGHT",
+    _profile_default(_legacy_target_base_pct, _legacy_target_base_pct, 0.50),
+)
+_inventory_band_low_default = _env_float(
+    "INVENTORY_BAND_LOW",
+    _profile_default(max(_inventory_target_weight_default - 0.08, 0.0), max(_inventory_target_weight_default - 0.08, 0.0), 0.45),
+)
+_inventory_band_high_default = _env_float(
+    "INVENTORY_BAND_HIGH",
+    _profile_default(min(_inventory_target_weight_default + 0.08, 1.0), min(_inventory_target_weight_default + 0.08, 1.0), 0.55),
+)
+_inventory_neutral_band_pct_default = max(
+    max(abs(_inventory_target_weight_default - _inventory_band_low_default), abs(_inventory_band_high_default - _inventory_target_weight_default))
+    * 100.0,
+    0.0,
 )
 
 REGIME_TUNING = RegimeTuningConfig(
@@ -466,8 +541,14 @@ EXECUTION_TUNING = ExecutionTuningConfig(
 )
 
 INVENTORY_TUNING = InventoryTuningConfig(
-    inventory_target_pct=_env_float("INVENTORY_TARGET_PCT", _legacy_target_base_pct * 100.0),
-    inventory_neutral_band_pct=_env_float("INVENTORY_NEUTRAL_BAND_PCT", 8.0),
+    inventory_target_pct=_env_float(
+        "INVENTORY_TARGET_PCT",
+        _inventory_target_weight_default * 100.0,
+    ),
+    inventory_neutral_band_pct=_env_float(
+        "INVENTORY_NEUTRAL_BAND_PCT",
+        _inventory_neutral_band_pct_default,
+    ),
     inventory_soft_limit_pct=_env_float("INVENTORY_SOFT_LIMIT_PCT_POINTS", 25.0),
     inventory_hard_limit_pct=_env_float("INVENTORY_HARD_LIMIT_PCT_POINTS", 40.0),
     inventory_force_reduce_pct=_env_float("INVENTORY_FORCE_REDUCE_PCT", 50.0),
@@ -485,11 +566,20 @@ INVENTORY_TUNING = InventoryTuningConfig(
 SIZING_TUNING = SizingTuningConfig(
     base_order_size_usd=_env_float(
         "SIZING_BASE_ORDER_SIZE_USD",
-        _env_float("TRADE_SIZE_USD", 25.0 if _V8_ACTIVITY_PROFILE_ENABLED else 30.0),
+        _env_float(
+            "BASE_SIZE_USD",
+            _env_float("TRADE_SIZE_USD", _profile_default(30.0, 25.0, 22.0)),
+        ),
     ),
     range_order_size_multiplier=_env_float("SIZING_RANGE_ORDER_SIZE_MULTIPLIER", _env_float("RANGE_SIZE_MULTIPLIER", 1.0)),
-    trend_order_size_multiplier=_env_float("SIZING_TREND_ORDER_SIZE_MULTIPLIER", _env_float("TREND_SIZE_MULTIPLIER", 0.9)),
-    high_vol_order_size_multiplier=_env_float("SIZING_HIGH_VOL_ORDER_SIZE_MULTIPLIER", 0.7),
+    trend_order_size_multiplier=_env_float(
+        "SIZING_TREND_ORDER_SIZE_MULTIPLIER",
+        _env_float("AGGRESSIVE_SIZE_MULT", _profile_default(0.9, 0.9, 1.6)),
+    ),
+    high_vol_order_size_multiplier=_env_float(
+        "SIZING_HIGH_VOL_ORDER_SIZE_MULTIPLIER",
+        _env_float("DEFENSIVE_SIZE_MULT", _profile_default(0.7, 0.7, 0.55)),
+    ),
     inventory_pressure_size_multiplier=_env_float("SIZING_INVENTORY_PRESSURE_SIZE_MULTIPLIER", 0.65),
 )
 
@@ -781,9 +871,9 @@ REENTRY_BLOCK_AFTER_LOSS_MINUTES = _env_float("REENTRY_BLOCK_AFTER_LOSS_MINUTES"
 MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE = _env_int("MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE", 3)
 LOSS_PAUSE_MINUTES = _env_float("LOSS_PAUSE_MINUTES", 30.0)
 HIGH_EDGE_OVERRIDE_SCORE = _env_float("HIGH_EDGE_OVERRIDE_SCORE", 80.0)
-CHOP_DISABLE_NEW_TRADES = _env_bool("CHOP_DISABLE_NEW_TRADES", True)
-TREND_DOWN_DISABLE_RANGE_BUYS = _env_bool("TREND_DOWN_DISABLE_RANGE_BUYS", True)
-TREND_UP_DISABLE_COUNTERTREND_SELLS = _env_bool("TREND_UP_DISABLE_COUNTERTREND_SELLS", True)
+CHOP_DISABLE_NEW_TRADES = _env_bool("CHOP_DISABLE_NEW_TRADES", not _V5_AGGRESSIVE_PROFILE_ENABLED)
+TREND_DOWN_DISABLE_RANGE_BUYS = _env_bool("TREND_DOWN_DISABLE_RANGE_BUYS", not _V5_AGGRESSIVE_PROFILE_ENABLED)
+TREND_UP_DISABLE_COUNTERTREND_SELLS = _env_bool("TREND_UP_DISABLE_COUNTERTREND_SELLS", not _V5_AGGRESSIVE_PROFILE_ENABLED)
 EMA_RANGE_BAND_BPS = _env_float("EMA_RANGE_BAND_BPS", 6.0)
 TREND_MOMENTUM_BLOCK_BPS = _env_float("TREND_MOMENTUM_BLOCK_BPS", 35.0)
 ENTRY_TRIGGER_RELAX_MULTIPLIER = _env_float("ENTRY_TRIGGER_RELAX_MULTIPLIER", 0.74)
@@ -856,7 +946,7 @@ TREND_TARGET_INVENTORY_MAX = _strategy_range_target_max
 RISK_OFF_TARGET_INVENTORY_MAX = _clamp(_strategy_target_base_pct - (_strategy_neutral_band_ratio * 0.50), 0.0, 1.0)
 CAUTION_TARGET_INVENTORY_CAP = _clamp(_strategy_target_base_pct + (_strategy_neutral_band_ratio * 0.50), 0.0, 1.0)
 MAX_TRADES_PER_DAY = ACTIVITY_TUNING.daily_aggressive_trade_cap
-MIN_TRADE_RATE_PER_HOUR = ACTIVITY_TUNING.min_trades_per_activity_window / max(ACTIVITY_TUNING.activity_window_hours, 1e-9)
+MIN_TRADE_RATE_PER_HOUR = TRADE_FILTER.min_trades_per_hour
 LOW_ACTIVITY_GUARD_ENABLED = ACTIVITY_TUNING.auto_loosen_if_low_activity
 LOW_ACTIVITY_LOOKBACK_HOURS = ACTIVITY_TUNING.activity_window_hours
 LOW_ACTIVITY_MIN_TRADES = ACTIVITY_TUNING.min_trades_per_activity_window
@@ -999,6 +1089,26 @@ INACTIVITY_FORCE_MIN_EDGE_BPS = ACTIVITY_TUNING.inactivity_force_min_edge_bps
 INACTIVITY_FORCE_SIZE_MULTIPLIER = ACTIVITY_TUNING.inactivity_force_size_multiplier
 ALLOW_MICRO_EDGE_ENTRIES = ACTIVITY_TUNING.allow_micro_edge_entries
 MICRO_EDGE_MIN_BPS = ACTIVITY_TUNING.micro_edge_min_bps
+
+BASE_SPREAD_BPS = SPREAD_BPS
+BASE_SIZE_USD = TRADE_SIZE_USD
+AGGRESSIVE_SIZE_MULT = _env_float("AGGRESSIVE_SIZE_MULT", _profile_default(0.9, 0.9, 1.6))
+DEFENSIVE_SIZE_MULT = _env_float("DEFENSIVE_SIZE_MULT", _profile_default(0.7, 0.7, 0.55))
+EDGE_STRONG_POS = _env_float("EDGE_STRONG_POS", _profile_default(0.004, 0.004, 0.003))
+EDGE_WEAK_POS = _env_float("EDGE_WEAK_POS", 0.0)
+EDGE_SOFT_NEG = _env_float("EDGE_SOFT_NEG", _profile_default(-0.0015, -0.0015, -0.002))
+COOLDOWN_AGGRESSIVE_SEC = max(_env_float("COOLDOWN_AGGRESSIVE_SEC", _profile_default(30.0, 20.0, 15.0)), 0.0)
+COOLDOWN_BASE_SEC = max(_env_float("COOLDOWN_BASE_SEC", _profile_default(120.0, 25.0, 25.0)), 0.0)
+COOLDOWN_DEFENSIVE_SEC = max(_env_float("COOLDOWN_DEFENSIVE_SEC", _profile_default(180.0, 45.0, 45.0)), 0.0)
+MIN_TRADES_PER_HOUR = max(_env_float("MIN_TRADES_PER_HOUR", MIN_TRADE_RATE_PER_HOUR), 0.0)
+FREEZE_RECOVERY_MINUTES = max(_env_float("FREEZE_RECOVERY_MINUTES", _profile_default(30.0, 20.0, 20.0)), 0.0)
+INVENTORY_TARGET_ETH_WEIGHT = TARGET_BASE_PCT
+INVENTORY_BAND_LOW = RANGE_TARGET_INVENTORY_MIN
+INVENTORY_BAND_HIGH = RANGE_TARGET_INVENTORY_MAX
+SKEW_STRENGTH = INVENTORY_SKEW_STRENGTH
+SOFT_DD_PCT = -(CAPITAL_PRESERVATION_DRAWDOWN_PCT * 100.0)
+MEDIUM_DD_PCT = -(RISK_BLOCK_DRAWDOWN_PCT * 100.0)
+HARD_DD_PCT = -(DRAWDOWN_PAUSE_PCT * 100.0)
 
 NEWS_RSS_URLS = FEEDS.news_rss_urls
 NEWS_LOOKBACK_HOURS = FEEDS.news_lookback_hours

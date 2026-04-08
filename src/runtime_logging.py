@@ -276,17 +276,31 @@ def log_cycle(
     )
     upper_tf_bias = getattr(runtime, "current_trend_bias", "range")
     current_mode = getattr(intelligence, "current_mode", mode)
+    mm_mode = getattr(runtime, "current_mm_mode", "base_mm")
+    strategy_mode = getattr(runtime, "current_strategy_mode", mode)
+    activity_boost = getattr(runtime, "current_activity_boost", 0.0)
+    dynamic_cooldown_sec = getattr(runtime, "current_dynamic_cooldown_sec", 0.0)
+    quote_enabled = getattr(runtime, "current_quote_enabled", True)
+    aggressive_enabled = getattr(runtime, "current_aggressive_enabled", False)
+    freeze_recovery_mode = getattr(runtime, "current_freeze_recovery_mode", False)
+    edge_bucket = getattr(runtime, "current_edge_bucket", "bad")
     confirmation_text = (
         f"{getattr(runtime, 'current_confirmation_momentum_bps', 0.0):.1f}bps/"
         f"{'slow' if getattr(runtime, 'current_confirmation_slowing', False) else 'fast'}"
     )
     log(
         f"{cycle_index} | state {runtime.state_context.current_state.value} | time_in_state {time_in_state_sec:.0f}s | "
-        f"last_transition {last_transition or '-'} | mode {mode} | current_mode {current_mode} | "
+        f"last_transition {last_transition or '-'} | mode {mm_mode} | strategy_mode {strategy_mode} | current_mode {current_mode} | "
         f"trend_strength {getattr(intelligence, 'trend_strength', 0.0):.5f} | regime {intelligence.regime} | "
         f"vol_state {intelligence.volatility_state} | "
         f"price {mid:.2f} | src {source} | eq {equity_usd:.2f} | pnl {pnl_usd:.2f} | "
-        f"spread {spread:.1f} | vol {intelligence.volatility:.5f} | inv {inventory_usd:.2f} | "
+        f"spread_bps {spread:.1f} | size {getattr(runtime, 'last_decision_size_usd', 0.0):.2f} | "
+        f"inv {inventory_usd:.2f} | inv_dev {inventory_drift_pct:+.2f} | "
+        f"cooldown {dynamic_cooldown_sec:.1f}s | activity_boost {activity_boost:.2f} | "
+        f"quote_enabled {quote_enabled} | aggressive_enabled {aggressive_enabled} | "
+        f"freeze_recovery {freeze_recovery_mode} | mins_since_fill {getattr(runtime, 'current_minutes_since_last_fill', 0.0):.1f} | "
+        f"fill_quality {getattr(runtime, 'current_fill_quality_tier', 'normal')}:{getattr(runtime, 'current_fill_quality_score', 1.0):.2f} | "
+        f"edge_bucket {edge_bucket} | vol {intelligence.volatility:.5f} | "
         f"sig {intelligence.signal_score:.2f} | feed {intelligence.feed_state} | risk {intelligence.risk_score:.2f} | "
         f"raw_signal {getattr(runtime, 'last_raw_signal', '-') or '-'} | detected_regime {detected_regime} | "
         f"active_regime {execution_regime} | trend_dir {trend_direction} | zone {zone} | range_loc {range_location} | "

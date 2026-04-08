@@ -81,4 +81,15 @@ class IntelligenceSnapshot:
     activity_state: str = "normal"
     min_edge_multiplier: float = 1.0
     entry_trigger_multiplier: float = 1.0
+    mm_mode: str = "base_mm"
+    strategy_mode: str = "RANGE_MAKER"
+    activity_boost: float = 0.0
+    quote_enabled: bool = True
+    aggressive_enabled: bool = False
+    freeze_recovery_mode: bool = False
+    minutes_since_last_fill: float = 0.0
+    trades_last_60m: int = 0
+    fill_quality_tier: str = "normal"
+    fill_quality_score: float = 1.0
+    cooldown_multiplier: float = 1.0
     blockers: list[str] = field(default_factory=list)

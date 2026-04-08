@@ -92,7 +92,7 @@ class RegimeEdgeGateTests(unittest.TestCase):
         assessment = detector.assess(prices)
 
         self.assertEqual(assessment.market_regime, "CHOP")
-        self.assertEqual(assessment.execution_regime, "NO_TRADE")
+        self.assertEqual(assessment.execution_regime, "RANGE")
         self.assertGreaterEqual(assessment.regime_confidence, 70.0)
 
     def test_regime_detector_exposes_trend_direction_for_uptrend(self) -> None:
@@ -139,9 +139,9 @@ class RegimeEdgeGateTests(unittest.TestCase):
         assessment = detector.assess(prices)
 
         self.assertEqual(assessment.market_regime, "CHOP")
-        self.assertEqual(assessment.execution_regime, "NO_TRADE")
+        self.assertEqual(assessment.execution_regime, "RANGE")
 
-    def test_signal_gate_blocks_buy_in_trend_down(self) -> None:
+    def test_signal_gate_softens_buy_in_trend_down(self) -> None:
         gate = SignalGate()
         decision = gate.evaluate(
             signal=DecisionOutcome(action="BUY", size_usd=20.0, reason="reentry_zone_1", source="test"),
@@ -157,10 +157,11 @@ class RegimeEdgeGateTests(unittest.TestCase):
             momentum_bps=-18.0,
         )
 
-        self.assertFalse(decision.allow_trade)
-        self.assertEqual(decision.blocked_reason, "ema_downtrend_buy_blocked")
+        self.assertTrue(decision.allow_trade)
+        self.assertIn("ema_downtrend_buy_soft", decision.gate_details["soft_guard_reasons"])
+        self.assertLess(decision.gate_details["gate_size_multiplier"], 1.0)
 
-    def test_signal_gate_blocks_sell_in_uptrend(self) -> None:
+    def test_signal_gate_softens_sell_in_uptrend(self) -> None:
         gate = SignalGate()
         decision = gate.evaluate(
             signal=DecisionOutcome(action="SELL", size_usd=20.0, reason="quoted_sell", source="test"),
@@ -176,8 +177,9 @@ class RegimeEdgeGateTests(unittest.TestCase):
             momentum_bps=20.0,
         )
 
-        self.assertFalse(decision.allow_trade)
-        self.assertEqual(decision.blocked_reason, "ema_uptrend_sell_blocked")
+        self.assertTrue(decision.allow_trade)
+        self.assertIn("ema_uptrend_sell_soft", decision.gate_details["soft_guard_reasons"])
+        self.assertLess(decision.gate_details["gate_size_multiplier"], 1.0)
 
     def test_signal_gate_allows_range_signal_with_positive_edge(self) -> None:
         gate = SignalGate()
@@ -223,7 +225,7 @@ class RegimeEdgeGateTests(unittest.TestCase):
         self.assertFalse(decision.allow_trade)
         self.assertEqual(decision.blocked_reason, "expected_edge_negative")
 
-    def test_signal_gate_blocks_buy_on_strong_negative_momentum(self) -> None:
+    def test_signal_gate_softens_buy_on_strong_negative_momentum(self) -> None:
         gate = SignalGate()
         decision = gate.evaluate(
             signal=DecisionOutcome(action="BUY", size_usd=20.0, reason="quoted_buy", source="test"),
@@ -239,10 +241,11 @@ class RegimeEdgeGateTests(unittest.TestCase):
             momentum_bps=-48.0,
         )
 
-        self.assertFalse(decision.allow_trade)
-        self.assertEqual(decision.blocked_reason, "momentum_drop_buy_blocked")
+        self.assertTrue(decision.allow_trade)
+        self.assertIn("momentum_drop_buy_soft", decision.gate_details["soft_guard_reasons"])
+        self.assertGreater(decision.gate_details["gate_spread_multiplier"], 1.0)
 
-    def test_signal_gate_blocks_buy_when_confirmation_still_falling(self) -> None:
+    def test_signal_gate_softens_buy_when_confirmation_still_falling(self) -> None:
         gate = SignalGate()
         decision = gate.evaluate(
             signal=DecisionOutcome(action="BUY", size_usd=20.0, reason="quoted_buy", source="test"),
@@ -261,8 +264,9 @@ class RegimeEdgeGateTests(unittest.TestCase):
             confirmation_slowing=False,
         )
 
-        self.assertFalse(decision.allow_trade)
-        self.assertEqual(decision.blocked_reason, "confirmation_blocks_buy")
+        self.assertTrue(decision.allow_trade)
+        self.assertIn("confirmation_blocks_buy_soft", decision.gate_details["soft_guard_reasons"])
+        self.assertLess(decision.gate_details["gate_size_multiplier"], 1.0)
 
     def test_edge_filter_rejects_reentry_with_shallow_pullback(self) -> None:
         edge_filter = EdgeFilter()

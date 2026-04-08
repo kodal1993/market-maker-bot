@@ -224,8 +224,8 @@ def evaluate_runtime_limits(
 
     if MAX_EXPOSURE_USD > 0 and exposure_usd > MAX_EXPOSURE_USD:
         return RiskLimitDecision(
-            stop_trading=True,
-            reason="max_exposure_limit",
+            stop_trading=False,
+            reason="max_exposure_soft_limit",
             details=(
                 f"exposure {exposure_usd:.2f} > {MAX_EXPOSURE_USD:.2f} "
                 f"| daily_pnl {daily_pnl_usd:.2f}"
@@ -286,8 +286,8 @@ def evaluate_trade_limits(
 
     if side.strip().lower() == "buy" and MAX_EXPOSURE_USD > 0 and projected_exposure > MAX_EXPOSURE_USD:
         return RiskLimitDecision(
-            stop_trading=True,
-            reason="max_exposure_limit",
+            stop_trading=False,
+            reason="max_exposure_soft_limit",
             details=(
                 f"projected_exposure {projected_exposure:.2f} > {MAX_EXPOSURE_USD:.2f} "
                 f"| trade_size {trade_size_usd:.2f}"
@@ -596,9 +596,6 @@ def build_partial_reset_buy_plan(
     usdc_share = runtime.portfolio.usdc / equity_usd
     target_inventory_usd = equity_usd * max(target_inventory_pct, 0.0)
     if usdc_share < PARTIAL_RESET_USDC_THRESHOLD_PCT or inventory_usd >= target_inventory_usd:
-        return None, 0.0
-
-    if not (buy_confirmation or trend_buy_allowed):
         return None, 0.0
 
     room_usd = min(

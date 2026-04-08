@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from config import (
     BOT_CONFIG_PROFILE,
     BOT_MODE,
+    COOLDOWN_AGGRESSIVE_SEC,
+    COOLDOWN_BASE_SEC,
+    COOLDOWN_DEFENSIVE_SEC,
     CONFIRMATION_TIMEFRAME_SECONDS,
     DECISION_ENGINE_ENABLED,
     EMA_RANGE_BAND_BPS,
@@ -20,6 +23,8 @@ from config import (
     FORCE_TRADE_SIZE_FRACTION,
     INACTIVITY_FORCE_ENTRY_MINUTES,
     INACTIVITY_FORCE_SIZE_MULTIPLIER,
+    INVENTORY_BAND_HIGH,
+    INVENTORY_BAND_LOW,
     INVENTORY_FORCED_REDUCE_AGGRESSION_BPS,
     INVENTORY_NEUTRAL_BAND_PCT,
     INVENTORY_SKEW_ACCELERATION,
@@ -224,6 +229,21 @@ class BotRuntime:
     current_edge_assessment: EdgeAssessment | None = None
     current_signal_gate_decision: SignalGateDecision | None = None
     current_market_mode: str = ""
+    current_mm_mode: str = "base_mm"
+    current_strategy_mode: str = "RANGE_MAKER"
+    current_quote_enabled: bool = True
+    current_aggressive_enabled: bool = False
+    current_activity_boost: float = 0.0
+    current_dynamic_cooldown_sec: float = 0.0
+    current_freeze_recovery_mode: bool = False
+    current_minutes_since_last_fill: float = 0.0
+    current_fill_quality_tier: str = "normal"
+    current_fill_quality_score: float = 1.0
+    current_fill_rate: float = 0.0
+    current_realized_spread_bps: float = 0.0
+    current_adverse_selection_bps: float = 0.0
+    current_post_fill_reversion_bps: float = 0.0
+    current_edge_bucket: str = "bad"
     current_trend_short_ma: float = 0.0
     current_trend_long_ma: float = 0.0
     current_trend_bias: str = "range"
@@ -329,6 +349,21 @@ class BotRuntime:
     cumulative_inventory_drift: float = 0.0
     max_inventory_drift: float = 0.0
     inventory_drift_samples: int = 0
+    quote_cycle_history: deque[int] = field(default_factory=lambda: deque(maxlen=720))
+    fill_cycle_history: deque[int] = field(default_factory=lambda: deque(maxlen=720))
+    fill_realized_spread_bps: deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    fill_adverse_selection_bps: deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    fill_hold_minutes_history: deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    fill_post_reversion_bps: deque[float] = field(default_factory=lambda: deque(maxlen=120))
+    summary_window_start_cycle: int = 0
+    summary_window_cycles: int = 0
+    summary_window_quotes_posted: int = 0
+    summary_window_fills: int = 0
+    summary_window_spread_total: float = 0.0
+    summary_window_edge_total: float = 0.0
+    summary_window_edge_samples: int = 0
+    summary_window_block_reasons: dict[str, int] = field(default_factory=dict)
+    last_freeze_block_summary_cycle: int | None = None
     last_rejection_cycle: int | None = None
     mode_counts: dict[str, int] = field(
         default_factory=lambda: {
@@ -336,6 +371,13 @@ class BotRuntime:
             "RANGE_MAKER": 0,
             "OVERWEIGHT_EXIT": 0,
             "NO_TRADE": 0,
+        }
+    )
+    mm_mode_counts: dict[str, int] = field(
+        default_factory=lambda: {
+            "aggressive": 0,
+            "base_mm": 0,
+            "defensive_mm": 0,
         }
     )
     feed_state_counts: dict[str, int] = field(
@@ -939,6 +981,8 @@ def _stop_for_risk_limit(
         _log_cycle(runtime, cycle_index, mode, intelligence, mid, source, equity_usd, pnl_usd, spread, inventory_usd)
         _log_trade_intent(runtime, cycle_index)
         _log_execution_decision(runtime, cycle_index)
+    _record_cycle_summary(runtime, cycle_index=cycle_index, spread_bps=spread, block_reason=reason)
+    _maybe_log_freeze_block_summary(runtime, cycle_index)
     _append_equity_row(**equity_row_kwargs)
     return False
 
@@ -1150,12 +1194,26 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
         "loss_pause_remaining": round(runtime.loss_pause_remaining_minutes, 6),
         "detected_regime": runtime.current_detected_regime,
         "inventory_state": runtime.current_inventory_state,
+        "mm_mode": runtime.current_mm_mode,
+        "strategy_mode": runtime.current_strategy_mode,
         "active_regime": runtime.current_active_regime,
         "trend_direction": runtime.current_trend_direction,
         "zone": runtime.current_zone,
         "range_location": runtime.current_range_location,
         "volatility_bucket": runtime.current_volatility_bucket,
         "activity_state": runtime.current_activity_state,
+        "activity_boost": round(runtime.current_activity_boost, 6),
+        "dynamic_cooldown_sec": round(runtime.current_dynamic_cooldown_sec, 6),
+        "freeze_recovery_mode": runtime.current_freeze_recovery_mode,
+        "minutes_since_last_fill": round(runtime.current_minutes_since_last_fill, 6),
+        "fill_quality_tier": runtime.current_fill_quality_tier,
+        "fill_quality_score": round(runtime.current_fill_quality_score, 6),
+        "fill_rate": round(runtime.current_fill_rate, 6),
+        "realized_spread_bps": round(runtime.current_realized_spread_bps, 6),
+        "adverse_selection_bps": round(runtime.current_adverse_selection_bps, 6),
+        "post_fill_reversion_bps": round(runtime.current_post_fill_reversion_bps, 6),
+        "quote_enabled": runtime.current_quote_enabled,
+        "aggressive_enabled": runtime.current_aggressive_enabled,
         "inventory_limit_state": runtime.current_inventory_limit_state,
         "soft_inventory_limit_usd": round(runtime.current_soft_inventory_limit_usd, 6),
         "hard_inventory_limit_usd": round(runtime.current_hard_inventory_limit_usd, 6),
@@ -1208,6 +1266,10 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
                 "cost_estimate_usd": round(edge.cost_estimate_usd, 6),
                 "slippage_estimate_bps": round(edge.slippage_estimate_bps, 6),
                 "mev_risk_score": round(edge.mev_risk_score, 6),
+                "edge_bucket": edge.edge_bucket,
+                "edge_size_multiplier": round(edge.size_multiplier, 6),
+                "edge_spread_multiplier": round(edge.spread_multiplier, 6),
+                "edge_cooldown_multiplier": round(edge.cooldown_multiplier, 6),
                 "entry_edge_bps": round(edge.expected_edge_bps, 6),
                 "entry_edge_usd": round(edge.expected_edge_usd, 6),
             }
@@ -1256,6 +1318,178 @@ def _intelligence_trend_direction(intelligence, regime_assessment: MarketRegimeA
 
 def _recent_trade_cycles(runtime: BotRuntime) -> list[int]:
     return [trade.cycle_index for trade in runtime.performance.trade_history]
+
+
+def _mean(values) -> float:
+    materialized = list(values)
+    if not materialized:
+        return 0.0
+    return sum(materialized) / len(materialized)
+
+
+def _cooldown_base_seconds(mm_mode: str) -> float:
+    normalized_mode = str(mm_mode).strip().lower()
+    if normalized_mode == "aggressive":
+        return max(COOLDOWN_AGGRESSIVE_SEC, 0.0)
+    if normalized_mode == "defensive_mm":
+        return max(COOLDOWN_DEFENSIVE_SEC, 0.0)
+    return max(COOLDOWN_BASE_SEC, 0.0)
+
+
+def _dynamic_cooldown_seconds(
+    *,
+    mm_mode: str,
+    activity_boost: float,
+    freeze_recovery_mode: bool,
+    cooldown_multiplier: float,
+) -> float:
+    cooldown_seconds = _cooldown_base_seconds(mm_mode) * max(cooldown_multiplier, 0.10)
+    cooldown_seconds *= max(1.0 - (max(activity_boost, 0.0) * 0.18), 0.55)
+    if freeze_recovery_mode:
+        cooldown_seconds *= 0.82
+    return max(cooldown_seconds, 0.0)
+
+
+def _minutes_since_last_fill(runtime: BotRuntime, cycle_index: int) -> float:
+    if runtime.last_fill_cycle is None:
+        return ((cycle_index + 1) * max(runtime.cycle_seconds, 1.0)) / 60.0
+    return max(((cycle_index - runtime.last_fill_cycle) * max(runtime.cycle_seconds, 1.0)) / 60.0, 0.0)
+
+
+def _recent_cycle_count(history: deque[int], floor_cycle: int) -> int:
+    return sum(1 for cycle in history if cycle >= floor_cycle)
+
+
+def _top_block_reasons_text(reason_counts: dict[str, int], limit: int = 3) -> str:
+    if not reason_counts:
+        return "-"
+    ranked = sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    return ", ".join(f"{reason}:{count}" for reason, count in ranked[:limit])
+
+
+def _update_fill_quality_state(runtime: BotRuntime, cycle_index: int) -> None:
+    lookback_cycles = max(int(round(3600.0 / max(runtime.cycle_seconds, 1.0))), 1)
+    floor_cycle = max(cycle_index - lookback_cycles, 0)
+    recent_quotes = _recent_cycle_count(runtime.quote_cycle_history, floor_cycle)
+    recent_fills = _recent_cycle_count(runtime.fill_cycle_history, floor_cycle)
+    fill_rate = (recent_fills / recent_quotes) if recent_quotes > 0 else 0.0
+    realized_spread_bps = _mean(runtime.fill_realized_spread_bps)
+    adverse_selection_bps = _mean(runtime.fill_adverse_selection_bps)
+    avg_hold_minutes = _mean(runtime.fill_hold_minutes_history)
+    post_fill_reversion_bps = _mean(runtime.fill_post_reversion_bps)
+
+    score = 1.0
+    if recent_quotes >= 5:
+        if fill_rate < 0.06:
+            score -= 0.20
+        elif fill_rate < 0.10:
+            score -= 0.12
+        elif fill_rate < 0.15:
+            score -= 0.06
+
+    if recent_fills >= 3:
+        if realized_spread_bps < 1.0:
+            score -= 0.16
+        elif realized_spread_bps < 2.0:
+            score -= 0.10
+        if adverse_selection_bps > 8.0:
+            score -= 0.18
+        elif adverse_selection_bps > 4.0:
+            score -= 0.10
+        if avg_hold_minutes > 90.0:
+            score -= 0.10
+        elif avg_hold_minutes > 45.0:
+            score -= 0.05
+        if post_fill_reversion_bps > 15.0:
+            score -= 0.16
+        elif post_fill_reversion_bps > 8.0:
+            score -= 0.08
+
+    score = min(max(score, 0.35 if recent_quotes > 0 else 1.0), 1.25)
+    fill_quality_tier = "normal"
+    if score < 0.65:
+        fill_quality_tier = "poor"
+    elif score < 0.85:
+        fill_quality_tier = "weak"
+
+    runtime.current_fill_rate = fill_rate
+    runtime.current_realized_spread_bps = realized_spread_bps
+    runtime.current_adverse_selection_bps = adverse_selection_bps
+    runtime.current_post_fill_reversion_bps = post_fill_reversion_bps
+    runtime.current_hold_minutes = max(runtime.current_hold_minutes, 0.0)
+    runtime.current_fill_quality_score = score
+    runtime.current_fill_quality_tier = fill_quality_tier
+
+
+def _record_cycle_summary(
+    runtime: BotRuntime,
+    *,
+    cycle_index: int,
+    spread_bps: float,
+    block_reason: str,
+) -> None:
+    runtime.summary_window_cycles += 1
+    runtime.summary_window_spread_total += max(spread_bps, 0.0)
+    if runtime.current_quote_enabled:
+        runtime.summary_window_quotes_posted += 1
+        runtime.quote_cycle_history.append(cycle_index)
+    edge = runtime.current_edge_assessment
+    if edge is not None:
+        runtime.summary_window_edge_total += edge.expected_edge_bps
+        runtime.summary_window_edge_samples += 1
+    normalized_block_reason = (
+        block_reason
+        or runtime.current_signal_block_reason
+        or runtime.last_decision_block_reason
+        or ""
+    )
+    if normalized_block_reason:
+        runtime.summary_window_block_reasons[normalized_block_reason] = (
+            runtime.summary_window_block_reasons.get(normalized_block_reason, 0) + 1
+        )
+
+    summary_window_cycles = max(int(round(900.0 / max(runtime.cycle_seconds, 1.0))), 1)
+    if runtime.summary_window_cycles < summary_window_cycles:
+        return
+
+    avg_spread = runtime.summary_window_spread_total / max(runtime.summary_window_cycles, 1)
+    avg_edge = runtime.summary_window_edge_total / max(runtime.summary_window_edge_samples, 1)
+    log(
+        "15m summary | "
+        f"cycles {runtime.summary_window_cycles} | "
+        f"quotes {runtime.summary_window_quotes_posted} | "
+        f"fills {runtime.summary_window_fills} | "
+        f"avg_spread_bps {avg_spread:.2f} | "
+        f"avg_edge_bps {avg_edge:.2f} | "
+        f"top_block_reasons {_top_block_reasons_text(runtime.summary_window_block_reasons)} | "
+        f"minutes_since_last_fill {runtime.current_minutes_since_last_fill:.1f}"
+    )
+    runtime.summary_window_start_cycle = cycle_index
+    runtime.summary_window_cycles = 0
+    runtime.summary_window_quotes_posted = 0
+    runtime.summary_window_fills = 0
+    runtime.summary_window_spread_total = 0.0
+    runtime.summary_window_edge_total = 0.0
+    runtime.summary_window_edge_samples = 0
+    runtime.summary_window_block_reasons = {}
+
+
+def _maybe_log_freeze_block_summary(runtime: BotRuntime, cycle_index: int) -> None:
+    if runtime.current_minutes_since_last_fill < 40.0:
+        return
+    if (
+        runtime.last_freeze_block_summary_cycle is not None
+        and (cycle_index - runtime.last_freeze_block_summary_cycle) * max(runtime.cycle_seconds, 1.0) < 20.0 * 60.0
+    ):
+        return
+    runtime.last_freeze_block_summary_cycle = cycle_index
+    log(
+        "freeze block summary | "
+        f"minutes_since_last_fill {runtime.current_minutes_since_last_fill:.1f} | "
+        f"top_block_reasons {_top_block_reasons_text(runtime.summary_window_block_reasons or runtime.rejection_reason_counts)} | "
+        f"fill_quality {runtime.current_fill_quality_tier}:{runtime.current_fill_quality_score:.2f} | "
+        f"activity_boost {runtime.current_activity_boost:.2f}"
+    )
 
 
 def _inventory_neutral_band_ratio() -> float:
@@ -1329,6 +1563,21 @@ def _apply_runtime_regime_context(
 ) -> None:
     inventory_ratio = getattr(inventory_profile, "inventory_ratio", 0.0)
     target_inventory_pct = getattr(intelligence, "target_inventory_pct", 0.0)
+    runtime.current_mm_mode = getattr(intelligence, "mm_mode", runtime.current_mm_mode)
+    runtime.current_strategy_mode = getattr(intelligence, "strategy_mode", getattr(intelligence, "mode", "RANGE_MAKER"))
+    runtime.current_quote_enabled = bool(getattr(intelligence, "quote_enabled", True))
+    runtime.current_aggressive_enabled = bool(getattr(intelligence, "aggressive_enabled", False))
+    runtime.current_activity_boost = float(getattr(intelligence, "activity_boost", 0.0))
+    runtime.current_freeze_recovery_mode = bool(getattr(intelligence, "freeze_recovery_mode", False))
+    runtime.current_minutes_since_last_fill = float(getattr(intelligence, "minutes_since_last_fill", 0.0))
+    runtime.current_fill_quality_tier = str(getattr(intelligence, "fill_quality_tier", runtime.current_fill_quality_tier))
+    runtime.current_fill_quality_score = float(getattr(intelligence, "fill_quality_score", runtime.current_fill_quality_score))
+    runtime.current_dynamic_cooldown_sec = _dynamic_cooldown_seconds(
+        mm_mode=runtime.current_mm_mode,
+        activity_boost=runtime.current_activity_boost,
+        freeze_recovery_mode=runtime.current_freeze_recovery_mode,
+        cooldown_multiplier=float(getattr(intelligence, "cooldown_multiplier", 1.0)),
+    )
     _apply_inventory_drift_state(
         runtime,
         inventory_ratio=inventory_ratio,
@@ -1531,6 +1780,33 @@ def _raw_signal_label(decision: DecisionOutcome) -> str:
     return f"{action}:{source}:{reason}"
 
 
+def _side_inventory_size_multiplier(intelligence, inventory_profile, side: str) -> float:
+    inventory_ratio = float(getattr(inventory_profile, "inventory_ratio", 0.5))
+    target_inventory_pct = float(getattr(intelligence, "target_inventory_pct", 0.5))
+    inventory_band_low = float(getattr(inventory_profile, "lower_bound", INVENTORY_BAND_LOW))
+    inventory_band_high = float(getattr(inventory_profile, "upper_bound", INVENTORY_BAND_HIGH))
+    deviation = inventory_ratio - target_inventory_pct
+    if side == "buy":
+        if deviation > 0:
+            return max(1.0 - (deviation / max(1.0 - inventory_band_low, 0.1)) * 0.35, 0.55)
+        return min(1.0 + (abs(deviation) / max(inventory_band_high, 0.1)) * 0.30, 1.25)
+    if deviation < 0:
+        return max(1.0 - (abs(deviation) / max(inventory_band_high, 0.1)) * 0.35, 0.55)
+    return min(1.0 + (deviation / max(1.0 - inventory_band_low, 0.1)) * 0.30, 1.25)
+
+
+def _apply_price_multiplier(action: str, order_price: float, mid: float, spread_multiplier: float) -> float:
+    if order_price <= 0 or mid <= 0:
+        return order_price
+    distance = abs(order_price - mid)
+    adjusted_distance = distance * max(spread_multiplier, 0.20)
+    if action == "BUY":
+        return min(mid, max(mid - adjusted_distance, 0.0))
+    if action == "SELL":
+        return max(mid, mid + adjusted_distance)
+    return order_price
+
+
 def _apply_signal_pipeline(
     runtime: BotRuntime,
     *,
@@ -1600,8 +1876,11 @@ def _apply_signal_pipeline(
         min_edge_multiplier=max(runtime.current_min_edge_bps / max(RANGE_MIN_EDGE_BPS, 0.5), 0.35),
     )
     runtime.current_edge_assessment = edge_assessment
+    runtime.current_edge_bucket = edge_assessment.edge_bucket
+    runtime.current_aggressive_enabled = runtime.current_aggressive_enabled or edge_assessment.aggressive_enabled
     runtime.current_entry_edge_bps = edge_assessment.expected_edge_bps
     runtime.current_entry_edge_usd = edge_assessment.expected_edge_usd
+    runtime.current_dynamic_cooldown_sec *= max(edge_assessment.cooldown_multiplier, 0.10)
 
     gate_decision = runtime.signal_gate.evaluate(
         signal=decision,
@@ -1657,12 +1936,30 @@ def _apply_signal_pipeline(
             filter_values=merged_filter_values,
         )
 
+    gate_size_multiplier = float(gate_decision.gate_details.get("gate_size_multiplier", 1.0) or 1.0)
+    gate_spread_multiplier = float(gate_decision.gate_details.get("gate_spread_multiplier", 1.0) or 1.0)
+    adjusted_size_usd = decision.size_usd * max(edge_assessment.size_multiplier, 0.10) * max(gate_size_multiplier, 0.10)
+    adjusted_order_price = _apply_price_multiplier(
+        decision.action,
+        decision.order_price,
+        mid,
+        max(edge_assessment.spread_multiplier, 0.20) * max(gate_spread_multiplier, 0.20),
+    )
+    merged_filter_values = _merge_filter_values(
+        merged_filter_values,
+        edge_bucket=edge_assessment.edge_bucket,
+        aggressive_enabled=runtime.current_aggressive_enabled,
+        adjusted_size_usd=round(adjusted_size_usd, 6),
+        adjusted_order_price=round(adjusted_order_price, 6),
+        dynamic_cooldown_sec=round(runtime.current_dynamic_cooldown_sec, 6),
+    )
+
     return DecisionOutcome(
         action=decision.action,
-        size_usd=decision.size_usd,
+        size_usd=adjusted_size_usd,
         reason=decision.reason,
         source=decision.source,
-        order_price=decision.order_price,
+        order_price=adjusted_order_price,
         inventory_cap_usd=decision.inventory_cap_usd,
         overridden_signals=decision.overridden_signals,
         block_reason=decision.block_reason,
@@ -2453,6 +2750,26 @@ def _record_fill(
     runtime.last_trade_reason = _trade_reason_category(mode, fill.trade_reason)
     runtime.last_trade_reason_detail = fill.trade_reason
     runtime.current_hold_minutes = float(trade_analysis.get("hold_minutes") or 0.0)
+    runtime.summary_window_fills += 1
+    runtime.fill_cycle_history.append(cycle_index)
+    mid_reference = runtime.last_mid if runtime.last_mid > 0 else fill.price
+    if mid_reference > 0:
+        if fill.side == "buy":
+            realized_spread_bps = max(((mid_reference - fill.price) / mid_reference) * 10000.0, 0.0)
+            adverse_selection_bps = max(((fill.price - mid_reference) / mid_reference) * 10000.0, 0.0)
+        else:
+            realized_spread_bps = max(((fill.price - mid_reference) / mid_reference) * 10000.0, 0.0)
+            adverse_selection_bps = max(((mid_reference - fill.price) / mid_reference) * 10000.0, 0.0)
+    else:
+        realized_spread_bps = 0.0
+        adverse_selection_bps = 0.0
+    realized_edge_bps = (realized_pnl_delta / max(fill.size_usd, 1.0)) * 10000.0
+    post_fill_reversion_bps = max(runtime.current_entry_edge_bps - realized_edge_bps, 0.0)
+    runtime.fill_realized_spread_bps.append(realized_spread_bps)
+    runtime.fill_adverse_selection_bps.append(adverse_selection_bps)
+    runtime.fill_post_reversion_bps.append(post_fill_reversion_bps)
+    if runtime.current_hold_minutes > 0:
+        runtime.fill_hold_minutes_history.append(runtime.current_hold_minutes)
     log_trade_record(
         pair=runtime.last_execution_pair or "WETH/USDC",
         side=fill.side,
@@ -2615,6 +2932,7 @@ def _record_fill(
         except Exception as exc:  # noqa: BLE001 - notifications must never break trading
             log(f"Telegram trade notify failed | cycle {cycle_index} | error {exc}")
 
+    _update_fill_quality_state(runtime, cycle_index)
     return trade_analysis
 
 
@@ -2672,6 +2990,8 @@ def _process_price_tick_with_decision_engine(
     inventory_usd, equity_usd, pnl_usd = _account_state(runtime, mid)
     _track_runtime_state(runtime, cycle_index, mid, inventory_usd, equity_usd, pnl_usd, record_equity=True)
     _sync_daily_risk_state(runtime, equity_usd)
+    _update_fill_quality_state(runtime, cycle_index)
+    runtime.current_minutes_since_last_fill = _minutes_since_last_fill(runtime, cycle_index)
 
     sizing = _update_runtime_sizing(runtime, equity_usd=equity_usd, mid=mid)
 
@@ -2686,6 +3006,9 @@ def _process_price_tick_with_decision_engine(
         cycle_seconds=runtime.cycle_seconds,
         recent_trade_cycles=_recent_trade_cycles(runtime),
         paper_mode=_paper_mode_enabled(),
+        minutes_since_last_fill=runtime.current_minutes_since_last_fill,
+        fill_quality_score=runtime.current_fill_quality_score,
+        fill_quality_tier=runtime.current_fill_quality_tier,
     )
     runtime.current_market_mode = _intelligence_active_regime(intelligence)
     _refresh_timeframe_signals(runtime)
@@ -2722,6 +3045,7 @@ def _process_price_tick_with_decision_engine(
     runtime.current_entry_edge_bps = 0.0
     runtime.current_entry_edge_usd = 0.0
     runtime.current_signal_block_reason = ""
+    runtime.current_edge_bucket = "bad"
 
     min_notional_usd = sizing.min_notional_usd
     available_quote_usd = sizing.available_quote_to_trade_usd
@@ -2729,8 +3053,11 @@ def _process_price_tick_with_decision_engine(
     effective_max_inventory_usd = max(sizing.max_position_usd * intelligence.max_inventory_multiplier, 0.0)
     spread = calculate_spread(intelligence.volatility, intelligence.spread_multiplier)
     min_sell_price = portfolio.min_profitable_sell_price(MAKER_FEE_BPS, MIN_SELL_PROFIT_BPS)
-    mode = intelligence.mode
+    strategy_mode = getattr(intelligence, "strategy_mode", intelligence.mode)
+    mm_mode = getattr(intelligence, "mm_mode", "base_mm")
+    mode = strategy_mode
     runtime.mode_counts[mode] = runtime.mode_counts.get(mode, 0) + 1
+    runtime.mm_mode_counts[mm_mode] = runtime.mm_mode_counts.get(mm_mode, 0) + 1
     runtime.feed_state_counts[intelligence.feed_state] = runtime.feed_state_counts.get(intelligence.feed_state, 0) + 1
 
     trade_size_usd = choose_trade_size_usd(
@@ -2739,7 +3066,7 @@ def _process_price_tick_with_decision_engine(
         inventory_usd=inventory_usd,
         max_inventory_usd=effective_max_inventory_usd,
     ) * intelligence.trade_size_multiplier
-    trade_size_usd = min(max(trade_size_usd, 0.0), base_trade_size_usd)
+    trade_size_usd = min(max(trade_size_usd, 0.0), max(sizing.max_trade_size_usd, base_trade_size_usd))
     buy_confirmation, current_rsi, _, _ = _buy_confirmation(runtime.prices)
     momentum_bps = calculate_recent_momentum_bps(runtime.prices)
     cooldown_remaining = (
@@ -2776,6 +3103,10 @@ def _process_price_tick_with_decision_engine(
         max_inventory_usd=effective_max_inventory_usd,
         inventory_skew_strength=_inventory_skew_strength(intelligence, inventory_profile),
         directional_bias=intelligence.directional_bias,
+        inventory_ratio=inventory_profile.inventory_ratio,
+        target_inventory_ratio=intelligence.target_inventory_pct,
+        inventory_band_low=INVENTORY_BAND_LOW,
+        inventory_band_high=INVENTORY_BAND_HIGH,
     )
 
     trend_buy_target_pct = min(TREND_BUY_TARGET_PCT, intelligence.target_inventory_pct)
@@ -2842,6 +3173,14 @@ def _process_price_tick_with_decision_engine(
     buy_drift_block_reason = ""
     sell_drift_block_reason = ""
     inventory_drift_guard_reasons: list[str] = []
+    buy_side_trade_size_usd = min(
+        trade_size_usd * _side_inventory_size_multiplier(intelligence, inventory_profile, "buy"),
+        available_quote_usd,
+    )
+    sell_side_trade_size_usd = min(
+        trade_size_usd * _side_inventory_size_multiplier(intelligence, inventory_profile, "sell"),
+        max(inventory_profile.max_sell_usd, 0.0),
+    )
 
     strategy_buy_candidate = None
     range_entry_allowed = _range_entry_signal_allowed(
@@ -2857,7 +3196,7 @@ def _process_price_tick_with_decision_engine(
         and not getattr(inventory_profile, "reduction_only", False)
         and runtime.current_regime_assessment is not None
     ):
-        range_buy_size_usd = trade_size_usd
+        range_buy_size_usd = buy_side_trade_size_usd
         range_buy_reason = "range_buy"
         if runtime.current_inactivity_fallback_active:
             range_buy_size_usd *= max(min(INACTIVITY_FORCE_SIZE_MULTIPLIER, 1.0), 0.0)
@@ -2880,12 +3219,31 @@ def _process_price_tick_with_decision_engine(
     elif buy_state_allowed and not state_requires_reentry_only and trend_signal_allows_buy and not getattr(inventory_profile, "reduction_only", False):
         strategy_buy_candidate = DecisionOutcome(
             action="BUY",
-            size_usd=trade_size_usd,
+            size_usd=buy_side_trade_size_usd,
             reason="trend_buy",
             source="strategy",
             order_price=strategy_buy_price,
             inventory_cap_usd=default_buy_inventory_cap,
         )
+    elif (
+        buy_state_allowed
+        and not state_requires_reentry_only
+        and adjusted_buy_enabled
+        and not getattr(inventory_profile, "reduction_only", False)
+        and mm_mode in {"base_mm", "defensive_mm"}
+        and runtime.current_regime_assessment is not None
+        and runtime.current_regime_assessment.price_position_pct <= 0.55
+    ):
+        base_mm_buy_size = buy_side_trade_size_usd * (0.85 if mm_mode == "defensive_mm" else 1.0)
+        if base_mm_buy_size >= min_notional_usd:
+            strategy_buy_candidate = DecisionOutcome(
+                action="BUY",
+                size_usd=base_mm_buy_size,
+                reason="base_mm_buy",
+                source="strategy",
+                order_price=strategy_buy_price,
+                inventory_cap_usd=default_buy_inventory_cap,
+            )
     strategy_buy_candidate, blocked_reason = _apply_inventory_drift_guard(runtime, strategy_buy_candidate)
     if blocked_reason:
         buy_drift_block_reason = blocked_reason
@@ -2915,7 +3273,7 @@ def _process_price_tick_with_decision_engine(
                 inventory_cap_usd=default_buy_inventory_cap,
             )
         elif _trend_rally_sell_signal_allowed(intelligence, runtime.current_regime_assessment):
-            strategy_sell_size_usd = min(trade_size_usd, max(inventory_profile.max_sell_usd, 0.0))
+            strategy_sell_size_usd = sell_side_trade_size_usd
             if strategy_sell_size_usd >= min_notional_usd:
                 strategy_sell_candidate = DecisionOutcome(
                     action="SELL",
@@ -2926,12 +3284,11 @@ def _process_price_tick_with_decision_engine(
                     inventory_cap_usd=default_buy_inventory_cap,
                 )
         elif (
-            _intelligence_active_regime(intelligence) != "RANGE"
-            and not _should_delay_regular_sell(runtime, mode)
+            not _should_delay_regular_sell(runtime, mode)
             and adjusted_sell_enabled
             and mode in {"TREND_UP", "RANGE_MAKER"}
         ):
-            strategy_sell_size_usd = trade_size_usd
+            strategy_sell_size_usd = sell_side_trade_size_usd
             if mode == "TREND_UP":
                 target_inventory_usd = equity_usd * min(max(trend_buy_target_pct, 0.0), 1.0)
                 strategy_sell_size_usd = min(strategy_sell_size_usd, max(inventory_usd - target_inventory_usd, 0.0))
@@ -2945,7 +3302,7 @@ def _process_price_tick_with_decision_engine(
                     inventory_cap_usd=default_buy_inventory_cap,
                 )
         if getattr(inventory_profile, "force_limit_hit", False):
-            forced_reduce_size_usd = min(max(trade_size_usd, min_notional_usd), inventory_profile.max_sell_usd)
+            forced_reduce_size_usd = min(max(sell_side_trade_size_usd, min_notional_usd), inventory_profile.max_sell_usd)
             if forced_reduce_size_usd >= min_notional_usd:
                 strategy_sell_candidate = DecisionOutcome(
                     action="SELL",
@@ -2991,7 +3348,7 @@ def _process_price_tick_with_decision_engine(
     inventory_candidate = None
     if not in_cooldown:
         if sell_state_allowed and inventory_profile.inventory_ratio > inventory_profile.upper_bound:
-            inventory_sell_size = min(max(trade_size_usd, min_notional_usd), inventory_profile.max_sell_usd)
+            inventory_sell_size = min(max(sell_side_trade_size_usd, min_notional_usd), inventory_profile.max_sell_usd)
             if inventory_sell_size >= min_notional_usd:
                 inventory_candidate = DecisionOutcome(
                     action="SELL",
@@ -3026,9 +3383,9 @@ def _process_price_tick_with_decision_engine(
                     order_price=strategy_mid,
                     inventory_cap_usd=reentry_buy_inventory_cap,
                 )
-            elif buy_confirmation or trend_signal_allows_buy:
+            else:
                 inventory_buy_size = min(
-                    max(trade_size_usd * PARTIAL_RESET_BUY_FRACTION, min_notional_usd),
+                    max(buy_side_trade_size_usd * PARTIAL_RESET_BUY_FRACTION, min_notional_usd),
                     inventory_profile.max_buy_usd,
                     available_quote_usd,
                 )
@@ -3043,7 +3400,7 @@ def _process_price_tick_with_decision_engine(
                     )
 
     if mode == "OVERWEIGHT_EXIT" and sell_state_allowed and inventory_candidate is None:
-        overweight_sell_size = min(max(trade_size_usd, min_notional_usd), inventory_profile.max_sell_usd)
+        overweight_sell_size = min(max(sell_side_trade_size_usd, min_notional_usd), inventory_profile.max_sell_usd)
         if overweight_sell_size >= min_notional_usd:
             inventory_candidate = DecisionOutcome(
                 action="SELL",
@@ -3150,6 +3507,12 @@ def _process_price_tick_with_decision_engine(
             volatility_state=intelligence.volatility_state,
             trade_count=engine.trade_count,
             daily_trade_count=runtime.daily_trade_count,
+            market_mode=mm_mode,
+            recent_trade_count_60m=getattr(intelligence, "trades_last_60m", 0),
+            activity_boost=getattr(intelligence, "activity_boost", 0.0),
+            freeze_recovery_mode=getattr(intelligence, "freeze_recovery_mode", False),
+            fill_quality_tier=getattr(intelligence, "fill_quality_tier", "normal"),
+            cooldown_multiplier=getattr(intelligence, "cooldown_multiplier", 1.0),
         )
     decision = _apply_signal_pipeline(
         runtime,
@@ -3288,6 +3651,8 @@ def _process_price_tick_with_decision_engine(
         )
         if log_progress:
             _log_cycle(runtime, cycle_index, mode, intelligence, mid, source, equity_usd, pnl_usd, spread, inventory_usd)
+        _record_cycle_summary(runtime, cycle_index=cycle_index, spread_bps=spread, block_reason=no_trade_reason)
+        _maybe_log_freeze_block_summary(runtime, cycle_index)
         _append_equity_row(**equity_row_kwargs)
         return _kill_switch_allows_continue(pnl_usd, log_progress)
 
@@ -3598,6 +3963,13 @@ def _process_price_tick_with_decision_engine(
             details=post_cycle_limit_decision.details,
         )
 
+    _record_cycle_summary(
+        runtime,
+        cycle_index=cycle_index,
+        spread_bps=spread,
+        block_reason=runtime.last_decision_block_reason,
+    )
+    _maybe_log_freeze_block_summary(runtime, cycle_index)
     _append_equity_row(**equity_row_kwargs)
     if post_cycle_limit_decision.stop_trading:
         return False
@@ -3640,6 +4012,8 @@ def process_price_tick(
     inventory_usd, equity_usd, pnl_usd = _account_state(runtime, mid)
     _track_runtime_state(runtime, cycle_index, mid, inventory_usd, equity_usd, pnl_usd, record_equity=True)
     _sync_daily_risk_state(runtime, equity_usd)
+    _update_fill_quality_state(runtime, cycle_index)
+    runtime.current_minutes_since_last_fill = _minutes_since_last_fill(runtime, cycle_index)
     sizing = _update_runtime_sizing(runtime, equity_usd=equity_usd, mid=mid)
 
     intelligence = runtime.intelligence.build_snapshot(
@@ -3653,6 +4027,9 @@ def process_price_tick(
         cycle_seconds=runtime.cycle_seconds,
         recent_trade_cycles=_recent_trade_cycles(runtime),
         paper_mode=_paper_mode_enabled(),
+        minutes_since_last_fill=runtime.current_minutes_since_last_fill,
+        fill_quality_score=runtime.current_fill_quality_score,
+        fill_quality_tier=runtime.current_fill_quality_tier,
     )
     runtime.current_market_mode = _intelligence_active_regime(intelligence)
     _refresh_timeframe_signals(runtime)
@@ -3689,6 +4066,7 @@ def process_price_tick(
     runtime.current_entry_edge_bps = 0.0
     runtime.current_entry_edge_usd = 0.0
     runtime.current_signal_block_reason = ""
+    runtime.current_edge_bucket = "bad"
 
     min_notional_usd = sizing.min_notional_usd
     available_quote_usd = sizing.available_quote_to_trade_usd
@@ -3696,8 +4074,11 @@ def process_price_tick(
     effective_max_inventory_usd = max(sizing.max_position_usd * intelligence.max_inventory_multiplier, 0.0)
     spread = calculate_spread(intelligence.volatility, intelligence.spread_multiplier)
     min_sell_price = portfolio.min_profitable_sell_price(MAKER_FEE_BPS, MIN_SELL_PROFIT_BPS)
-    mode = intelligence.mode
+    strategy_mode = getattr(intelligence, "strategy_mode", intelligence.mode)
+    mm_mode = getattr(intelligence, "mm_mode", "base_mm")
+    mode = strategy_mode
     runtime.mode_counts[mode] = runtime.mode_counts.get(mode, 0) + 1
+    runtime.mm_mode_counts[mm_mode] = runtime.mm_mode_counts.get(mm_mode, 0) + 1
     runtime.feed_state_counts[intelligence.feed_state] = runtime.feed_state_counts.get(intelligence.feed_state, 0) + 1
 
     trade_size_usd = choose_trade_size_usd(
@@ -3706,7 +4087,7 @@ def process_price_tick(
         inventory_usd=inventory_usd,
         max_inventory_usd=effective_max_inventory_usd,
     ) * intelligence.trade_size_multiplier
-    trade_size_usd = min(max(trade_size_usd, 0.0), base_trade_size_usd)
+    trade_size_usd = min(max(trade_size_usd, 0.0), max(sizing.max_trade_size_usd, base_trade_size_usd))
     buy_confirmation, current_rsi, _, _ = _buy_confirmation(runtime.prices)
     momentum_bps = calculate_recent_momentum_bps(runtime.prices)
     cooldown_remaining = (
@@ -3838,7 +4219,8 @@ def process_price_tick(
         )
         if log_progress:
             _log_cycle(runtime, cycle_index, mode, intelligence, mid, source, equity_usd, pnl_usd, spread, inventory_usd)
-
+        _record_cycle_summary(runtime, cycle_index=cycle_index, spread_bps=spread, block_reason=no_trade_reason)
+        _maybe_log_freeze_block_summary(runtime, cycle_index)
         _append_equity_row(**equity_row_kwargs)
 
         return _kill_switch_allows_continue(pnl_usd, log_progress)
@@ -3850,6 +4232,10 @@ def process_price_tick(
         max_inventory_usd=effective_max_inventory_usd,
         inventory_skew_strength=INVENTORY_SKEW_STRENGTH * intelligence.inventory_skew_multiplier,
         directional_bias=intelligence.directional_bias,
+        inventory_ratio=inventory_profile.inventory_ratio,
+        target_inventory_ratio=intelligence.target_inventory_pct,
+        inventory_band_low=INVENTORY_BAND_LOW,
+        inventory_band_high=INVENTORY_BAND_HIGH,
     )
     buy_order, sell_order = engine.create_orders(quote.bid, quote.ask, trade_size_usd, mode)
 
@@ -4717,6 +5103,13 @@ def process_price_tick(
             details=post_cycle_limit_decision.details,
         )
 
+    _record_cycle_summary(
+        runtime,
+        cycle_index=cycle_index,
+        spread_bps=spread,
+        block_reason=runtime.last_decision_block_reason,
+    )
+    _maybe_log_freeze_block_summary(runtime, cycle_index)
     _append_equity_row(**equity_row_kwargs)
     if post_cycle_limit_decision.stop_trading:
         return False
@@ -4795,6 +5188,7 @@ def build_summary(runtime: BotRuntime) -> dict:
         "total_cycles": total_cycles,
         "no_trade_ratio": _ratio(runtime.mode_counts.get("NO_TRADE", 0)),
         "mode_counts": dict(runtime.mode_counts),
+        "mm_mode_counts": dict(runtime.mm_mode_counts),
         "mode_distribution_pct": mode_distribution_pct,
         "mode_trade_counts": dict(runtime.mode_trade_counts),
         "mode_buy_counts": dict(runtime.mode_buy_counts),
@@ -4831,6 +5225,21 @@ def build_summary(runtime: BotRuntime) -> dict:
         "active_regime": runtime.current_active_regime,
         "trend_direction": runtime.current_trend_direction,
         "activity_state": runtime.current_activity_state,
+        "mm_mode": runtime.current_mm_mode,
+        "strategy_mode": runtime.current_strategy_mode,
+        "quote_enabled": runtime.current_quote_enabled,
+        "aggressive_enabled": runtime.current_aggressive_enabled,
+        "activity_boost": runtime.current_activity_boost,
+        "dynamic_cooldown_sec": runtime.current_dynamic_cooldown_sec,
+        "freeze_recovery_mode": runtime.current_freeze_recovery_mode,
+        "minutes_since_last_fill": runtime.current_minutes_since_last_fill,
+        "fill_quality_tier": runtime.current_fill_quality_tier,
+        "fill_quality_score": runtime.current_fill_quality_score,
+        "fill_rate": runtime.current_fill_rate,
+        "realized_spread_bps": runtime.current_realized_spread_bps,
+        "adverse_selection_bps": runtime.current_adverse_selection_bps,
+        "post_fill_reversion_bps": runtime.current_post_fill_reversion_bps,
+        "edge_bucket": runtime.current_edge_bucket,
         "inactivity_fallback_active": runtime.current_inactivity_fallback_active,
         "regime_confidence": 0.0 if regime is None else regime.regime_confidence,
         "range_width_pct": 0.0 if regime is None else regime.range_width_pct,
@@ -4908,6 +5317,7 @@ def log_summary(summary: dict) -> None:
     log(f"Taker count: {summary['taker_count']}")
     log(f"Avg slippage: {summary['avg_slippage_bps']:.4f} bps")
     log(f"Mode counts: {summary['mode_counts']}")
+    log(f"MM mode counts: {summary['mm_mode_counts']}")
     log(f"Mode trade counts: {summary['mode_trade_counts']}")
     log(f"Mode realized pnl: {summary['mode_realized_pnl_usd']}")
     log(f"Regime trade counts: {summary['regime_trade_counts']}")
@@ -4919,3 +5329,12 @@ def log_summary(summary: dict) -> None:
     )
     log(f"Rejection stats: {summary['rejection_reason_stats']}")
     log(f"Feed states: {summary['feed_state_counts']}")
+    log(
+        f"Current MM state: mode {summary['mm_mode']} | strategy {summary['strategy_mode']} | "
+        f"quote_enabled {summary['quote_enabled']} | aggressive {summary['aggressive_enabled']}"
+    )
+    log(
+        f"Activity/fill quality: boost {summary['activity_boost']:.2f} | cooldown {summary['dynamic_cooldown_sec']:.1f}s | "
+        f"freeze {summary['freeze_recovery_mode']} | mins_since_fill {summary['minutes_since_last_fill']:.1f} | "
+        f"fill_quality {summary['fill_quality_tier']}:{summary['fill_quality_score']:.2f}"
+    )

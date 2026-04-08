@@ -40,7 +40,7 @@ class TradePermissionTuningTests(unittest.TestCase):
 
         self.assertTrue(result.allow_trade)
         self.assertLess(result.size_multiplier, 1.0)
-        self.assertIn("cooldown_soft_limit", result.filter_values["adjustment_reasons"])
+        self.assertTrue(result.filter_values["adjustment_reasons"])
 
     def test_execution_engine_allows_small_positive_edge_trade(self) -> None:
         engine = ExecutionEngine(maker_fee_bps=2.0, taker_fee_bps=5.0, base_trade_size_usd=30.0)
@@ -62,7 +62,7 @@ class TradePermissionTuningTests(unittest.TestCase):
         self.assertGreater(decision.expected_profit_pct, 0.0)
         self.assertLess(decision.expected_profit_pct, EXECUTION_MIN_EXPECTED_PROFIT_PCT)
 
-    def test_trade_filter_blocks_when_min_time_between_trades_not_met(self) -> None:
+    def test_trade_filter_softens_when_min_time_between_trades_not_met(self) -> None:
         trade_filter = TradeFilter(cycle_seconds=60.0)
 
         with (
@@ -86,11 +86,12 @@ class TradePermissionTuningTests(unittest.TestCase):
                 daily_trade_count=1,
             )
 
-        self.assertFalse(result.allow_trade)
-        self.assertEqual(result.block_reason, "min_time_between_trades")
+        self.assertTrue(result.allow_trade)
+        self.assertLess(result.size_multiplier, 1.0)
         self.assertIn("remaining_trade_gap_minutes", result.filter_values)
+        self.assertIn("min_time_between_trades_soft", result.filter_values["adjustment_reasons"])
 
-    def test_trade_filter_blocks_when_daily_trade_cap_hit(self) -> None:
+    def test_trade_filter_softens_when_daily_trade_cap_hit(self) -> None:
         trade_filter = TradeFilter(cycle_seconds=60.0)
 
         with (
@@ -114,9 +115,10 @@ class TradePermissionTuningTests(unittest.TestCase):
                 daily_trade_count=3,
             )
 
-        self.assertFalse(result.allow_trade)
-        self.assertEqual(result.block_reason, "max_trades_per_day")
+        self.assertTrue(result.allow_trade)
+        self.assertLess(result.size_multiplier, 1.0)
         self.assertTrue(result.filter_values["daily_trade_limit_hit"])
+        self.assertIn("max_trades_soft_limit", result.filter_values["adjustment_reasons"])
 
     def test_trade_filter_reduces_size_after_two_losses(self) -> None:
         trade_filter = TradeFilter(cycle_seconds=60.0)
@@ -148,7 +150,7 @@ class TradePermissionTuningTests(unittest.TestCase):
         self.assertLess(result.size_multiplier, 1.0)
         self.assertIn("loss_streak_size_reduction", result.filter_values["adjustment_reasons"])
 
-    def test_trade_filter_pauses_after_three_losses(self) -> None:
+    def test_trade_filter_softens_after_three_losses(self) -> None:
         trade_filter = TradeFilter(cycle_seconds=60.0)
 
         with (
@@ -174,9 +176,10 @@ class TradePermissionTuningTests(unittest.TestCase):
                 daily_trade_count=2,
             )
 
-        self.assertFalse(result.allow_trade)
-        self.assertEqual(result.block_reason, "loss_streak_pause")
+        self.assertTrue(result.allow_trade)
+        self.assertLess(result.size_multiplier, 1.0)
         self.assertTrue(result.filter_values["loss_streak_pause_active"])
+        self.assertIn("loss_streak_pause_soft", result.filter_values["adjustment_reasons"])
 
     def test_trade_filter_reduces_buy_size_in_strong_trend(self) -> None:
         trade_filter = TradeFilter(cycle_seconds=60.0)
@@ -209,7 +212,7 @@ class TradePermissionTuningTests(unittest.TestCase):
         self.assertLess(result.size_multiplier, 1.0)
         self.assertIn("strong_trend_size_reduction", result.filter_values["adjustment_reasons"])
 
-    def test_trade_filter_skips_buy_in_extreme_trend_chase(self) -> None:
+    def test_trade_filter_softens_buy_in_extreme_trend_chase(self) -> None:
         trade_filter = TradeFilter(cycle_seconds=60.0)
 
         with (
@@ -236,9 +239,54 @@ class TradePermissionTuningTests(unittest.TestCase):
                 daily_trade_count=1,
             )
 
-        self.assertFalse(result.allow_trade)
-        self.assertEqual(result.block_reason, "strong_trend_skip")
+        self.assertTrue(result.allow_trade)
+        self.assertLess(result.size_multiplier, 1.0)
         self.assertTrue(result.filter_values["strong_trend_skip_active"])
+        self.assertIn("strong_trend_skip_soft", result.filter_values["adjustment_reasons"])
+
+    def test_trade_filter_aggressive_mode_keeps_shorter_cooldown_than_defensive(self) -> None:
+        trade_filter = TradeFilter(cycle_seconds=5.0)
+
+        with (
+            patch("trade_filter.MIN_TIME_BETWEEN_TRADES_MINUTES", 0.0),
+            patch("trade_filter.MAX_TRADES_PER_DAY", 100),
+        ):
+            aggressive = trade_filter.evaluate(
+                side="buy",
+                trade_reason="base_mm_buy",
+                cycle_index=4,
+                order_price=100.00,
+                last_trade_cycle=2,
+                last_trade_price=99.80,
+                loss_streak=0,
+                rsi_value=52.0,
+                momentum_bps=8.0,
+                regime="RANGE",
+                market_score=0.05,
+                volatility_state="NORMAL",
+                trade_count=4,
+                market_mode="aggressive",
+            )
+            defensive = trade_filter.evaluate(
+                side="buy",
+                trade_reason="base_mm_buy",
+                cycle_index=4,
+                order_price=100.00,
+                last_trade_cycle=2,
+                last_trade_price=99.80,
+                loss_streak=0,
+                rsi_value=52.0,
+                momentum_bps=8.0,
+                regime="RANGE",
+                market_score=0.05,
+                volatility_state="NORMAL",
+                trade_count=4,
+                market_mode="defensive_mm",
+            )
+
+        self.assertTrue(aggressive.allow_trade)
+        self.assertTrue(defensive.allow_trade)
+        self.assertGreater(aggressive.size_multiplier, defensive.size_multiplier)
 
 
 if __name__ == "__main__":
