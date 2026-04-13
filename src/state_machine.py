@@ -7,6 +7,7 @@ from config import (
     STATE_MACHINE_ACCUMULATING_FAILSAFE_MINUTES,
     STATE_MACHINE_COOLDOWN_MINUTES,
     STATE_MACHINE_LOSS_STREAK_LIMIT,
+    STATE_MACHINE_MAX_COOLDOWN_MINUTES,
 )
 from types_bot import ReentryState, StateMachineContext, StrategyState
 
@@ -19,6 +20,11 @@ class StateMachineEngine:
         if STATE_MACHINE_COOLDOWN_MINUTES <= 0:
             return 0
         return max(int(math.ceil((STATE_MACHINE_COOLDOWN_MINUTES * 60.0) / self.cycle_seconds)), 1)
+
+    def _max_cooldown_cycles(self) -> int:
+        if STATE_MACHINE_MAX_COOLDOWN_MINUTES <= 0:
+            return 0
+        return max(int(math.ceil((STATE_MACHINE_MAX_COOLDOWN_MINUTES * 60.0) / self.cycle_seconds)), 1)
 
     def _accumulating_failsafe_cycles(self) -> int:
         if STATE_MACHINE_ACCUMULATING_FAILSAFE_MINUTES <= 0:
@@ -35,17 +41,29 @@ class StateMachineEngine:
         if context.current_state == new_state and context.transition_reason == reason:
             return
 
+        previous_state_enum = context.current_state
         previous_state = context.current_state.value
+        cooldown_elapsed_seconds = 0.0
+        if previous_state_enum == StrategyState.COOLDOWN:
+            cooldown_elapsed_seconds = self.time_in_state_seconds(context, cycle_index)
+
         context.previous_state = previous_state
         context.current_state = new_state
         context.entered_cycle = cycle_index
         context.transition_reason = reason
         context.last_transition = f"{previous_state}->{new_state.value}:{reason}"
         context.last_transition_cycle = cycle_index
+        if new_state == StrategyState.COOLDOWN:
+            context.entering_cooldown_reason = reason
+            context.cooldown_exit_reason = ""
+            context.last_cooldown_elapsed_seconds = 0.0
+        elif previous_state_enum == StrategyState.COOLDOWN:
+            context.cooldown_exit_reason = reason
+            context.last_cooldown_elapsed_seconds = cooldown_elapsed_seconds
         if new_state != StrategyState.COOLDOWN:
             context.cooldown_until_cycle = None
 
-    def serialize(self, context: StateMachineContext) -> str:
+    def serialize(self, context: StateMachineContext, cycle_index: int | None = None) -> str:
         return json.dumps(
             {
                 "current_state": context.current_state.value,
@@ -55,6 +73,9 @@ class StateMachineEngine:
                 "last_transition": context.last_transition,
                 "last_transition_cycle": context.last_transition_cycle,
                 "cooldown_until_cycle": context.cooldown_until_cycle,
+                "entering_cooldown_reason": context.entering_cooldown_reason,
+                "cooldown_elapsed_sec": round(self.cooldown_elapsed_seconds(context, cycle_index), 6),
+                "cooldown_exit_reason": context.cooldown_exit_reason,
             },
             separators=(",", ":"),
         )
@@ -65,10 +86,30 @@ class StateMachineEngine:
     def time_in_state_seconds(self, context: StateMachineContext, cycle_index: int) -> float:
         return self.time_in_state_cycles(context, cycle_index) * self.cycle_seconds
 
+    def cooldown_elapsed_seconds(self, context: StateMachineContext, cycle_index: int | None = None) -> float:
+        if context.current_state == StrategyState.COOLDOWN:
+            if cycle_index is None:
+                cycle_index = context.entered_cycle
+            return self.time_in_state_seconds(context, cycle_index)
+        return max(context.last_cooldown_elapsed_seconds, 0.0)
+
+    def _cooldown_deadline_cycle(self, context: StateMachineContext) -> int | None:
+        deadlines: list[int] = []
+        if context.cooldown_until_cycle is not None:
+            deadlines.append(context.cooldown_until_cycle)
+        if context.current_state == StrategyState.COOLDOWN:
+            max_cooldown_cycles = self._max_cooldown_cycles()
+            if max_cooldown_cycles > 0:
+                deadlines.append(context.entered_cycle + max_cooldown_cycles)
+        if not deadlines:
+            return None
+        return min(deadlines)
+
     def cooldown_remaining_cycles(self, context: StateMachineContext, cycle_index: int) -> int:
-        if context.cooldown_until_cycle is None:
+        deadline_cycle = self._cooldown_deadline_cycle(context)
+        if deadline_cycle is None:
             return 0
-        return max(context.cooldown_until_cycle - cycle_index, 0)
+        return max(deadline_cycle - cycle_index, 0)
 
     def accumulating_failsafe_due(self, context: StateMachineContext, cycle_index: int) -> bool:
         if context.current_state != StrategyState.ACCUMULATING:
@@ -101,13 +142,26 @@ class StateMachineEngine:
         min_eth_reserve: float,
     ) -> None:
         if context.current_state == StrategyState.COOLDOWN:
-            remaining = self.cooldown_remaining_cycles(context, cycle_index)
-            if remaining <= 0:
+            cooldown_cycles = self._cooldown_cycles()
+            max_cooldown_cycles = self._max_cooldown_cycles()
+            elapsed_cycles = self.time_in_state_cycles(context, cycle_index)
+            exit_reason = ""
+
+            if max_cooldown_cycles > 0 and elapsed_cycles >= max_cooldown_cycles:
+                exit_reason = "max_cooldown_timeout"
+            elif cooldown_cycles <= 0:
+                exit_reason = "cooldown_disabled"
+            elif elapsed_cycles >= cooldown_cycles:
+                exit_reason = "cooldown_elapsed"
+            elif self.cooldown_remaining_cycles(context, cycle_index) <= 0:
+                exit_reason = "cooldown_elapsed"
+
+            if exit_reason:
                 self.transition(
                     context,
                     self._resting_state(reentry_state, portfolio_eth, min_eth_reserve),
                     cycle_index,
-                    "cooldown_expired",
+                    exit_reason,
                 )
             return
 

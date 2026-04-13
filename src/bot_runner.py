@@ -808,6 +808,40 @@ def _last_transition(runtime: BotRuntime) -> str:
     return risk_helpers.last_transition(runtime)
 
 
+def _cooldown_log_fields(runtime: BotRuntime, cycle_index: int) -> dict[str, object]:
+    if not runtime.enable_state_machine:
+        return {
+            "entering_cooldown_reason": "",
+            "cooldown_elapsed_sec": 0.0,
+            "cooldown_exit_reason": "",
+        }
+
+    context = runtime.state_context
+    if context.current_state == StrategyState.COOLDOWN:
+        return {
+            "entering_cooldown_reason": context.entering_cooldown_reason,
+            "cooldown_elapsed_sec": runtime.state_machine.cooldown_elapsed_seconds(context, cycle_index),
+            "cooldown_exit_reason": "",
+        }
+
+    cooldown_exited_this_cycle = (
+        context.previous_state == StrategyState.COOLDOWN.value
+        and context.last_transition_cycle == cycle_index
+    )
+    if cooldown_exited_this_cycle:
+        return {
+            "entering_cooldown_reason": context.entering_cooldown_reason,
+            "cooldown_elapsed_sec": context.last_cooldown_elapsed_seconds,
+            "cooldown_exit_reason": context.cooldown_exit_reason,
+        }
+
+    return {
+        "entering_cooldown_reason": "",
+        "cooldown_elapsed_sec": 0.0,
+        "cooldown_exit_reason": "",
+    }
+
+
 def _sync_daily_risk_state(runtime: BotRuntime, equity_usd: float) -> float:
     return risk_helpers.sync_daily_risk_state(runtime, equity_usd)
 
@@ -2261,6 +2295,7 @@ def _execute_sell_chunks(
                 min_eth_reserve=runtime.engine.min_eth_reserve,
             )
             runtime.state_machine.maybe_enter_cooldown(runtime.state_context, cycle_index, runtime.loss_streak)
+        cooldown_log_fields = _cooldown_log_fields(runtime, cycle_index)
         _append_trade_row(
             trade_logger,
             cycle_index,
@@ -2275,6 +2310,9 @@ def _execute_sell_chunks(
             fill,
             runtime.portfolio,
             runtime.last_execution_analytics,
+            cooldown_log_fields["entering_cooldown_reason"],
+            float(cooldown_log_fields["cooldown_elapsed_sec"]),
+            cooldown_log_fields["cooldown_exit_reason"],
             trade_analysis=trade_analysis,
         )
         if fill.filled:
@@ -2529,6 +2567,9 @@ def _append_equity_row(
     reentry_active: bool,
     reentry_timeout: int,
     cooldown_remaining: int,
+    entering_cooldown_reason: str,
+    cooldown_elapsed_sec: float,
+    cooldown_exit_reason: str,
     profit_lock_state: str,
     current_profit_pct: float | None,
     buy_debug_reason: str,
@@ -2590,6 +2631,9 @@ def _append_equity_row(
         reentry_active,
         reentry_timeout,
         cooldown_remaining,
+        entering_cooldown_reason,
+        cooldown_elapsed_sec,
+        cooldown_exit_reason,
         profit_lock_state,
         current_profit_pct,
         buy_debug_reason,
@@ -2615,6 +2659,9 @@ def _append_trade_row(
     fill,
     portfolio: Portfolio,
     execution_analytics: ExecutionAnalyticsRecord,
+    entering_cooldown_reason: str,
+    cooldown_elapsed_sec: float,
+    cooldown_exit_reason: str,
     trade_analysis: dict[str, object] | None = None,
 ) -> None:
     trade_analysis = trade_analysis or {}
@@ -2632,6 +2679,9 @@ def _append_trade_row(
         fill,
         portfolio,
         execution_analytics,
+        entering_cooldown_reason,
+        cooldown_elapsed_sec,
+        cooldown_exit_reason,
         trade_analysis.get("entry_price"),
         trade_analysis.get("exit_price"),
         trade_analysis.get("max_profit_during_trade"),
@@ -3591,7 +3641,7 @@ def _process_price_tick_with_decision_engine(
         "trade_count": engine.trade_count,
         "execution_price": runtime.last_execution_price,
         "reentry_state": runtime.reentry_engine.serialize_state(runtime.reentry_state),
-        "state_context": runtime.state_machine.serialize(runtime.state_context),
+        "state_context": runtime.state_machine.serialize(runtime.state_context, cycle_index),
         "time_in_state_sec": _time_in_state_seconds(runtime, cycle_index),
         "last_transition": _last_transition(runtime),
         "last_sell_price": runtime.reentry_state.last_sell_price,
@@ -3601,6 +3651,7 @@ def _process_price_tick_with_decision_engine(
         "reentry_active": runtime.reentry_state.active,
         "reentry_timeout": runtime.reentry_engine.timeout_remaining_cycles(runtime.reentry_state, cycle_index),
         "cooldown_remaining": cooldown_remaining,
+        **_cooldown_log_fields(runtime, cycle_index),
         "profit_lock_state": _serialize_profit_lock_state(runtime.profit_lock_state),
         "current_profit_pct": runtime.last_profit_pct,
         "buy_debug_reason": runtime.last_buy_debug_reason,
@@ -3844,6 +3895,7 @@ def _process_price_tick_with_decision_engine(
                     runtime.reentry_state.max_miss_triggered = True
                 if runtime.enable_state_machine:
                     runtime.state_machine.handle_buy_fill(runtime.state_context, cycle_index, decision.reason)
+            cooldown_log_fields = _cooldown_log_fields(runtime, cycle_index)
             if order.side == "buy":
                 _append_trade_row(
                     trade_logger,
@@ -3859,6 +3911,9 @@ def _process_price_tick_with_decision_engine(
                     fill,
                     portfolio,
                     runtime.last_execution_analytics,
+                    cooldown_log_fields["entering_cooldown_reason"],
+                    float(cooldown_log_fields["cooldown_elapsed_sec"]),
+                    cooldown_log_fields["cooldown_exit_reason"],
                     trade_analysis=trade_analysis,
                 )
 
@@ -3919,7 +3974,7 @@ def _process_price_tick_with_decision_engine(
             "trade_count": engine.trade_count,
             "execution_price": runtime.last_execution_price,
             "reentry_state": runtime.reentry_engine.serialize_state(runtime.reentry_state),
-            "state_context": runtime.state_machine.serialize(runtime.state_context),
+            "state_context": runtime.state_machine.serialize(runtime.state_context, cycle_index),
             "time_in_state_sec": _time_in_state_seconds(runtime, cycle_index),
             "last_transition": _last_transition(runtime),
             "last_sell_price": runtime.reentry_state.last_sell_price,
@@ -4159,7 +4214,7 @@ def process_price_tick(
         "trade_count": engine.trade_count,
         "execution_price": runtime.last_execution_price,
         "reentry_state": runtime.reentry_engine.serialize_state(runtime.reentry_state),
-        "state_context": runtime.state_machine.serialize(runtime.state_context),
+        "state_context": runtime.state_machine.serialize(runtime.state_context, cycle_index),
         "time_in_state_sec": _time_in_state_seconds(runtime, cycle_index),
         "last_transition": _last_transition(runtime),
         "last_sell_price": runtime.reentry_state.last_sell_price,
@@ -4169,6 +4224,7 @@ def process_price_tick(
         "reentry_active": runtime.reentry_state.active,
         "reentry_timeout": runtime.reentry_engine.timeout_remaining_cycles(runtime.reentry_state, cycle_index),
         "cooldown_remaining": cooldown_remaining,
+        **_cooldown_log_fields(runtime, cycle_index),
         "profit_lock_state": _serialize_profit_lock_state(runtime.profit_lock_state),
         "current_profit_pct": runtime.last_profit_pct,
         "buy_debug_reason": runtime.last_buy_debug_reason,
@@ -4947,6 +5003,7 @@ def process_price_tick(
                 runtime.reentry_state.max_miss_triggered = True
             if runtime.enable_state_machine:
                 runtime.state_machine.handle_buy_fill(runtime.state_context, cycle_index, buy_reason)
+        cooldown_log_fields = _cooldown_log_fields(runtime, cycle_index)
         _append_trade_row(
             trade_logger,
             cycle_index,
@@ -4961,6 +5018,9 @@ def process_price_tick(
             buy_fill,
             portfolio,
             runtime.last_execution_analytics,
+            cooldown_log_fields["entering_cooldown_reason"],
+            float(cooldown_log_fields["cooldown_elapsed_sec"]),
+            cooldown_log_fields["cooldown_exit_reason"],
             trade_analysis=trade_analysis,
         )
         realized_pnl_before = portfolio.realized_pnl_usd
@@ -5053,7 +5113,7 @@ def process_price_tick(
             "trade_count": engine.trade_count,
             "execution_price": runtime.last_execution_price,
             "reentry_state": runtime.reentry_engine.serialize_state(runtime.reentry_state),
-            "state_context": runtime.state_machine.serialize(runtime.state_context),
+            "state_context": runtime.state_machine.serialize(runtime.state_context, cycle_index),
             "time_in_state_sec": _time_in_state_seconds(runtime, cycle_index),
             "last_transition": _last_transition(runtime),
             "last_sell_price": runtime.reentry_state.last_sell_price,

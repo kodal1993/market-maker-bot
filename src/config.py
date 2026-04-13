@@ -336,6 +336,7 @@ STATE_MACHINE = StateMachineConfig(
     enabled=_env_bool("STATE_MACHINE_ENABLED", True),
     loss_streak_limit=_env_int("STATE_MACHINE_LOSS_STREAK_LIMIT", 3),
     cooldown_minutes=_env_float("STATE_MACHINE_COOLDOWN_MINUTES", 30.0),
+    max_cooldown_minutes=_env_float("STATE_MACHINE_MAX_COOLDOWN_MINUTES", 2.0),
     accumulating_failsafe_minutes=_env_float("STATE_MACHINE_ACCUMULATING_FAILSAFE_MINUTES", 30.0),
 )
 
@@ -816,6 +817,7 @@ INVENTORY_DOWNTREND_MAX = INVENTORY_MANAGER.downtrend_max
 STATE_MACHINE_ENABLED = STATE_MACHINE.enabled
 STATE_MACHINE_LOSS_STREAK_LIMIT = STATE_MACHINE.loss_streak_limit
 STATE_MACHINE_COOLDOWN_MINUTES = STATE_MACHINE.cooldown_minutes
+STATE_MACHINE_MAX_COOLDOWN_MINUTES = STATE_MACHINE.max_cooldown_minutes
 STATE_MACHINE_ACCUMULATING_FAILSAFE_MINUTES = STATE_MACHINE.accumulating_failsafe_minutes
 
 DECISION_ENGINE_ENABLED = DECISION_ENGINE.enabled

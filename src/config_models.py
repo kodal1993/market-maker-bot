@@ -353,6 +353,7 @@ class StateMachineConfig:
     enabled: bool
     loss_streak_limit: int
     cooldown_minutes: float
+    max_cooldown_minutes: float
     accumulating_failsafe_minutes: float
 
 

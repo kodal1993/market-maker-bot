@@ -140,6 +140,9 @@ class StateMachineContext:
     last_transition: str = "boot"
     last_transition_cycle: int = 0
     cooldown_until_cycle: int | None = None
+    entering_cooldown_reason: str = ""
+    cooldown_exit_reason: str = ""
+    last_cooldown_elapsed_seconds: float = 0.0
 
 
 @dataclass

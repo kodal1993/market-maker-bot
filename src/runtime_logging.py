@@ -104,6 +104,9 @@ def trade_log_headers() -> list[str]:
         "entry_edge_bps",
         "entry_edge_usd",
         "hold_minutes",
+        "entering_cooldown_reason",
+        "cooldown_elapsed_sec",
+        "cooldown_exit_reason",
         "usdc_after",
         "eth_after",
     ]
@@ -168,6 +171,9 @@ def equity_log_headers() -> list[str]:
         "reentry_active",
         "reentry_timeout",
         "cooldown_remaining",
+        "entering_cooldown_reason",
+        "cooldown_elapsed_sec",
+        "cooldown_exit_reason",
         "profit_lock_state",
         "current_profit_pct",
         "buy_debug_reason",
@@ -249,6 +255,20 @@ def log_cycle(
     last_transition: str,
 ) -> None:
     profit_text = "n/a" if runtime.last_profit_pct is None else f"{runtime.last_profit_pct:.3f}%"
+    cooldown_entry_reason = ""
+    cooldown_exit_reason = ""
+    cooldown_elapsed_sec = 0.0
+    if getattr(runtime, "state_context", None) is not None:
+        if runtime.state_context.current_state.value == "COOLDOWN":
+            cooldown_entry_reason = getattr(runtime.state_context, "entering_cooldown_reason", "")
+            cooldown_elapsed_sec = time_in_state_sec
+        elif (
+            getattr(runtime.state_context, "previous_state", "") == "COOLDOWN"
+            and getattr(runtime.state_context, "last_transition_cycle", -1) == cycle_index
+        ):
+            cooldown_entry_reason = getattr(runtime.state_context, "entering_cooldown_reason", "")
+            cooldown_exit_reason = getattr(runtime.state_context, "cooldown_exit_reason", "")
+            cooldown_elapsed_sec = float(getattr(runtime.state_context, "last_cooldown_elapsed_seconds", 0.0))
     regime = getattr(runtime, "current_regime_assessment", None)
     edge = getattr(runtime, "current_edge_assessment", None)
     gate = getattr(runtime, "current_signal_gate_decision", None)
@@ -291,6 +311,8 @@ def log_cycle(
     log(
         f"{cycle_index} | state {runtime.state_context.current_state.value} | time_in_state {time_in_state_sec:.0f}s | "
         f"last_transition {last_transition or '-'} | mode {mm_mode} | strategy_mode {strategy_mode} | current_mode {current_mode} | "
+        f"cooldown_entry {cooldown_entry_reason or '-'} | cooldown_elapsed {cooldown_elapsed_sec:.0f}s | "
+        f"cooldown_exit {cooldown_exit_reason or '-'} | "
         f"trend_strength {getattr(intelligence, 'trend_strength', 0.0):.5f} | regime {intelligence.regime} | "
         f"vol_state {intelligence.volatility_state} | "
         f"price {mid:.2f} | src {source} | eq {equity_usd:.2f} | pnl {pnl_usd:.2f} | "
@@ -428,6 +450,9 @@ def append_equity_row(
     reentry_active: bool,
     reentry_timeout: int,
     cooldown_remaining: int,
+    entering_cooldown_reason: str,
+    cooldown_elapsed_sec: float,
+    cooldown_exit_reason: str,
     profit_lock_state: str,
     current_profit_pct: float | None,
     buy_debug_reason: str,
@@ -501,6 +526,9 @@ def append_equity_row(
             int(reentry_active),
             reentry_timeout,
             cooldown_remaining,
+            entering_cooldown_reason,
+            round(cooldown_elapsed_sec, 6),
+            cooldown_exit_reason,
             profit_lock_state,
             "" if current_profit_pct is None else round(current_profit_pct, 6),
             buy_debug_reason,
@@ -537,6 +565,9 @@ def append_trade_row(
     fill,
     portfolio,
     execution_analytics: ExecutionAnalyticsRecord,
+    entering_cooldown_reason: str,
+    cooldown_elapsed_sec: float,
+    cooldown_exit_reason: str,
     entry_price: float | None,
     exit_price: float | None,
     max_profit_during_trade: float | None,
@@ -611,6 +642,9 @@ def append_trade_row(
             round(entry_edge_bps, 6),
             round(entry_edge_usd, 6),
             round(hold_minutes, 6),
+            entering_cooldown_reason,
+            round(cooldown_elapsed_sec, 6),
+            cooldown_exit_reason,
             round(portfolio.usdc, 6),
             round(portfolio.eth, 8),
         ]
