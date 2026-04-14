@@ -28,6 +28,7 @@ class DecisionEngine:
             "inventory_force_reduce",
             "time_exit_sell",
             "stop_loss_sell",
+            "profit_exit_sell",
         }
 
     def _normalize_candidate(self, candidate: DecisionOutcome | None) -> _DecisionCandidate | None:

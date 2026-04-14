@@ -58,6 +58,8 @@ def base_sell_debug_reason(
         return f"stop_loss_ready:{current_profit:.3f}%"
     if current_profit is None:
         return "no_profit_anchor"
+    if current_profit > 0.0:
+        return "profit_exit_ready"
     if not state.level_two_executed and current_profit >= level_two_target_pct:
         return "full_sell_ready"
     if not state.level_one_executed and current_profit >= level_one_target_pct:
@@ -190,7 +192,7 @@ def trade_reason_category(mode: str, trade_reason: str) -> str:
         return "mean_reversion"
     if trade_reason == "trend_rally_sell":
         return "trend"
-    if trade_reason in {"profit_lock_level_1", "profit_lock_level_2"}:
+    if trade_reason in {"profit_lock_level_1", "profit_lock_level_2", "profit_exit_sell"}:
         return "momentum"
     if trade_reason == "quoted_sell":
         return "trend" if mode in {"TREND_UP", "OVERWEIGHT_EXIT"} else "mean_reversion"

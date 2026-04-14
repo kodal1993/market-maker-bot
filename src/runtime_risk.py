@@ -750,6 +750,26 @@ def build_profit_lock_sell_plan(
     return None, 0.0
 
 
+def build_open_profit_exit_plan(
+    runtime: BotRuntime,
+    mid: float,
+) -> tuple[str | None, float]:
+    if mid <= 0:
+        return None, 0.0
+    if getattr(runtime, "open_position_cycle", None) is None and not getattr(runtime, "open_position_reason", ""):
+        return None, 0.0
+
+    current_profit = current_profit_pct(runtime, mid)
+    if current_profit is None or current_profit <= PROFIT_THRESHOLD_EPSILON_PCT:
+        return None, 0.0
+
+    tradable_eth = max(runtime.portfolio.eth - runtime.engine.min_eth_reserve, 0.0)
+    if tradable_eth <= 0:
+        return None, 0.0
+
+    return "profit_exit_sell", tradable_eth * mid
+
+
 def should_delay_regular_sell(runtime: BotRuntime, mode: str) -> bool:
     if mode == "OVERWEIGHT_EXIT":
         return False

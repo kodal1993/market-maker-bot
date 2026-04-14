@@ -161,11 +161,13 @@ REENTRY_ZONE_LEVELS = (
     ("zone_2", REENTRY_ZONE_2_BUY_FRACTION),
     ("zone_3", REENTRY_ZONE_3_BUY_FRACTION),
 )
+PROFIT_EXIT_SELL_REASON = "profit_exit_sell"
 FORCED_SELL_REASONS = {
     "failsafe_sell",
     "inventory_force_reduce",
     "time_exit_sell",
     "stop_loss_sell",
+    PROFIT_EXIT_SELL_REASON,
     "profit_lock_level_1",
     "profit_lock_level_2",
     "force_trade_sell",
@@ -175,6 +177,7 @@ PRIORITY_SELL_REASONS = {
     "inventory_force_reduce",
     "time_exit_sell",
     "stop_loss_sell",
+    PROFIT_EXIT_SELL_REASON,
     "profit_lock_level_1",
     "profit_lock_level_2",
 }
@@ -300,6 +303,7 @@ class BotRuntime:
     current_inactivity_fallback_active: bool = False
     current_signal_block_reason: str = ""
     current_inventory_limit_state: str = "normal"
+    pipeline_logging_enabled: bool = True
     current_soft_inventory_limit_usd: float = 0.0
     current_hard_inventory_limit_usd: float = 0.0
     current_entry_threshold_bps: float = 0.0
@@ -1202,6 +1206,73 @@ def _merge_filter_values(
     return logging_helpers.merge_filter_values(base, **updates)
 
 
+def _format_pipeline_value(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        if abs(value) < 1e-9:
+            return "0"
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def _log_pipeline_event(
+    runtime: BotRuntime,
+    cycle_index: int,
+    event: str,
+    **fields: object,
+) -> None:
+    if not getattr(runtime, "pipeline_logging_enabled", True):
+        return
+
+    rendered_fields = []
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        rendered_fields.append(f"{key} {_format_pipeline_value(value)}")
+
+    message = f"{cycle_index} | {event}"
+    if rendered_fields:
+        message = f"{message} | {' | '.join(rendered_fields)}"
+    log(message)
+
+
+def _tradable_position_usd(runtime: BotRuntime, mid: float) -> float:
+    if mid <= 0:
+        return 0.0
+    tradable_eth = max(runtime.portfolio.eth - runtime.engine.min_eth_reserve, 0.0)
+    return max(tradable_eth * mid, 0.0)
+
+
+def _has_open_position(runtime: BotRuntime, mid: float, min_notional_usd: float) -> bool:
+    return _tradable_position_usd(runtime, mid) >= max(min_notional_usd, 0.0)
+
+
+def _log_exit_check(
+    runtime: BotRuntime,
+    cycle_index: int,
+    mid: float,
+    min_notional_usd: float,
+    *,
+    reduction_only: bool,
+) -> None:
+    if not _has_open_position(runtime, mid, min_notional_usd):
+        return
+
+    _log_pipeline_event(
+        runtime,
+        cycle_index,
+        "EXIT_CHECK",
+        open_position=True,
+        profit_pct=runtime.last_profit_pct,
+        tradable_usd=_tradable_position_usd(runtime, mid),
+        open_reason=runtime.open_position_reason or "initial_inventory",
+        position_state=runtime.state_context.current_state.value,
+        reduction_only=reduction_only,
+        inventory_limit=runtime.current_inventory_limit_state,
+    )
+
+
 def _current_sizing(runtime: BotRuntime) -> SizingSnapshot | None:
     return runtime.current_sizing
 
@@ -1880,6 +1951,34 @@ def _apply_signal_pipeline(
         decision.filter_values = _merge_filter_values(decision.filter_values, **_signal_filter_values(runtime))
         return decision
 
+    if decision.action == "BUY":
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "ENTRY_SIGNAL",
+            reason=decision.reason,
+            source=decision.source,
+            size_usd=decision.size_usd,
+            order_price=decision.order_price,
+            position_state=runtime.state_context.current_state.value,
+            reduction_only=getattr(inventory_profile, "reduction_only", False),
+            inventory_limit=runtime.current_inventory_limit_state,
+        )
+    elif decision.action == "SELL":
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "EXIT_SIGNAL",
+            reason=decision.reason,
+            source=decision.source,
+            size_usd=decision.size_usd,
+            order_price=decision.order_price,
+            profit_pct=runtime.last_profit_pct,
+            position_state=runtime.state_context.current_state.value,
+            reduction_only=getattr(inventory_profile, "reduction_only", False),
+            inventory_limit=runtime.current_inventory_limit_state,
+        )
+
     execution_context = _build_execution_context(
         runtime=runtime,
         cycle_index=cycle_index,
@@ -1957,6 +2056,17 @@ def _apply_signal_pipeline(
         merged_filter_values = _merge_filter_values(merged_filter_values, **gate_decision.gate_details)
 
     if not gate_decision.allow_trade:
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "EXECUTION_SKIPPED",
+            side=decision.action.lower(),
+            reason=gate_decision.blocked_reason or decision.block_reason or "gate_reject",
+            trade_reason=decision.reason,
+            approved_mode=gate_decision.approved_mode,
+            reduction_only=getattr(inventory_profile, "reduction_only", False),
+            inventory_limit=runtime.current_inventory_limit_state,
+        )
         return DecisionOutcome(
             action="NONE",
             size_usd=0.0,
@@ -1987,6 +2097,19 @@ def _apply_signal_pipeline(
         adjusted_order_price=round(adjusted_order_price, 6),
         dynamic_cooldown_sec=round(runtime.current_dynamic_cooldown_sec, 6),
     )
+
+    if decision.action == "BUY":
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "ENTRY_ALLOWED",
+            reason=decision.reason,
+            approved_mode=gate_decision.approved_mode,
+            edge_bps=edge_assessment.expected_edge_bps,
+            edge_usd=edge_assessment.expected_edge_usd,
+            size_usd=adjusted_size_usd,
+            order_price=adjusted_order_price,
+        )
 
     return DecisionOutcome(
         action=decision.action,
@@ -2231,6 +2354,14 @@ def _execute_sell_chunks(
     sizing = _current_sizing(runtime)
     min_notional_usd = sizing.min_notional_usd if sizing is not None else MIN_ORDER_SIZE_USD
     if not chunk_sizes:
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "EXECUTION_FAILED_REASON",
+            side="sell",
+            reason="no_chunks",
+            trade_reason=sell_order.trade_reason,
+        )
         return None
 
     total_size_usd = sum(chunk_sizes)
@@ -2263,12 +2394,74 @@ def _execute_sell_chunks(
         chunk_order.trade_reason = sell_order.trade_reason
         _cap_inventory_preserving_sell_order(runtime, chunk_order, chunk_order.trade_reason)
         if chunk_order.size_usd < min_notional_usd:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "EXECUTION_FAILED_REASON",
+                side="sell",
+                reason="size_below_min_after_sell_cap",
+                trade_reason=chunk_order.trade_reason,
+                size_usd=chunk_order.size_usd,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
             break
         if not runtime.engine.can_place_sell(chunk_order, mode):
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "EXECUTION_FAILED_REASON",
+                side="sell",
+                reason="protect_eth",
+                trade_reason=chunk_order.trade_reason,
+                size_usd=chunk_order.size_usd,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
             break
+
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "ORDER_SENT",
+            side="sell",
+            trade_reason=chunk_order.trade_reason,
+            size_usd=chunk_order.size_usd,
+            order_price=chunk_order.price,
+            execution_type=chunk_order.execution_type,
+            chunk_index=chunk_index,
+            chunk_count=len(chunk_sizes),
+        )
 
         fill = runtime.engine.simulate_fill(chunk_order, mid)
         realized_delta = runtime.portfolio.realized_pnl_usd - realized_pnl_before
+        if fill.filled:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "ORDER_FILLED",
+                side="sell",
+                trade_reason=fill.trade_reason,
+                size_usd=fill.size_usd,
+                order_price=fill.price,
+                execution_type=fill.execution_type,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
+        else:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "EXECUTION_FAILED_REASON",
+                side="sell",
+                reason=fill.reason,
+                trade_reason=fill.trade_reason,
+                size_usd=fill.size_usd,
+                order_price=fill.price,
+                execution_type=fill.execution_type,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
         if fill.filled:
             post_sell_inventory_usd = runtime.portfolio.inventory_usd(mid)
             if _should_activate_reentry_after_sell(runtime, runtime.portfolio.eth, mid):
@@ -2465,6 +2658,13 @@ def _build_profit_lock_sell_plan(
     mid: float,
 ) -> tuple[str | None, float]:
     return risk_helpers.build_profit_lock_sell_plan(runtime, cycle_index, mid)
+
+
+def _build_open_profit_exit_plan(
+    runtime: BotRuntime,
+    mid: float,
+) -> tuple[str | None, float]:
+    return risk_helpers.build_open_profit_exit_plan(runtime, mid)
 
 
 def _should_delay_regular_sell(runtime: BotRuntime, mode: str) -> bool:
@@ -3031,6 +3231,7 @@ def _process_price_tick_with_decision_engine(
 
     portfolio = runtime.portfolio
     engine = runtime.engine
+    runtime.pipeline_logging_enabled = log_progress
 
     portfolio.ensure_cost_basis(mid)
     _refresh_timeframe_prices(runtime, mid)
@@ -3135,6 +3336,13 @@ def _process_price_tick_with_decision_engine(
     adjusted_buy_enabled = intelligence.buy_enabled and trend_filter_buy_allowed
     adjusted_sell_enabled = intelligence.sell_enabled and trend_filter_sell_allowed
     runtime.last_profit_pct = _current_profit_pct(runtime, strategy_mid)
+    _log_exit_check(
+        runtime,
+        cycle_index,
+        strategy_mid,
+        min_notional_usd,
+        reduction_only=getattr(inventory_profile, "reduction_only", False),
+    )
     base_sell_debug_reason = _base_sell_debug_reason(
         runtime=runtime,
         cycle_index=cycle_index,
@@ -3307,10 +3515,16 @@ def _process_price_tick_with_decision_engine(
         }
         profit_lock_reason = None
         profit_lock_size_usd = 0.0
+        profit_exit_reason = None
+        profit_exit_size_usd = 0.0
         if profit_lock_allowed:
             profit_lock_reason, profit_lock_size_usd = _build_profit_lock_sell_plan(
                 runtime=runtime,
                 cycle_index=cycle_index,
+                mid=strategy_mid,
+            )
+            profit_exit_reason, profit_exit_size_usd = _build_open_profit_exit_plan(
+                runtime=runtime,
                 mid=strategy_mid,
             )
         if profit_lock_reason and profit_lock_size_usd >= min_notional_usd:
@@ -3318,6 +3532,15 @@ def _process_price_tick_with_decision_engine(
                 action="SELL",
                 size_usd=profit_lock_size_usd,
                 reason=profit_lock_reason,
+                source="strategy",
+                order_price=strategy_mid,
+                inventory_cap_usd=default_buy_inventory_cap,
+            )
+        elif profit_exit_reason and profit_exit_size_usd >= min_notional_usd:
+            strategy_sell_candidate = DecisionOutcome(
+                action="SELL",
+                size_usd=profit_exit_size_usd,
+                reason=profit_exit_reason,
                 source="strategy",
                 order_price=strategy_mid,
                 inventory_cap_usd=default_buy_inventory_cap,
@@ -3867,13 +4090,113 @@ def _process_price_tick_with_decision_engine(
                 filter_values=decision_filter_values,
             )
 
+        if order.side == "buy":
+            if can_execute:
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "ENTRY_TRIGGERED",
+                    trade_reason=order.trade_reason,
+                    size_usd=order.size_usd,
+                    order_price=order.price,
+                    gate="allow",
+                    edge_bps=runtime.current_entry_edge_bps,
+                )
+            else:
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "EXECUTION_SKIPPED",
+                    side="buy",
+                    reason=can_execute_reason or runtime.last_decision_block_reason or "trade_blocked",
+                    trade_reason=order.trade_reason,
+                    reduction_only=getattr(inventory_profile, "reduction_only", False),
+                    inventory_limit=runtime.current_inventory_limit_state,
+                    position_state=runtime.state_context.current_state.value,
+                )
+        elif can_execute:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "EXIT_TRIGGERED",
+                trade_reason=order.trade_reason,
+                size_usd=order.size_usd,
+                order_price=order.price,
+                profit_pct=runtime.last_profit_pct,
+            )
+        else:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "EXECUTION_SKIPPED",
+                side="sell",
+                reason=can_execute_reason or runtime.last_decision_block_reason or "trade_blocked",
+                trade_reason=order.trade_reason,
+                reduction_only=getattr(inventory_profile, "reduction_only", False),
+                inventory_limit=runtime.current_inventory_limit_state,
+                position_state=runtime.state_context.current_state.value,
+            )
+
         if can_execute:
             if order.side == "buy":
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "EXECUTION_ATTEMPT",
+                    side="buy",
+                    trade_reason=order.trade_reason,
+                    size_usd=order.size_usd,
+                    order_price=order.price,
+                    execution_type=order.execution_type,
+                )
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "ORDER_SENT",
+                    side="buy",
+                    trade_reason=order.trade_reason,
+                    size_usd=order.size_usd,
+                    order_price=order.price,
+                    execution_type=order.execution_type,
+                )
                 realized_pnl_before = portfolio.realized_pnl_usd
                 fill = engine.simulate_fill(order, mid)
+                if fill.filled:
+                    _log_pipeline_event(
+                        runtime,
+                        cycle_index,
+                        "ORDER_FILLED",
+                        side="buy",
+                        trade_reason=fill.trade_reason,
+                        size_usd=fill.size_usd,
+                        order_price=fill.price,
+                        execution_type=fill.execution_type,
+                    )
+                else:
+                    _log_pipeline_event(
+                        runtime,
+                        cycle_index,
+                        "EXECUTION_FAILED_REASON",
+                        side="buy",
+                        reason=fill.reason,
+                        trade_reason=fill.trade_reason,
+                        size_usd=fill.size_usd,
+                        order_price=fill.price,
+                        execution_type=fill.execution_type,
+                    )
                 realized_delta = portfolio.realized_pnl_usd - realized_pnl_before
                 trade_analysis = _record_fill(runtime, cycle_index, mode, fill, realized_delta)
             else:
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "EXECUTION_ATTEMPT",
+                    side="sell",
+                    trade_reason=order.trade_reason,
+                    size_usd=order.size_usd,
+                    order_price=order.price,
+                    execution_type=order.execution_type,
+                )
                 trade_analysis = None
                 fill = _execute_sell_chunks(
                     runtime,
@@ -4058,6 +4381,7 @@ def process_price_tick(
 
     portfolio = runtime.portfolio
     engine = runtime.engine
+    runtime.pipeline_logging_enabled = log_progress
 
     portfolio.ensure_cost_basis(mid)
     _refresh_timeframe_prices(runtime, mid)
@@ -4161,6 +4485,13 @@ def process_price_tick(
     adjusted_buy_enabled = intelligence.buy_enabled and trend_filter_buy_allowed
     adjusted_sell_enabled = intelligence.sell_enabled and trend_filter_sell_allowed
     runtime.last_profit_pct = _current_profit_pct(runtime, strategy_mid)
+    _log_exit_check(
+        runtime,
+        cycle_index,
+        strategy_mid,
+        min_notional_usd,
+        reduction_only=getattr(inventory_profile, "reduction_only", False),
+    )
     base_sell_debug_reason = _base_sell_debug_reason(
         runtime=runtime,
         cycle_index=cycle_index,
@@ -4417,6 +4748,8 @@ def process_price_tick(
     sell_reason = "quoted_sell"
     profit_lock_reason = None
     profit_lock_size_usd = 0.0
+    profit_exit_reason = None
+    profit_exit_size_usd = 0.0
     profit_lock_allowed = not runtime.enable_state_machine or runtime.state_context.current_state in {
         StrategyState.ACCUMULATING,
         StrategyState.DISTRIBUTING,
@@ -4427,10 +4760,19 @@ def process_price_tick(
             cycle_index=cycle_index,
             mid=strategy_mid,
         )
+        profit_exit_reason, profit_exit_size_usd = _build_open_profit_exit_plan(
+            runtime=runtime,
+            mid=strategy_mid,
+        )
     if profit_lock_reason and profit_lock_size_usd >= min_notional_usd:
         sell_reason = profit_lock_reason
         sell_order.price = strategy_mid
         sell_order.size_usd = profit_lock_size_usd
+        sell_order.size_base = sell_order.size_usd / sell_order.price if sell_order.price > 0 else 0.0
+    elif profit_exit_reason and profit_exit_size_usd >= min_notional_usd:
+        sell_reason = profit_exit_reason
+        sell_order.price = strategy_mid
+        sell_order.size_usd = profit_exit_size_usd
         sell_order.size_base = sell_order.size_usd / sell_order.price if sell_order.price > 0 else 0.0
     elif _should_delay_regular_sell(runtime, mode):
         sell_reason = "delayed_for_profit_lock"
@@ -4913,6 +5255,7 @@ def process_price_tick(
 
     if (
         runtime.enable_state_machine
+        and legacy_decision.action == "SELL"
         and sell_order.size_usd >= min_notional_usd
         and (sell_reason in FORCED_SELL_REASONS or intelligence.sell_enabled)
         and (sell_filter_result is None or sell_filter_result.allow_trade)
@@ -4980,18 +5323,102 @@ def process_price_tick(
             block_reason="" if can_execute else (can_execute_reason or "trade_blocked"),
             filter_values=selected_filter_values,
         )
+        if legacy_decision.action == "BUY":
+            if can_execute:
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "ENTRY_TRIGGERED",
+                    trade_reason=buy_reason,
+                    size_usd=buy_order.size_usd,
+                    order_price=buy_order.price,
+                    gate="allow",
+                    edge_bps=runtime.current_entry_edge_bps,
+                )
+            else:
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "EXECUTION_SKIPPED",
+                    side="buy",
+                    reason=can_execute_reason or "trade_blocked",
+                    trade_reason=buy_reason,
+                    reduction_only=getattr(inventory_profile, "reduction_only", False),
+                    inventory_limit=runtime.current_inventory_limit_state,
+                    position_state=runtime.state_context.current_state.value,
+                )
+        elif legacy_decision.action == "SELL":
+            if can_execute:
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "EXIT_TRIGGERED",
+                    trade_reason=sell_reason,
+                    size_usd=sell_order.size_usd,
+                    order_price=sell_order.price,
+                    profit_pct=runtime.last_profit_pct,
+                )
+            else:
+                _log_pipeline_event(
+                    runtime,
+                    cycle_index,
+                    "EXECUTION_SKIPPED",
+                    side="sell",
+                    reason=can_execute_reason or "trade_blocked",
+                    trade_reason=sell_reason,
+                    reduction_only=getattr(inventory_profile, "reduction_only", False),
+                    inventory_limit=runtime.current_inventory_limit_state,
+                    position_state=runtime.state_context.current_state.value,
+                )
 
-    if (
-        buy_enabled
-        and buy_order.size_usd >= min_notional_usd
-        and (buy_filter_result is None or buy_filter_result.allow_trade or buy_filter_result.block_reason == "loss_streak_pause")
-        and engine.can_place_buy(buy_inventory_cap, mid, buy_order.size_usd, mode)
-        and _allows_opposite_side_trade(runtime, cycle_index, "buy", buy_order.price)
-    ):
+    if legacy_decision.action == "BUY" and can_execute:
         runtime.last_execution_analytics = buy_execution_analytics
         if buy_execution_context is not None:
             execution_helpers.capture_execution_result(runtime, buy_execution_context, buy_execution_result)
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "EXECUTION_ATTEMPT",
+            side="buy",
+            trade_reason=buy_reason,
+            size_usd=buy_order.size_usd,
+            order_price=buy_order.price,
+            execution_type=buy_order.execution_type,
+        )
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "ORDER_SENT",
+            side="buy",
+            trade_reason=buy_reason,
+            size_usd=buy_order.size_usd,
+            order_price=buy_order.price,
+            execution_type=buy_order.execution_type,
+        )
         buy_fill = engine.simulate_fill(buy_order, mid)
+        if buy_fill.filled:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "ORDER_FILLED",
+                side="buy",
+                trade_reason=buy_fill.trade_reason,
+                size_usd=buy_fill.size_usd,
+                order_price=buy_fill.price,
+                execution_type=buy_fill.execution_type,
+            )
+        else:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "EXECUTION_FAILED_REASON",
+                side="buy",
+                reason=buy_fill.reason,
+                trade_reason=buy_fill.trade_reason,
+                size_usd=buy_fill.size_usd,
+                order_price=buy_fill.price,
+                execution_type=buy_fill.execution_type,
+            )
         realized_delta = portfolio.realized_pnl_usd - realized_pnl_before
         trade_analysis = _record_fill(runtime, cycle_index, mode, buy_fill, realized_delta)
         if buy_fill.filled:
@@ -5025,17 +5452,20 @@ def process_price_tick(
         )
         realized_pnl_before = portfolio.realized_pnl_usd
 
-    if (
-        not (buy_fill and buy_fill.filled)
-        and sell_order.size_usd >= min_notional_usd
-        and (sell_reason in FORCED_SELL_REASONS or intelligence.sell_enabled)
-        and (sell_filter_result is None or sell_filter_result.allow_trade or sell_filter_result.block_reason == "loss_streak_pause")
-        and engine.can_place_sell(sell_order, mode)
-        and _allows_opposite_side_trade(runtime, cycle_index, "sell", sell_order.price)
-    ):
+    elif legacy_decision.action == "SELL" and can_execute:
         runtime.last_execution_analytics = sell_execution_analytics
         if sell_execution_context is not None:
             execution_helpers.capture_execution_result(runtime, sell_execution_context, sell_execution_result)
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "EXECUTION_ATTEMPT",
+            side="sell",
+            trade_reason=sell_reason,
+            size_usd=sell_order.size_usd,
+            order_price=sell_order.price,
+            execution_type=sell_order.execution_type,
+        )
         sell_fill = _execute_sell_chunks(
             runtime,
             cycle_index=cycle_index,

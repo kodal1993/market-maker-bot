@@ -34,6 +34,7 @@ PROTECTIVE_SELL_REASONS = {
     "inventory_force_reduce",
     "time_exit_sell",
     "stop_loss_sell",
+    "profit_exit_sell",
     "profit_lock_level_1",
     "profit_lock_level_2",
 }

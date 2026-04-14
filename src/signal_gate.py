@@ -18,6 +18,7 @@ PROTECTIVE_SELL_REASONS = {
     "failsafe_sell",
     "time_exit_sell",
     "stop_loss_sell",
+    "profit_exit_sell",
     "profit_lock_level_1",
     "profit_lock_level_2",
     "force_trade_sell",

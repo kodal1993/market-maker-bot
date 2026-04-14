@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from bot_runner import _build_profit_lock_sell_plan, _record_fill, create_runtime
+from bot_runner import _build_open_profit_exit_plan, _build_profit_lock_sell_plan, _record_fill, create_runtime
 from edge_filter import EdgeFilter
 from regime_detector import RegimeDetector
 from signal_gate import SignalGate
@@ -463,6 +463,29 @@ class RegimeEdgeGateTests(unittest.TestCase):
         reason, size_usd = _build_profit_lock_sell_plan(runtime, cycle_index=120, mid=100.05)
 
         self.assertEqual(reason, "time_exit_sell")
+        self.assertGreater(size_usd, 0.0)
+
+    def test_profit_exit_sell_plan_triggers_for_profitable_open_position(self) -> None:
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            start_usdc=0.0,
+            start_eth=1.0,
+            start_eth_usd=0.0,
+            cycle_seconds=60.0,
+            enable_trade_filter=False,
+            enable_execution_engine=False,
+        )
+        runtime.current_regime_assessment = build_regime("TREND_UP", net_move_pct=0.8, direction_consistency=0.82)
+        runtime.current_market_mode = "TREND"
+        runtime.current_volatility_bucket = "NORMAL"
+        runtime.open_position_cycle = 0
+        runtime.open_position_reason = "trend_buy"
+        runtime.profit_lock_state.anchor_price = 100.0
+
+        reason, size_usd = _build_open_profit_exit_plan(runtime, mid=100.20)
+
+        self.assertEqual(reason, "profit_exit_sell")
         self.assertGreater(size_usd, 0.0)
 
 

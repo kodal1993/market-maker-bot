@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from bot_runner import create_runtime, process_price_tick, trade_log_headers, equity_log_headers
 from csv_logger import CsvLogger
-from types_bot import DecisionOutcome
+from types_bot import DecisionOutcome, EdgeAssessment, FillResult, MarketRegimeAssessment
 
 TEST_ROOT = Path(__file__).resolve().parents[1]
 TMP_ROOT = TEST_ROOT / ".tmp"
@@ -155,6 +155,162 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
         self.assertEqual(filter_values["trade_blocked_reason"], "gas_spike_skip")
         self.assertEqual(filter_values["gas_price_gwei"], 50.0)
         self.assertEqual(runtime.engine.trade_count, 0)
+
+    def test_process_price_tick_emits_entry_pipeline_logs(self) -> None:
+        random.seed(0)
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            start_eth_usd=0.0,
+            enable_trade_filter=False,
+            enable_execution_engine=True,
+        )
+        runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
+        runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
+            action="BUY",
+            size_usd=30.0,
+            reason="trend_buy",
+            source="test",
+            order_price=100.0,
+            inventory_cap_usd=5_000.0,
+            allow_trade=True,
+            filter_values={},
+        )
+
+        with patch("bot_runner.log") as mocked_log:
+            process_price_tick(
+                runtime=runtime,
+                cycle_index=30,
+                mid=100.0,
+                source="test",
+                trade_logger=None,
+                equity_logger=None,
+                log_progress=True,
+            )
+
+        messages = "\n".join(str(call.args[0]) for call in mocked_log.call_args_list if call.args)
+        self.assertIn("ENTRY_SIGNAL", messages)
+        self.assertIn("ENTRY_ALLOWED", messages)
+        self.assertIn("ENTRY_TRIGGERED", messages)
+        self.assertIn("EXECUTION_ATTEMPT", messages)
+        self.assertIn("ORDER_SENT", messages)
+        self.assertIn("ORDER_FILLED", messages)
+
+    def test_profitable_open_position_triggers_profit_exit_sell(self) -> None:
+        random.seed(0)
+        runtime = create_runtime(
+            bootstrap_prices=[100.01] * 30,
+            reference_price=100.0,
+            start_usdc=120.0,
+            start_eth=1.0,
+            start_eth_usd=0.0,
+            enable_trade_filter=False,
+            enable_execution_engine=False,
+            execution_timeframe_seconds=60.0,
+            trend_timeframe_seconds=60.0,
+        )
+        runtime.intelligence.build_snapshot = lambda **kwargs: SimpleNamespace(
+            regime="RANGE",
+            volatility_state="NORMAL",
+            feed_state="NORMAL",
+            mode="RANGE_MAKER",
+            strategy_mode="RANGE_MAKER",
+            short_ma=100.0,
+            long_ma=100.0,
+            volatility=0.0010,
+            spread_multiplier=1.0,
+            signal_score=0.28,
+            feed_score=0.1,
+            risk_score=0.05,
+            news_score=0.0,
+            macro_score=0.0,
+            onchain_score=0.0,
+            adaptive_score=0.0,
+            confidence=0.8,
+            buy_enabled=True,
+            sell_enabled=True,
+            max_inventory_multiplier=5.0,
+            target_inventory_pct=0.5,
+            trade_size_multiplier=1.0,
+            market_score=0.30,
+            trend_strength=1.0,
+            inventory_skew_multiplier=1.0,
+            directional_bias=0.0,
+            max_chase_bps_multiplier=1.0,
+            mm_mode="base_mm",
+            activity_boost=0.0,
+            freeze_recovery_mode=False,
+            fill_quality_score=1.0,
+            fill_quality_tier="normal",
+            cooldown_multiplier=1.0,
+        )
+        runtime.regime_detector.assess = lambda prices: MarketRegimeAssessment(
+            market_regime="RANGE",
+            regime_confidence=84.0,
+            range_width_pct=1.0,
+            net_move_pct=0.10,
+            direction_consistency=0.74,
+            volatility_score=22.0,
+            execution_regime="RANGE",
+            trend_direction="neutral",
+            range_location="lower",
+            bounce_count=3,
+            range_touch_count=4,
+            sign_flip_ratio=0.18,
+            noise_ratio=1.1,
+            body_to_wick_ratio=0.62,
+            ema_deviation_pct=0.08,
+            mean_reversion_distance_pct=-0.12,
+            window_high=100.8,
+            window_low=99.8,
+            window_mean=100.2,
+            price_position_pct=0.15,
+        )
+        runtime.edge_filter.assess = lambda **kwargs: EdgeAssessment(
+            expected_edge_usd=0.18,
+            expected_edge_bps=70.0,
+            cost_estimate_usd=0.02,
+            edge_score=78.0,
+            edge_pass=True,
+            slippage_estimate_bps=4.0,
+            mev_risk_score=18.0,
+        )
+        runtime.portfolio.eth_cost_basis = 100.0
+        runtime.profit_lock_state.anchor_price = 100.0
+        runtime.open_position_cycle = 0
+        runtime.open_position_reason = "trend_buy"
+        recorded_orders: list[tuple[str, str]] = []
+
+        def _simulate_fill(order, mid):
+            recorded_orders.append((order.side, order.trade_reason))
+            return FillResult(
+                filled=True,
+                side=order.side,
+                price=order.price,
+                size_base=order.size_base,
+                size_usd=order.size_usd,
+                fee_usd=0.01,
+                reason="fill",
+                execution_type=order.execution_type,
+                slippage_bps=order.slippage_bps,
+                trade_reason=order.trade_reason,
+            )
+
+        runtime.engine.simulate_fill = _simulate_fill
+
+        process_price_tick(
+            runtime=runtime,
+            cycle_index=30,
+            mid=100.01,
+            source="test",
+            trade_logger=None,
+            equity_logger=None,
+            log_progress=False,
+        )
+
+        self.assertGreaterEqual(len(recorded_orders), 1)
+        self.assertTrue(all(side == "sell" for side, _ in recorded_orders))
+        self.assertTrue(all(reason == "profit_exit_sell" for _, reason in recorded_orders))
 
 
 if __name__ == "__main__":
