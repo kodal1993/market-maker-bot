@@ -310,6 +310,10 @@ def log_cycle(
     )
     log(
         f"{cycle_index} | state {runtime.state_context.current_state.value} | time_in_state {time_in_state_sec:.0f}s | "
+        f"should_enter {getattr(runtime, 'current_should_enter', False)} | "
+        f"should_exit {getattr(runtime, 'current_should_exit', False)} | "
+        f"execution_attempted {getattr(runtime, 'current_execution_attempted', False)} | "
+        f"execution_success {getattr(runtime, 'current_execution_success', False)} | "
         f"last_transition {last_transition or '-'} | mode {mm_mode} | strategy_mode {strategy_mode} | current_mode {current_mode} | "
         f"cooldown_entry {cooldown_entry_reason or '-'} | cooldown_elapsed {cooldown_elapsed_sec:.0f}s | "
         f"cooldown_exit {cooldown_exit_reason or '-'} | "

@@ -303,6 +303,10 @@ class BotRuntime:
     current_inactivity_fallback_active: bool = False
     current_signal_block_reason: str = ""
     current_inventory_limit_state: str = "normal"
+    current_should_enter: bool = False
+    current_should_exit: bool = False
+    current_execution_attempted: bool = False
+    current_execution_success: bool = False
     pipeline_logging_enabled: bool = True
     current_soft_inventory_limit_usd: float = 0.0
     current_hard_inventory_limit_usd: float = 0.0
@@ -1237,6 +1241,271 @@ def _log_pipeline_event(
     log(message)
 
 
+def _reset_execution_debug_state(runtime: BotRuntime) -> None:
+    runtime.current_should_enter = False
+    runtime.current_should_exit = False
+    runtime.current_execution_attempted = False
+    runtime.current_execution_success = False
+
+
+def _set_execution_debug_state(
+    runtime: BotRuntime,
+    *,
+    should_enter: bool | None = None,
+    should_exit: bool | None = None,
+    execution_attempted: bool | None = None,
+    execution_success: bool | None = None,
+) -> None:
+    if should_enter is not None:
+        runtime.current_should_enter = should_enter
+    if should_exit is not None:
+        runtime.current_should_exit = should_exit
+    if execution_attempted is not None:
+        runtime.current_execution_attempted = execution_attempted
+    if execution_success is not None:
+        runtime.current_execution_success = execution_success
+
+
+def _execution_debug_fields(runtime: BotRuntime) -> dict[str, object]:
+    return {
+        "current_state": runtime.state_context.current_state.value,
+        "should_enter": runtime.current_should_enter,
+        "should_exit": runtime.current_should_exit,
+        "execution_attempted": runtime.current_execution_attempted,
+        "execution_success": runtime.current_execution_success,
+    }
+
+
+def _log_should_trade_state(
+    runtime: BotRuntime,
+    cycle_index: int,
+    *,
+    side: str,
+    value: bool,
+    stage: str,
+    trade_reason: str,
+    size_usd: float = 0.0,
+    order_price: float = 0.0,
+    blocked_reason: str = "",
+) -> None:
+    normalized_side = side.lower()
+    if normalized_side == "buy":
+        event = "SHOULD_ENTER"
+        _set_execution_debug_state(runtime, should_enter=value, should_exit=False)
+    else:
+        event = "SHOULD_EXIT"
+        _set_execution_debug_state(runtime, should_enter=False, should_exit=value)
+
+    fields: dict[str, object] = {
+        "value": value,
+        "stage": stage,
+        "side": normalized_side,
+        "trade_reason": trade_reason,
+        "size_usd": size_usd,
+        "order_price": order_price,
+        **_execution_debug_fields(runtime),
+    }
+    if blocked_reason:
+        fields["blocked_reason"] = blocked_reason
+    _log_pipeline_event(runtime, cycle_index, event, **fields)
+
+
+def _log_execution_failure(
+    runtime: BotRuntime,
+    cycle_index: int,
+    *,
+    side: str,
+    reason: str,
+    stage: str,
+    trade_reason: str = "",
+    size_usd: float = 0.0,
+    order_price: float = 0.0,
+    execution_type: str = "",
+    execution_mode: str = "",
+    **fields: object,
+) -> None:
+    payload: dict[str, object] = {
+        "side": side,
+        "reason": reason or "unknown_execution_failure",
+        "stage": stage,
+        "trade_reason": trade_reason,
+        "size_usd": size_usd,
+        "order_price": order_price,
+        "execution_type": execution_type,
+        "execution_mode": execution_mode,
+        **_execution_debug_fields(runtime),
+    }
+    payload.update(fields)
+    _log_pipeline_event(runtime, cycle_index, "EXECUTION_FAILED", **payload)
+
+
+def _log_execution_exception(
+    runtime: BotRuntime,
+    cycle_index: int,
+    *,
+    side: str,
+    stage: str,
+    exc: Exception,
+    trade_reason: str = "",
+    size_usd: float = 0.0,
+    order_price: float = 0.0,
+    execution_type: str = "",
+    execution_mode: str = "",
+    **fields: object,
+) -> None:
+    payload: dict[str, object] = {
+        "side": side,
+        "error": str(exc),
+        "stage": stage,
+        "trade_reason": trade_reason,
+        "size_usd": size_usd,
+        "order_price": order_price,
+        "execution_type": execution_type,
+        "execution_mode": execution_mode,
+        **_execution_debug_fields(runtime),
+    }
+    payload.update(fields)
+    _log_pipeline_event(runtime, cycle_index, "EXECUTION_ERROR", **payload)
+    _log_execution_failure(
+        runtime,
+        cycle_index,
+        side=side,
+        reason=str(exc),
+        stage=stage,
+        trade_reason=trade_reason,
+        size_usd=size_usd,
+        order_price=order_price,
+        execution_type=execution_type,
+        execution_mode=execution_mode,
+        **fields,
+    )
+
+
+def _log_order_response(
+    runtime: BotRuntime,
+    cycle_index: int,
+    *,
+    side: str,
+    trade_reason: str,
+    requested_size_usd: float,
+    requested_order_price: float,
+    execution_result,
+) -> None:
+    if execution_result is None:
+        return
+
+    _log_pipeline_event(
+        runtime,
+        cycle_index,
+        "ORDER_RESPONSE",
+        side=side,
+        trade_reason=trade_reason,
+        allow_trade=execution_result.allow_trade,
+        size_usd=execution_result.size_usd or requested_size_usd,
+        order_price=execution_result.order_price or requested_order_price,
+        quoted_price=execution_result.quoted_price,
+        execution_type=execution_result.execution_type,
+        execution_mode=execution_result.execution_mode,
+        blocked_reason=execution_result.trade_blocked_reason,
+        **_execution_debug_fields(runtime),
+    )
+
+
+def _execute_order_with_logging(
+    runtime: BotRuntime,
+    cycle_index: int,
+    *,
+    side: str,
+    trade_reason: str,
+    size_usd: float,
+    order_price: float,
+    execution_type: str,
+    execute_fn,
+    emit_order_events: bool = True,
+):
+    _set_execution_debug_state(runtime, execution_attempted=True, execution_success=False)
+    _log_pipeline_event(
+        runtime,
+        cycle_index,
+        "EXECUTION_ATTEMPT",
+        side=side,
+        trade_reason=trade_reason,
+        size_usd=size_usd,
+        order_price=order_price,
+        execution_type=execution_type,
+        **_execution_debug_fields(runtime),
+    )
+
+    try:
+        if emit_order_events:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "ORDER_SENT",
+                side=side,
+                trade_reason=trade_reason,
+                size_usd=size_usd,
+                order_price=order_price,
+                execution_type=execution_type,
+                **_execution_debug_fields(runtime),
+            )
+        fill = execute_fn()
+    except Exception as exc:  # noqa: BLE001 - execution failures must be visible and re-raised
+        _log_execution_exception(
+            runtime,
+            cycle_index,
+            side=side,
+            stage="order_execution",
+            exc=exc,
+            trade_reason=trade_reason,
+            size_usd=size_usd,
+            order_price=order_price,
+            execution_type=execution_type,
+        )
+        raise
+
+    if fill and fill.filled:
+        _set_execution_debug_state(runtime, execution_success=True)
+        if emit_order_events:
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "ORDER_FILLED",
+                side=side,
+                trade_reason=fill.trade_reason,
+                size_usd=fill.size_usd,
+                order_price=fill.price,
+                execution_type=fill.execution_type,
+                **_execution_debug_fields(runtime),
+            )
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "ORDER_EXECUTED",
+            side=side,
+            trade_reason=fill.trade_reason,
+            requested_size_usd=size_usd,
+            filled_size_usd=fill.size_usd,
+            order_price=fill.price,
+            execution_type=fill.execution_type,
+            **_execution_debug_fields(runtime),
+        )
+        return fill
+
+    _log_execution_failure(
+        runtime,
+        cycle_index,
+        side=side,
+        reason=(getattr(fill, "reason", "") or "no_fill_returned"),
+        stage="order_execution",
+        trade_reason=(getattr(fill, "trade_reason", "") or trade_reason),
+        size_usd=float(getattr(fill, "size_usd", 0.0) or size_usd),
+        order_price=float(getattr(fill, "price", 0.0) or order_price),
+        execution_type=str(getattr(fill, "execution_type", "") or execution_type),
+    )
+    return fill
+
+
 def _tradable_position_usd(runtime: BotRuntime, mid: float) -> float:
     if mid <= 0:
         return 0.0
@@ -1885,6 +2154,25 @@ def _raw_signal_label(decision: DecisionOutcome) -> str:
     return f"{action}:{source}:{reason}"
 
 
+def _resolve_no_trade_reason(intelligence) -> tuple[str, list[str]]:
+    blockers = list(getattr(intelligence, "blockers", []))
+    reason = "drawdown_pause" if "drawdown_pause" in blockers else "no_trade"
+    return reason, blockers
+
+
+def _should_bypass_no_trade_override(decision: DecisionOutcome) -> bool:
+    return (
+        decision.action == "SELL"
+        and decision.allow_trade
+        and decision.size_usd > 0
+        and decision.reason in FORCED_SELL_REASONS
+    )
+
+
+def _effective_no_trade_block_reason(runtime: BotRuntime, no_trade_reason: str) -> str:
+    return runtime.last_decision_block_reason or runtime.current_signal_block_reason or no_trade_reason
+
+
 def _side_inventory_size_multiplier(intelligence, inventory_profile, side: str) -> float:
     inventory_ratio = float(getattr(inventory_profile, "inventory_ratio", 0.5))
     target_inventory_pct = float(getattr(intelligence, "target_inventory_pct", 0.5))
@@ -2056,6 +2344,27 @@ def _apply_signal_pipeline(
         merged_filter_values = _merge_filter_values(merged_filter_values, **gate_decision.gate_details)
 
     if not gate_decision.allow_trade:
+        _log_should_trade_state(
+            runtime,
+            cycle_index,
+            side=decision.action.lower(),
+            value=False,
+            stage="signal_gate",
+            trade_reason=decision.reason,
+            size_usd=decision.size_usd,
+            order_price=decision.order_price,
+            blocked_reason=gate_decision.blocked_reason or decision.block_reason,
+        )
+        _log_execution_failure(
+            runtime,
+            cycle_index,
+            side=decision.action.lower(),
+            reason=gate_decision.blocked_reason or decision.block_reason or "gate_reject",
+            stage="signal_gate",
+            trade_reason=decision.reason,
+            size_usd=decision.size_usd,
+            order_price=decision.order_price,
+        )
         _log_pipeline_event(
             runtime,
             cycle_index,
@@ -2099,6 +2408,16 @@ def _apply_signal_pipeline(
     )
 
     if decision.action == "BUY":
+        _log_should_trade_state(
+            runtime,
+            cycle_index,
+            side="buy",
+            value=True,
+            stage="signal_gate",
+            trade_reason=decision.reason,
+            size_usd=adjusted_size_usd,
+            order_price=adjusted_order_price,
+        )
         _log_pipeline_event(
             runtime,
             cycle_index,
@@ -2107,6 +2426,17 @@ def _apply_signal_pipeline(
             approved_mode=gate_decision.approved_mode,
             edge_bps=edge_assessment.expected_edge_bps,
             edge_usd=edge_assessment.expected_edge_usd,
+            size_usd=adjusted_size_usd,
+            order_price=adjusted_order_price,
+        )
+    elif decision.action == "SELL":
+        _log_should_trade_state(
+            runtime,
+            cycle_index,
+            side="sell",
+            value=True,
+            stage="signal_gate",
+            trade_reason=decision.reason,
             size_usd=adjusted_size_usd,
             order_price=adjusted_order_price,
         )
@@ -2178,7 +2508,56 @@ def _route_execution_signal(
     signal: ExecutionSignal,
     context: ExecutionContext,
 ) -> tuple[object | None, dict[str, object]]:
-    return execution_helpers.route_execution_signal(runtime, signal, context)
+    cycle_index = context.block_number
+    try:
+        execution_result, filter_values = execution_helpers.route_execution_signal(runtime, signal, context)
+    except Exception as exc:  # noqa: BLE001 - execution failures must be logged and surfaced
+        _log_execution_exception(
+            runtime,
+            cycle_index,
+            side=signal.side,
+            stage="execution_router",
+            exc=exc,
+            trade_reason=signal.trade_reason,
+            size_usd=signal.size_usd,
+            order_price=signal.limit_price,
+        )
+        raise
+
+    _log_order_response(
+        runtime,
+        cycle_index,
+        side=signal.side,
+        trade_reason=signal.trade_reason,
+        requested_size_usd=signal.size_usd,
+        requested_order_price=signal.limit_price,
+        execution_result=execution_result,
+    )
+    if execution_result is not None and not execution_result.allow_trade:
+        _log_should_trade_state(
+            runtime,
+            cycle_index,
+            side=signal.side,
+            value=False,
+            stage="execution_router",
+            trade_reason=signal.trade_reason,
+            size_usd=signal.size_usd,
+            order_price=signal.limit_price,
+            blocked_reason=execution_result.trade_blocked_reason or "execution_router_blocked",
+        )
+        _log_execution_failure(
+            runtime,
+            cycle_index,
+            side=signal.side,
+            reason=execution_result.trade_blocked_reason or "execution_router_blocked",
+            stage="execution_router",
+            trade_reason=signal.trade_reason,
+            size_usd=signal.size_usd,
+            order_price=signal.limit_price,
+            execution_type=execution_result.execution_type,
+            execution_mode=execution_result.execution_mode,
+        )
+    return execution_result, filter_values
 
 
 def _apply_execution_result_to_order(order, execution_result) -> None:
@@ -2362,6 +2741,18 @@ def _execute_sell_chunks(
             reason="no_chunks",
             trade_reason=sell_order.trade_reason,
         )
+        _log_execution_failure(
+            runtime,
+            cycle_index,
+            side="sell",
+            reason="no_chunks",
+            stage="sell_chunk_prepare",
+            trade_reason=sell_order.trade_reason,
+            size_usd=sell_order.size_usd,
+            order_price=sell_order.price,
+            execution_type=sell_order.execution_type,
+            execution_mode=runtime.last_execution_analytics.execution_mode,
+        )
         return None
 
     total_size_usd = sum(chunk_sizes)
@@ -2405,6 +2796,20 @@ def _execute_sell_chunks(
                 chunk_index=chunk_index,
                 chunk_count=len(chunk_sizes),
             )
+            _log_execution_failure(
+                runtime,
+                cycle_index,
+                side="sell",
+                reason="size_below_min_after_sell_cap",
+                stage="sell_chunk_prepare",
+                trade_reason=chunk_order.trade_reason,
+                size_usd=chunk_order.size_usd,
+                order_price=chunk_order.price,
+                execution_type=chunk_order.execution_type,
+                execution_mode=runtime.last_execution_analytics.execution_mode,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
             break
         if not runtime.engine.can_place_sell(chunk_order, mode):
             _log_pipeline_event(
@@ -2415,6 +2820,20 @@ def _execute_sell_chunks(
                 reason="protect_eth",
                 trade_reason=chunk_order.trade_reason,
                 size_usd=chunk_order.size_usd,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
+            _log_execution_failure(
+                runtime,
+                cycle_index,
+                side="sell",
+                reason="protect_eth",
+                stage="sell_chunk_prepare",
+                trade_reason=chunk_order.trade_reason,
+                size_usd=chunk_order.size_usd,
+                order_price=chunk_order.price,
+                execution_type=chunk_order.execution_type,
+                execution_mode=runtime.last_execution_analytics.execution_mode,
                 chunk_index=chunk_index,
                 chunk_count=len(chunk_sizes),
             )
@@ -2433,7 +2852,24 @@ def _execute_sell_chunks(
             chunk_count=len(chunk_sizes),
         )
 
-        fill = runtime.engine.simulate_fill(chunk_order, mid)
+        try:
+            fill = runtime.engine.simulate_fill(chunk_order, mid)
+        except Exception as exc:  # noqa: BLE001 - chunk execution failures must be logged and re-raised
+            _log_execution_exception(
+                runtime,
+                cycle_index,
+                side="sell",
+                stage="sell_chunk_fill",
+                exc=exc,
+                trade_reason=chunk_order.trade_reason,
+                size_usd=chunk_order.size_usd,
+                order_price=chunk_order.price,
+                execution_type=chunk_order.execution_type,
+                execution_mode=runtime.last_execution_analytics.execution_mode,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
+            raise
         realized_delta = runtime.portfolio.realized_pnl_usd - realized_pnl_before
         if fill.filled:
             _log_pipeline_event(
@@ -2462,6 +2898,20 @@ def _execute_sell_chunks(
                 chunk_index=chunk_index,
                 chunk_count=len(chunk_sizes),
             )
+            _log_execution_failure(
+                runtime,
+                cycle_index,
+                side="sell",
+                reason=fill.reason,
+                stage="sell_chunk_fill",
+                trade_reason=fill.trade_reason,
+                size_usd=fill.size_usd,
+                order_price=fill.price,
+                execution_type=fill.execution_type,
+                execution_mode=runtime.last_execution_analytics.execution_mode,
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_sizes),
+            )
         if fill.filled:
             post_sell_inventory_usd = runtime.portfolio.inventory_usd(mid)
             if _should_activate_reentry_after_sell(runtime, runtime.portfolio.eth, mid):
@@ -2477,7 +2927,7 @@ def _execute_sell_chunks(
                         fallback_trade_size_usd=fallback_trade_size_usd,
                     ),
                 )
-        trade_analysis = _record_fill(runtime, cycle_index, mode, fill, realized_delta)
+        trade_analysis = _record_fill_with_logging(runtime, cycle_index, mode, fill, realized_delta)
         if fill.filled and runtime.enable_state_machine:
             runtime.state_machine.handle_sell_fill(
                 context=runtime.state_context,
@@ -2489,7 +2939,8 @@ def _execute_sell_chunks(
             )
             runtime.state_machine.maybe_enter_cooldown(runtime.state_context, cycle_index, runtime.loss_streak)
         cooldown_log_fields = _cooldown_log_fields(runtime, cycle_index)
-        _append_trade_row(
+        _append_trade_row_with_logging(
+            runtime,
             trade_logger,
             cycle_index,
             runtime.state_context.current_state.value,
@@ -2901,6 +3352,78 @@ def _append_trade_row(
     )
 
 
+def _append_trade_row_with_logging(
+    runtime: BotRuntime,
+    trade_logger,
+    cycle_index: int,
+    state: str,
+    mode: str,
+    decision_source: str,
+    final_action: str,
+    overridden_signals: str,
+    allow_trade: bool,
+    block_reason: str,
+    filter_values: str,
+    fill,
+    portfolio: Portfolio,
+    execution_analytics: ExecutionAnalyticsRecord,
+    entering_cooldown_reason: str,
+    cooldown_elapsed_sec: float,
+    cooldown_exit_reason: str,
+    trade_analysis: dict[str, object] | None = None,
+) -> None:
+    if trade_logger is None or not fill or not fill.filled:
+        return
+
+    try:
+        _append_trade_row(
+            trade_logger,
+            cycle_index,
+            state,
+            mode,
+            decision_source,
+            final_action,
+            overridden_signals,
+            allow_trade,
+            block_reason,
+            filter_values,
+            fill,
+            portfolio,
+            execution_analytics,
+            entering_cooldown_reason,
+            cooldown_elapsed_sec,
+            cooldown_exit_reason,
+            trade_analysis=trade_analysis,
+        )
+    except Exception as exc:  # noqa: BLE001 - logging errors must be visible and re-raised
+        _log_execution_exception(
+            runtime,
+            cycle_index,
+            side=fill.side,
+            stage="trade_csv_append",
+            exc=exc,
+            trade_reason=fill.trade_reason,
+            size_usd=fill.size_usd,
+            order_price=fill.price,
+            execution_type=fill.execution_type,
+            execution_mode=execution_analytics.execution_mode,
+        )
+        raise
+
+    _log_pipeline_event(
+        runtime,
+        cycle_index,
+        "TRADE_LOGGED",
+        side=fill.side,
+        trade_reason=fill.trade_reason,
+        size_usd=fill.size_usd,
+        order_price=fill.price,
+        execution_type=fill.execution_type,
+        execution_mode=execution_analytics.execution_mode,
+        **_execution_debug_fields(runtime),
+    )
+
+
 def _blank_trade_analysis() -> dict[str, object]:
     return {
         "entry_price": None,
@@ -3186,6 +3709,47 @@ def _record_fill(
     return trade_analysis
 
 
+def _record_fill_with_logging(
+    runtime: BotRuntime,
+    cycle_index: int,
+    mode: str,
+    fill,
+    realized_pnl_delta: float,
+) -> dict[str, object]:
+    try:
+        trade_analysis = _record_fill(runtime, cycle_index, mode, fill, realized_pnl_delta)
+    except Exception as exc:  # noqa: BLE001 - fill recording failures must be visible and re-raised
+        _log_execution_exception(
+            runtime,
+            cycle_index,
+            side=str(getattr(fill, "side", "") or ""),
+            stage="trade_record",
+            exc=exc,
+            trade_reason=str(getattr(fill, "trade_reason", "") or ""),
+            size_usd=float(getattr(fill, "size_usd", 0.0) or 0.0),
+            order_price=float(getattr(fill, "price", 0.0) or 0.0),
+            execution_type=str(getattr(fill, "execution_type", "") or ""),
+            execution_mode=runtime.last_execution_analytics.execution_mode,
+        )
+        raise
+
+    if fill and fill.filled:
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "TRADE_RECORDED",
+            side=fill.side,
+            trade_reason=fill.trade_reason,
+            size_usd=fill.size_usd,
+            order_price=fill.price,
+            execution_type=fill.execution_type,
+            execution_mode=runtime.last_execution_analytics.execution_mode,
+            realized_pnl_delta=realized_pnl_delta,
+            **_execution_debug_fields(runtime),
+        )
+    return trade_analysis
+
+
 def _allows_opposite_side_trade(
     runtime: BotRuntime,
     cycle_index: int,
@@ -3297,6 +3861,7 @@ def _process_price_tick_with_decision_engine(
     runtime.current_entry_edge_usd = 0.0
     runtime.current_signal_block_reason = ""
     runtime.current_edge_bucket = "bad"
+    _reset_execution_debug_state(runtime)
 
     min_notional_usd = sizing.min_notional_usd
     available_quote_usd = sizing.available_quote_to_trade_usd
@@ -3905,30 +4470,72 @@ def _process_price_tick_with_decision_engine(
         )
 
     if mode == "NO_TRADE":
-        blockers = getattr(intelligence, "blockers", [])
-        no_trade_reason = "drawdown_pause" if "drawdown_pause" in blockers else "no_trade"
-        _record_decision(runtime, DecisionOutcome(action="NONE", reason=no_trade_reason, source="strategy"))
-        _record_trade_gate(runtime, allow_trade=False, block_reason=no_trade_reason, filter_values={"mode": mode})
-        runtime.last_buy_debug_reason = no_trade_reason
-        runtime.last_sell_debug_reason = no_trade_reason
-        equity_row_kwargs.update(
-            {
-                "decision_source": runtime.last_decision_source,
-                "final_action": runtime.last_final_action,
-                "overridden_signals": runtime.last_overridden_signals,
-                "allow_trade": runtime.last_allow_trade,
-                "block_reason": runtime.last_decision_block_reason,
-                "filter_values": runtime.last_filter_values,
-                "buy_debug_reason": runtime.last_buy_debug_reason,
-                "sell_debug_reason": runtime.last_sell_debug_reason,
-            }
-        )
-        if log_progress:
-            _log_cycle(runtime, cycle_index, mode, intelligence, mid, source, equity_usd, pnl_usd, spread, inventory_usd)
-        _record_cycle_summary(runtime, cycle_index=cycle_index, spread_bps=spread, block_reason=no_trade_reason)
-        _maybe_log_freeze_block_summary(runtime, cycle_index)
-        _append_equity_row(**equity_row_kwargs)
-        return _kill_switch_allows_continue(pnl_usd, log_progress)
+        no_trade_reason, blockers = _resolve_no_trade_reason(intelligence)
+        if _should_bypass_no_trade_override(decision):
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "NO_TRADE_BYPASS",
+                side=decision.action.lower(),
+                trade_reason=decision.reason,
+                size_usd=decision.size_usd,
+                order_price=decision.order_price,
+                override_reason=no_trade_reason,
+                blockers="|".join(blockers),
+            )
+        else:
+            effective_block_reason = _effective_no_trade_block_reason(runtime, no_trade_reason)
+            _log_pipeline_event(
+                runtime,
+                cycle_index,
+                "NO_TRADE_OVERRIDE",
+                original_action=decision.action,
+                original_reason=decision.reason,
+                override_reason=no_trade_reason,
+                upstream_block_reason=effective_block_reason,
+                blockers="|".join(blockers),
+            )
+            _record_decision(
+                runtime,
+                DecisionOutcome(
+                    action="NONE",
+                    reason=no_trade_reason,
+                    source="strategy",
+                    block_reason=effective_block_reason,
+                ),
+            )
+            _record_trade_gate(
+                runtime,
+                allow_trade=False,
+                block_reason=effective_block_reason,
+                filter_values={
+                    "mode": mode,
+                    "no_trade_override": True,
+                    "no_trade_override_reason": no_trade_reason,
+                    "no_trade_blockers": "|".join(blockers),
+                    "upstream_block_reason": effective_block_reason,
+                },
+            )
+            runtime.last_buy_debug_reason = no_trade_reason
+            runtime.last_sell_debug_reason = no_trade_reason
+            equity_row_kwargs.update(
+                {
+                    "decision_source": runtime.last_decision_source,
+                    "final_action": runtime.last_final_action,
+                    "overridden_signals": runtime.last_overridden_signals,
+                    "allow_trade": runtime.last_allow_trade,
+                    "block_reason": runtime.last_decision_block_reason,
+                    "filter_values": runtime.last_filter_values,
+                    "buy_debug_reason": runtime.last_buy_debug_reason,
+                    "sell_debug_reason": runtime.last_sell_debug_reason,
+                }
+            )
+            if log_progress:
+                _log_cycle(runtime, cycle_index, mode, intelligence, mid, source, equity_usd, pnl_usd, spread, inventory_usd)
+            _record_cycle_summary(runtime, cycle_index=cycle_index, spread_bps=spread, block_reason=no_trade_reason)
+            _maybe_log_freeze_block_summary(runtime, cycle_index)
+            _append_equity_row(**equity_row_kwargs)
+            return _kill_switch_allows_continue(pnl_usd, log_progress)
 
     fill = None
     if decision.action in {"BUY", "SELL"}:
@@ -4101,8 +4708,32 @@ def _process_price_tick_with_decision_engine(
                     order_price=order.price,
                     gate="allow",
                     edge_bps=runtime.current_entry_edge_bps,
+                    **_execution_debug_fields(runtime),
                 )
             else:
+                _log_should_trade_state(
+                    runtime,
+                    cycle_index,
+                    side="buy",
+                    value=False,
+                    stage="pre_order_checks",
+                    trade_reason=order.trade_reason,
+                    size_usd=order.size_usd,
+                    order_price=order.price,
+                    blocked_reason=can_execute_reason or runtime.last_decision_block_reason or "trade_blocked",
+                )
+                _log_execution_failure(
+                    runtime,
+                    cycle_index,
+                    side="buy",
+                    reason=can_execute_reason or runtime.last_decision_block_reason or "trade_blocked",
+                    stage="pre_order_checks",
+                    trade_reason=order.trade_reason,
+                    size_usd=order.size_usd,
+                    order_price=order.price,
+                    execution_type=order.execution_type,
+                    execution_mode=runtime.last_execution_analytics.execution_mode,
+                )
                 _log_pipeline_event(
                     runtime,
                     cycle_index,
@@ -4123,8 +4754,32 @@ def _process_price_tick_with_decision_engine(
                 size_usd=order.size_usd,
                 order_price=order.price,
                 profit_pct=runtime.last_profit_pct,
+                **_execution_debug_fields(runtime),
             )
         else:
+            _log_should_trade_state(
+                runtime,
+                cycle_index,
+                side="sell",
+                value=False,
+                stage="pre_order_checks",
+                trade_reason=order.trade_reason,
+                size_usd=order.size_usd,
+                order_price=order.price,
+                blocked_reason=can_execute_reason or runtime.last_decision_block_reason or "trade_blocked",
+            )
+            _log_execution_failure(
+                runtime,
+                cycle_index,
+                side="sell",
+                reason=can_execute_reason or runtime.last_decision_block_reason or "trade_blocked",
+                stage="pre_order_checks",
+                trade_reason=order.trade_reason,
+                size_usd=order.size_usd,
+                order_price=order.price,
+                execution_type=order.execution_type,
+                execution_mode=runtime.last_execution_analytics.execution_mode,
+            )
             _log_pipeline_event(
                 runtime,
                 cycle_index,
@@ -4139,75 +4794,41 @@ def _process_price_tick_with_decision_engine(
 
         if can_execute:
             if order.side == "buy":
-                _log_pipeline_event(
-                    runtime,
-                    cycle_index,
-                    "EXECUTION_ATTEMPT",
-                    side="buy",
-                    trade_reason=order.trade_reason,
-                    size_usd=order.size_usd,
-                    order_price=order.price,
-                    execution_type=order.execution_type,
-                )
-                _log_pipeline_event(
-                    runtime,
-                    cycle_index,
-                    "ORDER_SENT",
-                    side="buy",
-                    trade_reason=order.trade_reason,
-                    size_usd=order.size_usd,
-                    order_price=order.price,
-                    execution_type=order.execution_type,
-                )
                 realized_pnl_before = portfolio.realized_pnl_usd
-                fill = engine.simulate_fill(order, mid)
-                if fill.filled:
-                    _log_pipeline_event(
-                        runtime,
-                        cycle_index,
-                        "ORDER_FILLED",
-                        side="buy",
-                        trade_reason=fill.trade_reason,
-                        size_usd=fill.size_usd,
-                        order_price=fill.price,
-                        execution_type=fill.execution_type,
-                    )
-                else:
-                    _log_pipeline_event(
-                        runtime,
-                        cycle_index,
-                        "EXECUTION_FAILED_REASON",
-                        side="buy",
-                        reason=fill.reason,
-                        trade_reason=fill.trade_reason,
-                        size_usd=fill.size_usd,
-                        order_price=fill.price,
-                        execution_type=fill.execution_type,
-                    )
-                realized_delta = portfolio.realized_pnl_usd - realized_pnl_before
-                trade_analysis = _record_fill(runtime, cycle_index, mode, fill, realized_delta)
-            else:
-                _log_pipeline_event(
+                fill = _execute_order_with_logging(
                     runtime,
                     cycle_index,
-                    "EXECUTION_ATTEMPT",
+                    side="buy",
+                    trade_reason=order.trade_reason,
+                    size_usd=order.size_usd,
+                    order_price=order.price,
+                    execution_type=order.execution_type,
+                    execute_fn=lambda: engine.simulate_fill(order, mid),
+                )
+                realized_delta = portfolio.realized_pnl_usd - realized_pnl_before
+                trade_analysis = _record_fill_with_logging(runtime, cycle_index, mode, fill, realized_delta)
+            else:
+                trade_analysis = None
+                fill = _execute_order_with_logging(
+                    runtime,
+                    cycle_index,
                     side="sell",
                     trade_reason=order.trade_reason,
                     size_usd=order.size_usd,
                     order_price=order.price,
                     execution_type=order.execution_type,
-                )
-                trade_analysis = None
-                fill = _execute_sell_chunks(
-                    runtime,
-                    cycle_index=cycle_index,
-                    mode=mode,
-                    mid=mid,
-                    sell_order=order,
-                    chunk_sizes=chunk_sizes,
-                    trade_logger=trade_logger,
-                    effective_max_inventory_usd=effective_max_inventory_usd,
-                    fallback_trade_size_usd=max(trade_size_usd, base_trade_size_usd),
+                    emit_order_events=False,
+                    execute_fn=lambda: _execute_sell_chunks(
+                        runtime,
+                        cycle_index=cycle_index,
+                        mode=mode,
+                        mid=mid,
+                        sell_order=order,
+                        chunk_sizes=chunk_sizes,
+                        trade_logger=trade_logger,
+                        effective_max_inventory_usd=effective_max_inventory_usd,
+                        fallback_trade_size_usd=max(trade_size_usd, base_trade_size_usd),
+                    ),
                 )
             if fill and fill.filled and order.side == "buy":
                 if decision.reason == "reentry_timeout":
@@ -4220,7 +4841,8 @@ def _process_price_tick_with_decision_engine(
                     runtime.state_machine.handle_buy_fill(runtime.state_context, cycle_index, decision.reason)
             cooldown_log_fields = _cooldown_log_fields(runtime, cycle_index)
             if order.side == "buy":
-                _append_trade_row(
+                _append_trade_row_with_logging(
+                    runtime,
                     trade_logger,
                     cycle_index,
                     runtime.state_context.current_state.value,
@@ -4446,6 +5068,7 @@ def process_price_tick(
     runtime.current_entry_edge_usd = 0.0
     runtime.current_signal_block_reason = ""
     runtime.current_edge_bucket = "bad"
+    _reset_execution_debug_state(runtime)
 
     min_notional_usd = sizing.min_notional_usd
     available_quote_usd = sizing.available_quote_to_trade_usd
@@ -5105,30 +5728,31 @@ def process_price_tick(
             effective_max_inventory_usd=effective_max_inventory_usd,
             size_usd=buy_order.size_usd,
         )
-        buy_execution_result = runtime.execution_router.execute_trade(
-            ExecutionSignal(
+        buy_execution_signal = ExecutionSignal(
+            side="buy",
+            size_usd=buy_order.size_usd,
+            limit_price=buy_order.price,
+            trade_reason=buy_reason,
+            mode=mode,
+            source=legacy_source,
+            pair=_execution_pair(),
+            router="uniswap_v3",
+            inventory_cap_usd=buy_inventory_cap,
+            metadata=_build_execution_signal_metadata(
+                runtime,
                 side="buy",
+                quote=quote,
                 size_usd=buy_order.size_usd,
-                limit_price=buy_order.price,
-                trade_reason=buy_reason,
                 mode=mode,
-                source=legacy_source,
-                pair=_execution_pair(),
-                router="uniswap_v3",
-                inventory_cap_usd=buy_inventory_cap,
-                metadata=_build_execution_signal_metadata(
-                    runtime,
-                    side="buy",
-                    quote=quote,
-                    size_usd=buy_order.size_usd,
-                    mode=mode,
-                    trade_reason=buy_reason,
-                    extra={"legacy": True},
-                ),
+                trade_reason=buy_reason,
+                extra={"legacy": True},
             ),
+        )
+        buy_execution_result, _ = _route_execution_signal(
+            runtime,
+            buy_execution_signal,
             buy_execution_context,
         )
-        execution_helpers.capture_execution_result(runtime, buy_execution_context, buy_execution_result)
         buy_execution_analytics = analytics_from_result(buy_execution_result)
     if runtime.enable_execution_engine and sell_order.size_usd > 0:
         sell_execution_context = _build_execution_context(
@@ -5144,30 +5768,31 @@ def process_price_tick(
             effective_max_inventory_usd=effective_max_inventory_usd,
             size_usd=sell_order.size_usd,
         )
-        sell_execution_result = runtime.execution_router.execute_trade(
-            ExecutionSignal(
+        sell_execution_signal = ExecutionSignal(
+            side="sell",
+            size_usd=sell_order.size_usd,
+            limit_price=sell_order.price,
+            trade_reason=sell_reason,
+            mode=mode,
+            source=legacy_source,
+            pair=_execution_pair(),
+            router="uniswap_v3",
+            inventory_cap_usd=buy_inventory_cap,
+            metadata=_build_execution_signal_metadata(
+                runtime,
                 side="sell",
+                quote=quote,
                 size_usd=sell_order.size_usd,
-                limit_price=sell_order.price,
-                trade_reason=sell_reason,
                 mode=mode,
-                source=legacy_source,
-                pair=_execution_pair(),
-                router="uniswap_v3",
-                inventory_cap_usd=buy_inventory_cap,
-                metadata=_build_execution_signal_metadata(
-                    runtime,
-                    side="sell",
-                    quote=quote,
-                    size_usd=sell_order.size_usd,
-                    mode=mode,
-                    trade_reason=sell_reason,
-                    extra={"legacy": True},
-                ),
+                trade_reason=sell_reason,
+                extra={"legacy": True},
             ),
+        )
+        sell_execution_result, _ = _route_execution_signal(
+            runtime,
+            sell_execution_signal,
             sell_execution_context,
         )
-        execution_helpers.capture_execution_result(runtime, sell_execution_context, sell_execution_result)
         sell_execution_analytics = analytics_from_result(sell_execution_result)
 
     selected_execution_result = None
@@ -5334,8 +5959,32 @@ def process_price_tick(
                     order_price=buy_order.price,
                     gate="allow",
                     edge_bps=runtime.current_entry_edge_bps,
+                    **_execution_debug_fields(runtime),
                 )
             else:
+                _log_should_trade_state(
+                    runtime,
+                    cycle_index,
+                    side="buy",
+                    value=False,
+                    stage="pre_order_checks",
+                    trade_reason=buy_reason,
+                    size_usd=buy_order.size_usd,
+                    order_price=buy_order.price,
+                    blocked_reason=can_execute_reason or "trade_blocked",
+                )
+                _log_execution_failure(
+                    runtime,
+                    cycle_index,
+                    side="buy",
+                    reason=can_execute_reason or "trade_blocked",
+                    stage="pre_order_checks",
+                    trade_reason=buy_reason,
+                    size_usd=buy_order.size_usd,
+                    order_price=buy_order.price,
+                    execution_type=buy_order.execution_type,
+                    execution_mode=runtime.last_execution_analytics.execution_mode,
+                )
                 _log_pipeline_event(
                     runtime,
                     cycle_index,
@@ -5357,8 +6006,32 @@ def process_price_tick(
                     size_usd=sell_order.size_usd,
                     order_price=sell_order.price,
                     profit_pct=runtime.last_profit_pct,
+                    **_execution_debug_fields(runtime),
                 )
             else:
+                _log_should_trade_state(
+                    runtime,
+                    cycle_index,
+                    side="sell",
+                    value=False,
+                    stage="pre_order_checks",
+                    trade_reason=sell_reason,
+                    size_usd=sell_order.size_usd,
+                    order_price=sell_order.price,
+                    blocked_reason=can_execute_reason or "trade_blocked",
+                )
+                _log_execution_failure(
+                    runtime,
+                    cycle_index,
+                    side="sell",
+                    reason=can_execute_reason or "trade_blocked",
+                    stage="pre_order_checks",
+                    trade_reason=sell_reason,
+                    size_usd=sell_order.size_usd,
+                    order_price=sell_order.price,
+                    execution_type=sell_order.execution_type,
+                    execution_mode=runtime.last_execution_analytics.execution_mode,
+                )
                 _log_pipeline_event(
                     runtime,
                     cycle_index,
@@ -5375,52 +6048,18 @@ def process_price_tick(
         runtime.last_execution_analytics = buy_execution_analytics
         if buy_execution_context is not None:
             execution_helpers.capture_execution_result(runtime, buy_execution_context, buy_execution_result)
-        _log_pipeline_event(
+        buy_fill = _execute_order_with_logging(
             runtime,
             cycle_index,
-            "EXECUTION_ATTEMPT",
             side="buy",
             trade_reason=buy_reason,
             size_usd=buy_order.size_usd,
             order_price=buy_order.price,
             execution_type=buy_order.execution_type,
+            execute_fn=lambda: engine.simulate_fill(buy_order, mid),
         )
-        _log_pipeline_event(
-            runtime,
-            cycle_index,
-            "ORDER_SENT",
-            side="buy",
-            trade_reason=buy_reason,
-            size_usd=buy_order.size_usd,
-            order_price=buy_order.price,
-            execution_type=buy_order.execution_type,
-        )
-        buy_fill = engine.simulate_fill(buy_order, mid)
-        if buy_fill.filled:
-            _log_pipeline_event(
-                runtime,
-                cycle_index,
-                "ORDER_FILLED",
-                side="buy",
-                trade_reason=buy_fill.trade_reason,
-                size_usd=buy_fill.size_usd,
-                order_price=buy_fill.price,
-                execution_type=buy_fill.execution_type,
-            )
-        else:
-            _log_pipeline_event(
-                runtime,
-                cycle_index,
-                "EXECUTION_FAILED_REASON",
-                side="buy",
-                reason=buy_fill.reason,
-                trade_reason=buy_fill.trade_reason,
-                size_usd=buy_fill.size_usd,
-                order_price=buy_fill.price,
-                execution_type=buy_fill.execution_type,
-            )
         realized_delta = portfolio.realized_pnl_usd - realized_pnl_before
-        trade_analysis = _record_fill(runtime, cycle_index, mode, buy_fill, realized_delta)
+        trade_analysis = _record_fill_with_logging(runtime, cycle_index, mode, buy_fill, realized_delta)
         if buy_fill.filled:
             if buy_reason == "reentry_timeout":
                 runtime.reentry_state.timeout_triggered = True
@@ -5431,7 +6070,8 @@ def process_price_tick(
             if runtime.enable_state_machine:
                 runtime.state_machine.handle_buy_fill(runtime.state_context, cycle_index, buy_reason)
         cooldown_log_fields = _cooldown_log_fields(runtime, cycle_index)
-        _append_trade_row(
+        _append_trade_row_with_logging(
+            runtime,
             trade_logger,
             cycle_index,
             runtime.state_context.current_state.value,
@@ -5456,26 +6096,26 @@ def process_price_tick(
         runtime.last_execution_analytics = sell_execution_analytics
         if sell_execution_context is not None:
             execution_helpers.capture_execution_result(runtime, sell_execution_context, sell_execution_result)
-        _log_pipeline_event(
+        sell_fill = _execute_order_with_logging(
             runtime,
             cycle_index,
-            "EXECUTION_ATTEMPT",
             side="sell",
             trade_reason=sell_reason,
             size_usd=sell_order.size_usd,
             order_price=sell_order.price,
             execution_type=sell_order.execution_type,
-        )
-        sell_fill = _execute_sell_chunks(
-            runtime,
-            cycle_index=cycle_index,
-            mode=mode,
-            mid=mid,
-            sell_order=sell_order,
-            chunk_sizes=sell_chunk_sizes,
-            trade_logger=trade_logger,
-            effective_max_inventory_usd=effective_max_inventory_usd,
-            fallback_trade_size_usd=max(trade_size_usd, base_trade_size_usd),
+            emit_order_events=False,
+            execute_fn=lambda: _execute_sell_chunks(
+                runtime,
+                cycle_index=cycle_index,
+                mode=mode,
+                mid=mid,
+                sell_order=sell_order,
+                chunk_sizes=sell_chunk_sizes,
+                trade_logger=trade_logger,
+                effective_max_inventory_usd=effective_max_inventory_usd,
+                fallback_trade_size_usd=max(trade_size_usd, base_trade_size_usd),
+            ),
         )
 
     if runtime.enable_state_machine:

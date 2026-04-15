@@ -52,6 +52,28 @@ def build_snapshot() -> SimpleNamespace:
     )
 
 
+def build_no_trade_snapshot() -> SimpleNamespace:
+    snapshot = build_snapshot()
+    snapshot.regime = "WARMUP"
+    snapshot.feed_state = "BLOCK"
+    snapshot.mode = "NO_TRADE"
+    snapshot.strategy_mode = "NO_TRADE"
+    snapshot.buy_enabled = False
+    snapshot.sell_enabled = False
+    snapshot.feed_score = -0.4152
+    snapshot.news_score = -0.2881
+    snapshot.macro_score = -0.8220
+    snapshot.risk_score = 0.16
+    snapshot.mm_mode = "base_mm"
+    snapshot.activity_boost = 1.0
+    snapshot.freeze_recovery_mode = False
+    snapshot.fill_quality_score = 1.0
+    snapshot.fill_quality_tier = "normal"
+    snapshot.cooldown_multiplier = 1.0
+    snapshot.blockers = ["warmup"]
+    return snapshot
+
+
 class BotRunnerExecutionBridgeTests(unittest.TestCase):
     def test_process_price_tick_logs_execution_analytics(self) -> None:
         random.seed(0)
@@ -190,11 +212,215 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
 
         messages = "\n".join(str(call.args[0]) for call in mocked_log.call_args_list if call.args)
         self.assertIn("ENTRY_SIGNAL", messages)
+        self.assertIn("SHOULD_ENTER", messages)
         self.assertIn("ENTRY_ALLOWED", messages)
         self.assertIn("ENTRY_TRIGGERED", messages)
+        self.assertIn("ORDER_RESPONSE", messages)
         self.assertIn("EXECUTION_ATTEMPT", messages)
         self.assertIn("ORDER_SENT", messages)
         self.assertIn("ORDER_FILLED", messages)
+        self.assertIn("ORDER_EXECUTED", messages)
+        self.assertIn("execution_attempted true", messages)
+        self.assertIn("execution_success true", messages)
+
+    def test_process_price_tick_emits_execution_failure_logs_when_router_blocks(self) -> None:
+        random.seed(0)
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            start_eth_usd=0.0,
+            enable_trade_filter=False,
+            enable_execution_engine=True,
+        )
+        runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
+        runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
+            action="BUY",
+            size_usd=30.0,
+            reason="trend_buy",
+            source="test",
+            order_price=100.0,
+            inventory_cap_usd=5_000.0,
+            allow_trade=True,
+            filter_values={},
+        )
+
+        with patch("runtime_execution.estimate_execution_gas_gwei", return_value=50.0):
+            with patch("bot_runner.log") as mocked_log:
+                process_price_tick(
+                    runtime=runtime,
+                    cycle_index=30,
+                    mid=100.0,
+                    source="test",
+                    trade_logger=None,
+                    equity_logger=None,
+                    log_progress=True,
+                )
+
+        messages = "\n".join(str(call.args[0]) for call in mocked_log.call_args_list if call.args)
+        self.assertIn("SHOULD_ENTER", messages)
+        self.assertIn("ORDER_RESPONSE", messages)
+        self.assertIn("EXECUTION_FAILED", messages)
+        self.assertIn("execution_attempted false", messages)
+        self.assertIn("execution_success false", messages)
+        self.assertNotIn("ORDER_EXECUTED", messages)
+        self.assertNotIn("EXECUTION_ATTEMPT", messages)
+
+    def test_process_price_tick_allows_protective_exit_during_no_trade_mode(self) -> None:
+        random.seed(0)
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            start_usdc=50.0,
+            start_eth=2.0,
+            start_eth_usd=0.0,
+            enable_trade_filter=False,
+            enable_execution_engine=False,
+            execution_timeframe_seconds=60.0,
+            trend_timeframe_seconds=60.0,
+        )
+        runtime.intelligence.build_snapshot = lambda **kwargs: build_no_trade_snapshot()
+        runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
+            action="SELL",
+            size_usd=20.0,
+            reason="profit_lock_level_1",
+            source="strategy",
+            order_price=100.10,
+            inventory_cap_usd=5_000.0,
+            allow_trade=True,
+            filter_values={},
+        )
+        runtime.regime_detector.assess = lambda prices: MarketRegimeAssessment(
+            market_regime="RANGE",
+            regime_confidence=84.0,
+            range_width_pct=1.0,
+            net_move_pct=0.10,
+            direction_consistency=0.74,
+            volatility_score=22.0,
+            execution_regime="RANGE",
+            trend_direction="neutral",
+            range_location="upper",
+            bounce_count=3,
+            range_touch_count=4,
+            sign_flip_ratio=0.18,
+            noise_ratio=1.1,
+            body_to_wick_ratio=0.62,
+            ema_deviation_pct=0.08,
+            mean_reversion_distance_pct=0.12,
+            window_high=100.8,
+            window_low=99.8,
+            window_mean=100.2,
+            price_position_pct=0.85,
+        )
+        runtime.edge_filter.assess = lambda **kwargs: EdgeAssessment(
+            expected_edge_usd=0.18,
+            expected_edge_bps=70.0,
+            cost_estimate_usd=0.02,
+            edge_score=78.0,
+            edge_pass=True,
+            slippage_estimate_bps=4.0,
+            mev_risk_score=18.0,
+        )
+        runtime.portfolio.eth_cost_basis = 100.0
+        runtime.profit_lock_state.anchor_price = 100.0
+        runtime.engine.can_place_sell = lambda order, mode: True
+
+        with patch("bot_runner.log") as mocked_log:
+            process_price_tick(
+                runtime=runtime,
+                cycle_index=30,
+                mid=100.10,
+                source="test",
+                trade_logger=None,
+                equity_logger=None,
+                log_progress=True,
+            )
+
+        messages = "\n".join(str(call.args[0]) for call in mocked_log.call_args_list if call.args)
+        self.assertIn("NO_TRADE_BYPASS", messages)
+        self.assertIn("EXIT_TRIGGERED", messages)
+        self.assertIn("ORDER_EXECUTED", messages)
+        self.assertNotIn("NO_TRADE_OVERRIDE", messages)
+        self.assertGreaterEqual(runtime.engine.trade_count, 1)
+
+    def test_process_price_tick_preserves_upstream_block_reason_when_no_trade_overrides(self) -> None:
+        random.seed(0)
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            start_usdc=50.0,
+            start_eth=2.0,
+            start_eth_usd=0.0,
+            enable_trade_filter=False,
+            enable_execution_engine=False,
+            execution_timeframe_seconds=60.0,
+            trend_timeframe_seconds=60.0,
+        )
+        runtime.intelligence.build_snapshot = lambda **kwargs: build_no_trade_snapshot()
+        runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
+            action="SELL",
+            size_usd=20.0,
+            reason="range_sell",
+            source="strategy",
+            order_price=100.10,
+            inventory_cap_usd=5_000.0,
+            allow_trade=True,
+            filter_values={},
+        )
+        runtime.regime_detector.assess = lambda prices: MarketRegimeAssessment(
+            market_regime="RANGE",
+            regime_confidence=84.0,
+            range_width_pct=1.0,
+            net_move_pct=0.10,
+            direction_consistency=0.74,
+            volatility_score=22.0,
+            execution_regime="RANGE",
+            trend_direction="neutral",
+            range_location="upper",
+            bounce_count=3,
+            range_touch_count=4,
+            sign_flip_ratio=0.18,
+            noise_ratio=1.1,
+            body_to_wick_ratio=0.62,
+            ema_deviation_pct=0.08,
+            mean_reversion_distance_pct=0.12,
+            window_high=100.8,
+            window_low=99.8,
+            window_mean=100.2,
+            price_position_pct=0.85,
+        )
+        runtime.edge_filter.assess = lambda **kwargs: EdgeAssessment(
+            expected_edge_usd=-0.16,
+            expected_edge_bps=-39.95,
+            cost_estimate_usd=0.16,
+            edge_score=30.8,
+            edge_pass=False,
+            edge_reject_reason="expected_edge_bad",
+            slippage_estimate_bps=3.6,
+            mev_risk_score=14.2,
+        )
+        runtime.portfolio.eth_cost_basis = 100.0
+
+        with patch("bot_runner.log") as mocked_log:
+            process_price_tick(
+                runtime=runtime,
+                cycle_index=30,
+                mid=100.10,
+                source="test",
+                trade_logger=None,
+                equity_logger=None,
+                log_progress=True,
+            )
+
+        messages = "\n".join(str(call.args[0]) for call in mocked_log.call_args_list if call.args)
+        filter_values = json.loads(runtime.last_filter_values)
+
+        self.assertIn("NO_TRADE_OVERRIDE", messages)
+        self.assertEqual(runtime.last_decision_block_reason, "expected_edge_bad")
+        self.assertEqual(filter_values["trade_blocked_reason"], "expected_edge_bad")
+        self.assertTrue(filter_values["no_trade_override"])
+        self.assertEqual(filter_values["no_trade_override_reason"], "no_trade")
+        self.assertEqual(filter_values["upstream_block_reason"], "expected_edge_bad")
+        self.assertEqual(runtime.engine.trade_count, 0)
 
     def test_profitable_open_position_triggers_profit_exit_sell(self) -> None:
         random.seed(0)
