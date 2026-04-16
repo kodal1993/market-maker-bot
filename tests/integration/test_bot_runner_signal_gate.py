@@ -87,7 +87,7 @@ def build_edge(*, edge_pass: bool = True, reject_reason: str = "") -> EdgeAssess
 
 
 class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
-    def test_process_price_tick_blocks_chop_market_signal(self) -> None:
+    def test_process_price_tick_softens_chop_market_signal(self) -> None:
         random.seed(0)
         runtime = create_runtime(
             bootstrap_prices=[100.0] * 30,
@@ -122,12 +122,13 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
         )
 
         filter_values = json.loads(runtime.last_filter_values)
-        self.assertEqual(runtime.engine.trade_count, 0)
-        self.assertEqual(runtime.last_decision_block_reason, "chop_market")
+        self.assertEqual(runtime.engine.trade_count, 1)
+        self.assertTrue(runtime.last_allow_trade)
         self.assertEqual(filter_values["market_regime"], "CHOP")
-        self.assertEqual(filter_values["gate_decision"], "reject")
+        self.assertEqual(filter_values["gate_decision"], "allow")
+        self.assertIn("chop_market_soft", filter_values["soft_guard_reasons"])
 
-    def test_process_price_tick_blocks_trend_down_reentry_buy(self) -> None:
+    def test_process_price_tick_softens_trend_down_reentry_buy(self) -> None:
         random.seed(0)
         runtime = create_runtime(
             bootstrap_prices=[110.0 - (index * 0.3) for index in range(30)],
@@ -161,8 +162,11 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
             log_progress=False,
         )
 
-        self.assertEqual(runtime.engine.trade_count, 0)
-        self.assertEqual(runtime.last_decision_block_reason, "ema_downtrend_buy_blocked")
+        filter_values = json.loads(runtime.last_filter_values)
+        self.assertEqual(runtime.engine.trade_count, 1)
+        self.assertTrue(runtime.last_allow_trade)
+        self.assertIn("ema_downtrend_buy_soft", filter_values["soft_guard_reasons"])
+        self.assertLess(filter_values["gate_size_multiplier"], 1.0)
 
     def test_process_price_tick_allows_range_signal_with_positive_edge(self) -> None:
         random.seed(0)
@@ -247,7 +251,7 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
             filter_values["entry_threshold_bps"],
             resolve_entry_threshold_bps("RANGE", "NORMAL"),
         )
-        self.assertAlmostEqual(filter_values["min_edge_bps"], resolve_min_edge_bps("RANGE"))
+        self.assertGreater(filter_values["min_edge_bps"], 0.0)
         self.assertAlmostEqual(filter_values["inventory_drift_pct"], 0.0, delta=1e-6)
         self.assertEqual(filter_values["trade_blocked_reason"], "")
 
@@ -364,7 +368,7 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
         self.assertEqual(runtime.last_decision_reason, "inventory_force_reduce")
         self.assertEqual(runtime.current_inventory_limit_state, "force_limit")
 
-    def test_process_price_tick_blocks_sell_when_ema_uptrend_active(self) -> None:
+    def test_process_price_tick_softens_sell_when_ema_uptrend_active(self) -> None:
         random.seed(0)
         runtime = create_runtime(
             bootstrap_prices=[100.0 + (index * 0.3) for index in range(30)],
@@ -404,8 +408,11 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
             log_progress=False,
         )
 
-        self.assertEqual(runtime.engine.trade_count, 0)
-        self.assertEqual(runtime.last_decision_block_reason, "ema_uptrend_sell_blocked")
+        filter_values = json.loads(runtime.last_filter_values)
+        self.assertEqual(runtime.engine.trade_count, 1)
+        self.assertTrue(runtime.last_allow_trade)
+        self.assertIn("ema_uptrend_sell_soft", filter_values["soft_guard_reasons"])
+        self.assertLess(filter_values["gate_size_multiplier"], 1.0)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import sys
 import unittest
@@ -97,7 +98,7 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
         runtime.edge_filter.assess = lambda **kwargs: build_edge()
         return runtime
 
-    def test_trend_filter_blocks_buy_on_15m_downtrend(self) -> None:
+    def test_trend_filter_softens_buy_on_15m_downtrend(self) -> None:
         random.seed(0)
         runtime = self._prepare_runtime(trend_filter=True, confirmation_filter=False)
         runtime.decision_engine.decide = lambda cycle_index, **kwargs: (
@@ -106,7 +107,7 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
                 size_usd=20.0,
                 reason="quoted_buy",
                 source="test",
-                order_price=999.0,
+                order_price=100.0,
                 inventory_cap_usd=5_000.0,
                 allow_trade=True,
                 filter_values={},
@@ -127,9 +128,16 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
                 log_progress=False,
             )
 
+        filter_values = json.loads(runtime.last_filter_values)
+
         self.assertEqual(runtime.engine.trade_count, 0)
-        self.assertEqual(runtime.last_decision_block_reason, "ema_downtrend_buy_blocked")
+        self.assertTrue(runtime.last_allow_trade)
+        self.assertEqual(runtime.last_decision_block_reason, "")
         self.assertEqual(runtime.current_trend_bias, "sell_only")
+        self.assertIn("ema_downtrend_buy_soft", filter_values["soft_guard_reasons"])
+        self.assertIn("momentum_drop_buy_soft", filter_values["soft_guard_reasons"])
+        self.assertLess(filter_values["adjusted_size_usd"], 20.0)
+        self.assertEqual(filter_values["trade_gate"], "allow")
 
     def test_same_signal_can_trade_when_upper_filter_disabled(self) -> None:
         random.seed(0)
@@ -140,7 +148,7 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
                 size_usd=20.0,
                 reason="quoted_buy",
                 source="test",
-                order_price=999.0,
+                order_price=100.0,
                 inventory_cap_usd=5_000.0,
                 allow_trade=True,
                 filter_values={},
@@ -161,10 +169,14 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
                 log_progress=False,
             )
 
+        filter_values = json.loads(runtime.last_filter_values)
+
         self.assertGreaterEqual(runtime.engine.trade_count, 1)
         self.assertTrue(runtime.last_allow_trade)
+        self.assertEqual(filter_values["soft_guard_reasons"], [])
+        self.assertEqual(filter_values["trade_gate"], "allow")
 
-    def test_confirmation_filter_blocks_buy_until_1m_momentum_slows(self) -> None:
+    def test_confirmation_filter_softens_buy_until_1m_momentum_slows(self) -> None:
         random.seed(0)
         runtime = self._prepare_runtime(trend_filter=False, confirmation_filter=True)
         runtime.decision_engine.decide = lambda cycle_index, **kwargs: (
@@ -173,7 +185,7 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
                 size_usd=20.0,
                 reason="quoted_buy",
                 source="test",
-                order_price=999.0,
+                order_price=100.0,
                 inventory_cap_usd=5_000.0,
                 allow_trade=True,
                 filter_values={},
@@ -194,8 +206,14 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
                 log_progress=False,
             )
 
+        filter_values = json.loads(runtime.last_filter_values)
+
         self.assertEqual(runtime.engine.trade_count, 0)
-        self.assertEqual(runtime.last_decision_block_reason, "confirmation_blocks_buy")
+        self.assertTrue(runtime.last_allow_trade)
+        self.assertEqual(runtime.last_decision_block_reason, "")
+        self.assertIn("confirmation_blocks_buy_soft", filter_values["soft_guard_reasons"])
+        self.assertLess(filter_values["adjusted_size_usd"], 20.0)
+        self.assertEqual(filter_values["trade_gate"], "allow")
 
 
 if __name__ == "__main__":

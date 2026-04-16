@@ -28,6 +28,29 @@ VARIANTS = (
         "enable_decision_engine": True,
         "enable_execution_engine": True,
         "enable_state_machine": True,
+        "adaptive_flags": None,
+    },
+    {
+        "name": "adaptive_regime_aware",
+        "enable_trade_filter": True,
+        "enable_inventory_manager": True,
+        "enable_reentry_engine": True,
+        "enable_decision_engine": True,
+        "enable_execution_engine": True,
+        "enable_state_machine": True,
+        "adaptive_flags": {
+            "enabled": True,
+            "regime_enabled": True,
+            "edge_enabled": True,
+            "mode_selector_enabled": True,
+            "dynamic_quoting_enabled": True,
+            "risk_governor_enabled": True,
+            "performance_adaptation_enabled": True,
+            "inventory_bands_enabled": True,
+            "fill_quality_enabled": True,
+            "soft_filters_enabled": True,
+            "logging_enabled": True,
+        },
     },
 )
 
@@ -89,6 +112,7 @@ def run_variant(rows: list[tuple[float, str]], seed: int, cycle_seconds: float, 
         enable_trade_filter=variant["enable_trade_filter"],
         enable_inventory_manager=variant["enable_inventory_manager"],
         enable_state_machine=variant["enable_state_machine"],
+        adaptive_flags=variant.get("adaptive_flags"),
     )
 
     for cycle_index, (mid, source) in enumerate(rows):
@@ -148,6 +172,8 @@ def summarize_variant(variant: str, cycle_seconds: float, summaries: list[dict])
         "avg_max_loss_streak": round(average([summary["max_loss_streak"] for summary in summaries]), 6),
         "avg_trade_count": round(average([summary["trade_count"] for summary in summaries]), 6),
         "avg_closed_trade_count": round(average([summary["closed_trade_count"] for summary in summaries]), 6),
+        "avg_idle_time_ratio": round(average([summary.get("idle_time_ratio", summary.get("no_trade_ratio", 0.0)) for summary in summaries]), 6),
+        "avg_toxic_fill_ratio": round(average([summary.get("toxic_fill_ratio", 0.0) for summary in summaries]), 6),
         "avg_buy_count": round(average([summary["buy_count"] for summary in summaries]), 6),
         "avg_sell_count": round(average([summary["sell_count"] for summary in summaries]), 6),
         "avg_pnl_per_trade": round(average([summary["pnl_per_trade"] for summary in summaries]), 6),
@@ -217,7 +243,8 @@ def main():
             f"{variant_name} | avg pnl {summary['avg_final_pnl']:.2f} | "
             f"avg eth delta {summary['avg_eth_delta']:.8f} | "
             f"profit factor {profit_factor_text} | "
-            f"avg dd {summary['avg_max_drawdown_usd']:.2f}"
+            f"avg dd {summary['avg_max_drawdown_usd']:.2f} | "
+            f"idle {summary['avg_idle_time_ratio']:.2%} | toxic {summary['avg_toxic_fill_ratio']:.2f}"
         )
 
     write_csv(summary_rows, csv_output)

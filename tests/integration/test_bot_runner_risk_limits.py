@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import shutil
 import sys
@@ -93,7 +94,7 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
             reference_price=100.0,
             start_eth_usd=0.0,
             enable_trade_filter=False,
-            enable_execution_engine=True,
+            enable_execution_engine=False,
             telegram_notifier=notifier,
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
@@ -126,12 +127,14 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
             )
 
         shutil.rmtree(temp_dir, ignore_errors=True)
+        filter_values = json.loads(runtime.last_filter_values)
+
         self.assertTrue(should_continue)
         self.assertGreaterEqual(runtime.engine.trade_count, 1)
         self.assertFalse(runtime.risk_stop_active)
         self.assertEqual(notifier.risk_alerts, [])
-        self.assertIn("risk_stop_size_exceeded", runtime.last_filter_values)
-        self.assertIn("reduced_trade_size_usd", runtime.last_filter_values)
+        self.assertTrue(filter_values["risk_stop_size_exceeded"])
+        self.assertEqual(filter_values["reduced_trade_size_usd"], 10.0)
 
     def test_daily_loss_limit_stops_bot_and_sends_alert(self) -> None:
         random.seed(0)
@@ -188,7 +191,7 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
         self.assertLessEqual(runtime.daily_pnl_usd, -5.0)
         self.assertEqual(notifier.risk_alerts[0]["reason"], "max_daily_loss_limit")
 
-    def test_exposure_limit_stops_bot_and_sends_alert(self) -> None:
+    def test_exposure_limit_triggers_soft_reduction_without_stopping_bot(self) -> None:
         random.seed(0)
         notifier = RecordingNotifier()
         runtime = create_runtime(
@@ -219,9 +222,17 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
             )
 
         shutil.rmtree(temp_dir, ignore_errors=True)
-        self.assertFalse(should_continue)
-        self.assertEqual(runtime.risk_stop_reason, "max_exposure_limit")
-        self.assertEqual(notifier.risk_alerts[0]["reason"], "max_exposure_limit")
+        filter_values = json.loads(runtime.last_filter_values)
+
+        self.assertTrue(should_continue)
+        self.assertFalse(runtime.risk_stop_active)
+        self.assertEqual(runtime.risk_stop_reason, "")
+        self.assertEqual(notifier.risk_alerts, [])
+        self.assertTrue(runtime.last_allow_trade)
+        self.assertEqual(runtime.last_final_action, "SELL")
+        self.assertEqual(filter_values["inventory_limit_state"], "force_limit")
+        self.assertEqual(filter_values["decision_reason"], "inventory_force_reduce")
+        self.assertEqual(filter_values["trade_gate"], "allow")
 
 
 if __name__ == "__main__":

@@ -106,10 +106,12 @@ class TradeFilter:
     @staticmethod
     def _base_cooldown_seconds(market_mode: str) -> float:
         normalized_mode = str(market_mode).strip().lower()
-        if normalized_mode == "aggressive":
+        if normalized_mode in {"aggressive", "trend_assist"}:
             return max(COOLDOWN_AGGRESSIVE_SEC, 0.0)
-        if normalized_mode == "defensive_mm":
+        if normalized_mode in {"defensive_mm", "rebalance_only", "standby"}:
             return max(COOLDOWN_DEFENSIVE_SEC, 0.0)
+        if normalized_mode == "skewed_mm":
+            return max((COOLDOWN_BASE_SEC + COOLDOWN_DEFENSIVE_SEC) / 2.0, 0.0)
         if normalized_mode == "base_mm":
             return max(COOLDOWN_BASE_SEC, 0.0)
         return max(TRADE_COOLDOWN_MINUTES * 60.0, 0.0)

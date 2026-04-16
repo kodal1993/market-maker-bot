@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import shutil
 import sys
@@ -65,7 +66,7 @@ class BotRunnerAntiOvertradingTests(unittest.TestCase):
             temp_dir,
         )
 
-    def test_process_price_tick_blocks_when_min_gap_not_met(self) -> None:
+    def test_process_price_tick_softens_when_min_gap_not_met(self) -> None:
         random.seed(0)
         runtime = create_runtime(
             bootstrap_prices=[100.0] * 30,
@@ -100,11 +101,17 @@ class BotRunnerAntiOvertradingTests(unittest.TestCase):
             )
 
         shutil.rmtree(temp_dir, ignore_errors=True)
-        self.assertEqual(runtime.engine.trade_count, 0)
-        self.assertEqual(runtime.daily_trade_count, 1)
-        self.assertEqual(runtime.last_decision_block_reason, "min_time_between_trades")
+        filter_values = json.loads(runtime.last_filter_values)
 
-    def test_process_price_tick_blocks_after_daily_trade_cap(self) -> None:
+        self.assertEqual(runtime.engine.trade_count, 1)
+        self.assertEqual(runtime.daily_trade_count, 2)
+        self.assertTrue(runtime.last_allow_trade)
+        self.assertEqual(runtime.last_decision_block_reason, "")
+        self.assertIn("min_time_between_trades_soft", filter_values["adjustment_reasons"])
+        self.assertGreater(filter_values["remaining_trade_gap_minutes"], 0.0)
+        self.assertTrue(filter_values["size_clamped_to_min"])
+
+    def test_process_price_tick_softens_after_daily_trade_cap(self) -> None:
         random.seed(0)
         runtime = create_runtime(
             bootstrap_prices=[100.0] * 30,
@@ -139,9 +146,15 @@ class BotRunnerAntiOvertradingTests(unittest.TestCase):
             )
 
         shutil.rmtree(temp_dir, ignore_errors=True)
-        self.assertEqual(runtime.engine.trade_count, 0)
-        self.assertEqual(runtime.daily_trade_count, 1)
-        self.assertEqual(runtime.last_decision_block_reason, "max_trades_per_day")
+        filter_values = json.loads(runtime.last_filter_values)
+
+        self.assertEqual(runtime.engine.trade_count, 1)
+        self.assertEqual(runtime.daily_trade_count, 2)
+        self.assertTrue(runtime.last_allow_trade)
+        self.assertEqual(runtime.last_decision_block_reason, "")
+        self.assertIn("max_trades_soft_limit", filter_values["adjustment_reasons"])
+        self.assertTrue(filter_values["daily_trade_limit_hit"])
+        self.assertTrue(filter_values["size_clamped_to_min"])
 
 
 if __name__ == "__main__":

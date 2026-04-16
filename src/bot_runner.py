@@ -3,6 +3,18 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 
+from adaptive_market_maker import (
+    AdaptiveCyclePlan,
+    AdaptiveFeatureConfig,
+    apply_intelligence_overrides,
+    build_adaptive_feature_config,
+    build_cycle_plan,
+    build_hourly_report,
+    quote_decision_filter_values,
+    register_fill_quality_probe,
+    soften_edge_assessment,
+    update_quote_decision_runtime,
+)
 from config import (
     BOT_CONFIG_PROFILE,
     BOT_MODE,
@@ -224,6 +236,7 @@ class BotRuntime:
     enable_trade_filter: bool
     enable_inventory_manager: bool
     enable_state_machine: bool
+    adaptive_config: AdaptiveFeatureConfig
     start_usdc: float
     start_eth: float
     telegram_notifier: TelegramNotifier | None = None
@@ -231,6 +244,7 @@ class BotRuntime:
     current_regime_assessment: MarketRegimeAssessment | None = None
     current_edge_assessment: EdgeAssessment | None = None
     current_signal_gate_decision: SignalGateDecision | None = None
+    current_adaptive_plan: AdaptiveCyclePlan | None = None
     current_market_mode: str = ""
     current_mm_mode: str = "base_mm"
     current_strategy_mode: str = "RANGE_MAKER"
@@ -316,6 +330,21 @@ class BotRuntime:
     current_entry_edge_bps: float = 0.0
     current_entry_edge_usd: float = 0.0
     current_hold_minutes: float = 0.0
+    current_adaptive_regime: str = ""
+    current_adaptive_regime_confidence: float = 0.0
+    current_adaptive_edge_score: float = 0.0
+    current_adaptive_mode: str = ""
+    current_aggressiveness_score: float = 0.0
+    current_risk_governor_state: str = "normal"
+    current_risk_governor_reasons: str = ""
+    current_toxic_fill_ratio: float = 0.0
+    current_adverse_fill_ratio: float = 0.0
+    current_expected_vs_realized_edge_bps: float = 0.0
+    current_liquidity_estimate_usd: float = 0.0
+    current_quote_decision: str = ""
+    current_quote_spread_bps: float = 0.0
+    current_quote_size_usd: float = 0.0
+    current_quote_skew_multiplier: float = 1.0
     open_position_cycle: int | None = None
     open_position_reason: str = ""
     open_position_regime: str = ""
@@ -372,6 +401,12 @@ class BotRuntime:
     summary_window_edge_samples: int = 0
     summary_window_block_reasons: dict[str, int] = field(default_factory=dict)
     last_freeze_block_summary_cycle: int | None = None
+    adaptive_pending_fill_checks: deque = field(default_factory=lambda: deque(maxlen=128))
+    adaptive_fill_quality_events: deque = field(default_factory=lambda: deque(maxlen=256))
+    adaptive_cycle_history: deque = field(default_factory=lambda: deque(maxlen=1440))
+    adaptive_last_hourly_report_cycle: int | None = None
+    last_cycle_realized_pnl_delta: float = 0.0
+    consecutive_invalid_price_cycles: int = 0
     last_rejection_cycle: int | None = None
     mode_counts: dict[str, int] = field(
         default_factory=lambda: {
@@ -497,6 +532,7 @@ def create_runtime(
     confirmation_timeframe_seconds: float | None = None,
     enable_trend_timeframe_filter: bool | None = None,
     enable_confirmation_filter: bool | None = None,
+    adaptive_flags: dict[str, bool] | None = None,
     telegram_notifier: TelegramNotifier | None = None,
 ) -> BotRuntime:
     resolved_start_eth_usd = START_ETH_USD if start_eth_usd is None else start_eth_usd
@@ -557,6 +593,7 @@ def create_runtime(
         if enable_confirmation_filter is None
         else enable_confirmation_filter
     )
+    adaptive_config = build_adaptive_feature_config(adaptive_flags)
     portfolio = Portfolio(resolved_start_usdc, resolved_start_eth)
     performance = PerformanceTracker(
         start_usdc=resolved_start_usdc,
@@ -624,6 +661,7 @@ def create_runtime(
         enable_trade_filter=resolved_enable_trade_filter,
         enable_inventory_manager=resolved_enable_inventory_manager,
         enable_state_machine=resolved_enable_state_machine,
+        adaptive_config=adaptive_config,
         start_usdc=resolved_start_usdc,
         start_eth=resolved_start_eth,
         telegram_notifier=telegram_notifier,
@@ -1598,6 +1636,10 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
         "inactivity_fallback_active": runtime.current_inactivity_fallback_active,
         "hold_minutes": round(runtime.current_hold_minutes, 6),
         "raw_signal": runtime.last_raw_signal,
+        "quote_decision": runtime.current_quote_decision,
+        "quote_spread_bps": round(runtime.current_quote_spread_bps, 6),
+        "quote_size_usd": round(runtime.current_quote_size_usd, 6),
+        "quote_skew_multiplier": round(runtime.current_quote_skew_multiplier, 6),
         "trade_blocked_reason": trade_blocked_reason,
         "execution_timeframe_seconds": round(runtime.execution_timeframe_seconds, 6),
         "trend_timeframe_seconds": round(runtime.trend_timeframe_seconds, 6),
@@ -1656,7 +1698,96 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
                 "gate_blocked_reason": gate.blocked_reason,
             }
         )
+    filter_values.update(quote_decision_filter_values(runtime, runtime.current_adaptive_plan))
     return filter_values
+
+
+def _build_adaptive_cycle_plan(
+    runtime: BotRuntime,
+    *,
+    cycle_index: int,
+    intelligence,
+    inventory_profile,
+    prices: list[float],
+    mid: float,
+    spread_bps: float,
+    inventory_usd: float,
+    equity_usd: float,
+    pnl_usd: float,
+    base_trade_size_usd: float,
+    cooldown_active: bool,
+) -> AdaptiveCyclePlan | None:
+    cycle_plan = build_cycle_plan(
+        runtime,
+        cycle_index=cycle_index,
+        intelligence=intelligence,
+        inventory_profile=inventory_profile,
+        prices=prices,
+        mid=mid,
+        spread_bps=spread_bps,
+        inventory_usd=inventory_usd,
+        equity_usd=equity_usd,
+        pnl_usd=pnl_usd,
+        base_trade_size_usd=base_trade_size_usd,
+        cooldown_active=cooldown_active,
+    )
+    runtime.current_adaptive_plan = cycle_plan
+    return cycle_plan
+
+
+def _apply_adaptive_cycle_plan(runtime: BotRuntime, intelligence, cycle_plan: AdaptiveCyclePlan | None) -> None:
+    runtime.current_adaptive_plan = cycle_plan
+    apply_intelligence_overrides(runtime, intelligence, cycle_plan)
+
+
+def _soften_cooldown_if_enabled(runtime: BotRuntime, in_cooldown: bool) -> tuple[bool, bool]:
+    if not in_cooldown:
+        return False, False
+    if runtime.current_adaptive_plan is None or not runtime.adaptive_config.soft_filters_enabled:
+        return True, False
+    if runtime.current_risk_governor_state == "kill_switch":
+        return True, False
+    return False, True
+
+
+def _record_adaptive_cycle_history(runtime: BotRuntime, cycle_index: int, block_reason: str) -> None:
+    if runtime.adaptive_config is None or not runtime.adaptive_config.logging_enabled:
+        return
+    runtime.adaptive_cycle_history.append(
+        {
+            "cycle": cycle_index,
+            "mm_mode": runtime.current_mm_mode,
+            "strategy_mode": runtime.current_strategy_mode,
+            "allow_trade": runtime.last_allow_trade,
+            "block_reason": block_reason or runtime.last_decision_block_reason,
+            "drawdown_pct": runtime.current_drawdown_pct,
+            "quote_enabled": runtime.current_quote_enabled,
+            "edge_score": runtime.current_adaptive_edge_score or (runtime.current_edge_assessment.edge_score if runtime.current_edge_assessment else 0.0),
+        }
+    )
+
+
+def _maybe_log_hourly_report(runtime: BotRuntime, cycle_index: int) -> None:
+    if runtime.adaptive_config is None or not runtime.adaptive_config.logging_enabled:
+        return
+    report_every_cycles = max(int(round((60.0 * 60.0) / max(runtime.cycle_seconds, 1.0))), 1)
+    if (cycle_index + 1) < report_every_cycles:
+        return
+    if runtime.adaptive_last_hourly_report_cycle is not None and (cycle_index - runtime.adaptive_last_hourly_report_cycle) < report_every_cycles:
+        return
+    report = build_hourly_report(runtime, cycle_index)
+    if not report:
+        return
+    runtime.adaptive_last_hourly_report_cycle = cycle_index
+    log(
+        "hourly report | "
+        f"trades {report['trade_count']} | "
+        f"pnl {report['pnl_usd']:.2f} | "
+        f"drawdown {report['drawdown_pct']:.2%} | "
+        f"modes {report['mode_distribution']} | "
+        f"skips {report['skip_reasons']} | "
+        f"toxic_fill_ratio {report['toxic_fill_ratio']:.2f}"
+    )
 
 
 def _paper_mode_enabled() -> bool:
@@ -1703,10 +1834,12 @@ def _mean(values) -> float:
 
 def _cooldown_base_seconds(mm_mode: str) -> float:
     normalized_mode = str(mm_mode).strip().lower()
-    if normalized_mode == "aggressive":
+    if normalized_mode in {"aggressive", "trend_assist"}:
         return max(COOLDOWN_AGGRESSIVE_SEC, 0.0)
-    if normalized_mode == "defensive_mm":
+    if normalized_mode in {"defensive_mm", "rebalance_only", "standby"}:
         return max(COOLDOWN_DEFENSIVE_SEC, 0.0)
+    if normalized_mode == "skewed_mm":
+        return max((COOLDOWN_BASE_SEC + COOLDOWN_DEFENSIVE_SEC) / 2.0, 0.0)
     return max(COOLDOWN_BASE_SEC, 0.0)
 
 
@@ -1821,9 +1954,11 @@ def _record_cycle_summary(
         runtime.summary_window_block_reasons[normalized_block_reason] = (
             runtime.summary_window_block_reasons.get(normalized_block_reason, 0) + 1
         )
+    _record_adaptive_cycle_history(runtime, cycle_index, normalized_block_reason)
 
     summary_window_cycles = max(int(round(900.0 / max(runtime.cycle_seconds, 1.0))), 1)
     if runtime.summary_window_cycles < summary_window_cycles:
+        _maybe_log_hourly_report(runtime, cycle_index)
         return
 
     avg_spread = runtime.summary_window_spread_total / max(runtime.summary_window_cycles, 1)
@@ -1846,6 +1981,7 @@ def _record_cycle_summary(
     runtime.summary_window_edge_total = 0.0
     runtime.summary_window_edge_samples = 0
     runtime.summary_window_block_reasons = {}
+    _maybe_log_hourly_report(runtime, cycle_index)
 
 
 def _maybe_log_freeze_block_summary(runtime: BotRuntime, cycle_index: int) -> None:
@@ -1892,6 +2028,8 @@ def _inventory_drift_block_reason(runtime: BotRuntime, action: str, trade_reason
     if action not in {"BUY", "SELL"}:
         return ""
     if trade_reason in INVENTORY_DRIFT_GUARD_EXEMPT_REASONS:
+        return ""
+    if runtime.adaptive_config is not None and runtime.adaptive_config.soft_filters_enabled:
         return ""
     neutral_band_pct = _inventory_neutral_band_ratio() * 100.0
     drift_pct = runtime.current_inventory_drift_pct
@@ -2296,6 +2434,7 @@ def _apply_signal_pipeline(
         current_profit_pct=runtime.last_profit_pct,
         min_edge_multiplier=max(runtime.current_min_edge_bps / max(RANGE_MIN_EDGE_BPS, 0.5), 0.35),
     )
+    edge_assessment, adaptive_edge_filter_values = soften_edge_assessment(edge_assessment, runtime.current_adaptive_plan)
     runtime.current_edge_assessment = edge_assessment
     runtime.current_edge_bucket = edge_assessment.edge_bucket
     runtime.current_aggressive_enabled = runtime.current_aggressive_enabled or edge_assessment.aggressive_enabled
@@ -2321,6 +2460,7 @@ def _apply_signal_pipeline(
     )
     runtime.current_signal_gate_decision = gate_decision
     merged_filter_values = _merge_filter_values(decision.filter_values, **_signal_filter_values(runtime))
+    merged_filter_values = _merge_filter_values(merged_filter_values, **adaptive_edge_filter_values)
     merged_filter_values = _merge_filter_values(merged_filter_values, **gate_decision.gate_details)
 
     if (
@@ -3522,6 +3662,7 @@ def _record_fill(
     runtime.last_execution_analytics.trade_blocked_reason = ""
     runtime.last_trade_reason = _trade_reason_category(mode, fill.trade_reason)
     runtime.last_trade_reason_detail = fill.trade_reason
+    runtime.last_cycle_realized_pnl_delta = realized_pnl_delta
     runtime.current_hold_minutes = float(trade_analysis.get("hold_minutes") or 0.0)
     runtime.summary_window_fills += 1
     runtime.fill_cycle_history.append(cycle_index)
@@ -3706,6 +3847,8 @@ def _record_fill(
             log(f"Telegram trade notify failed | cycle {cycle_index} | error {exc}")
 
     _update_fill_quality_state(runtime, cycle_index)
+    if runtime.adaptive_config is not None and runtime.adaptive_config.fill_quality_enabled:
+        register_fill_quality_probe(runtime, cycle_index, fill, runtime.current_entry_edge_bps)
     return trade_analysis
 
 
@@ -3789,6 +3932,11 @@ def _process_price_tick_with_decision_engine(
     log_progress: bool = True,
 ) -> bool:
     if mid <= 0:
+        runtime.consecutive_invalid_price_cycles += 1
+        if runtime.adaptive_config is not None and runtime.adaptive_config.risk_governor_enabled:
+            runtime.current_risk_governor_state = "kill_switch" if runtime.consecutive_invalid_price_cycles >= 3 else "soft_brake"
+            runtime.current_risk_governor_reasons = "feed_issue_cluster"
+            runtime.current_quote_enabled = False
         if log_progress:
             log(f"{cycle_index} | invalid price from {source}")
         return True
@@ -3796,6 +3944,8 @@ def _process_price_tick_with_decision_engine(
     portfolio = runtime.portfolio
     engine = runtime.engine
     runtime.pipeline_logging_enabled = log_progress
+    runtime.consecutive_invalid_price_cycles = 0
+    runtime.last_cycle_realized_pnl_delta = 0.0
 
     portfolio.ensure_cost_basis(mid)
     _refresh_timeframe_prices(runtime, mid)
@@ -3835,6 +3985,22 @@ def _process_price_tick_with_decision_engine(
         inventory_usd=inventory_usd,
         equity_usd=equity_usd,
     )
+    adaptive_cycle_plan = _build_adaptive_cycle_plan(
+        runtime,
+        cycle_index=cycle_index,
+        intelligence=intelligence,
+        inventory_profile=inventory_profile,
+        prices=runtime.prices,
+        mid=strategy_mid,
+        spread_bps=calculate_spread(intelligence.volatility, intelligence.spread_multiplier),
+        inventory_usd=inventory_usd,
+        equity_usd=equity_usd,
+        pnl_usd=pnl_usd,
+        base_trade_size_usd=sizing.trade_size_usd,
+        cooldown_active=runtime.enable_state_machine and runtime.state_machine.in_cooldown(runtime.state_context),
+    )
+    _apply_adaptive_cycle_plan(runtime, intelligence, adaptive_cycle_plan)
+    runtime.current_market_mode = _intelligence_active_regime(intelligence)
     _track_inventory_ratio(runtime, inventory_profile.inventory_ratio)
     _apply_runtime_regime_context(
         runtime,
@@ -3896,6 +4062,7 @@ def _process_price_tick_with_decision_engine(
     buy_state_allowed = not runtime.enable_state_machine or runtime.state_machine.allow_buy(runtime.state_context)
     sell_state_allowed = not runtime.enable_state_machine or runtime.state_machine.allow_sell(runtime.state_context)
     in_cooldown = runtime.enable_state_machine and runtime.state_machine.in_cooldown(runtime.state_context)
+    in_cooldown, cooldown_softened = _soften_cooldown_if_enabled(runtime, in_cooldown)
     trend_filter_buy_allowed = _trend_filter_allows_buy(runtime)
     trend_filter_sell_allowed = _trend_filter_allows_sell(runtime)
     adjusted_buy_enabled = intelligence.buy_enabled and trend_filter_buy_allowed
@@ -3930,6 +4097,13 @@ def _process_price_tick_with_decision_engine(
         target_inventory_ratio=intelligence.target_inventory_pct,
         inventory_band_low=INVENTORY_BAND_LOW,
         inventory_band_high=INVENTORY_BAND_HIGH,
+    )
+    update_quote_decision_runtime(
+        runtime,
+        spread_bps=spread,
+        size_usd=trade_size_usd,
+        bid=quote.bid,
+        ask=quote.ask,
     )
 
     trend_buy_target_pct = min(TREND_BUY_TARGET_PCT, intelligence.target_inventory_pct)
@@ -4997,6 +5171,11 @@ def process_price_tick(
         )
 
     if mid <= 0:
+        runtime.consecutive_invalid_price_cycles += 1
+        if runtime.adaptive_config is not None and runtime.adaptive_config.risk_governor_enabled:
+            runtime.current_risk_governor_state = "kill_switch" if runtime.consecutive_invalid_price_cycles >= 3 else "soft_brake"
+            runtime.current_risk_governor_reasons = "feed_issue_cluster"
+            runtime.current_quote_enabled = False
         if log_progress:
             log(f"{cycle_index} | invalid price from {source}")
         return True
@@ -5004,6 +5183,8 @@ def process_price_tick(
     portfolio = runtime.portfolio
     engine = runtime.engine
     runtime.pipeline_logging_enabled = log_progress
+    runtime.consecutive_invalid_price_cycles = 0
+    runtime.last_cycle_realized_pnl_delta = 0.0
 
     portfolio.ensure_cost_basis(mid)
     _refresh_timeframe_prices(runtime, mid)
@@ -5042,6 +5223,22 @@ def process_price_tick(
         inventory_usd=inventory_usd,
         equity_usd=equity_usd,
     )
+    adaptive_cycle_plan = _build_adaptive_cycle_plan(
+        runtime,
+        cycle_index=cycle_index,
+        intelligence=intelligence,
+        inventory_profile=inventory_profile,
+        prices=runtime.prices,
+        mid=strategy_mid,
+        spread_bps=calculate_spread(intelligence.volatility, intelligence.spread_multiplier),
+        inventory_usd=inventory_usd,
+        equity_usd=equity_usd,
+        pnl_usd=pnl_usd,
+        base_trade_size_usd=sizing.trade_size_usd,
+        cooldown_active=runtime.enable_state_machine and runtime.state_machine.in_cooldown(runtime.state_context),
+    )
+    _apply_adaptive_cycle_plan(runtime, intelligence, adaptive_cycle_plan)
+    runtime.current_market_mode = _intelligence_active_regime(intelligence)
     _track_inventory_ratio(runtime, inventory_profile.inventory_ratio)
     _apply_runtime_regime_context(
         runtime,
@@ -5103,6 +5300,7 @@ def process_price_tick(
     buy_state_allowed = not runtime.enable_state_machine or runtime.state_machine.allow_buy(runtime.state_context)
     sell_state_allowed = not runtime.enable_state_machine or runtime.state_machine.allow_sell(runtime.state_context)
     in_cooldown = runtime.enable_state_machine and runtime.state_machine.in_cooldown(runtime.state_context)
+    in_cooldown, cooldown_softened = _soften_cooldown_if_enabled(runtime, in_cooldown)
     trend_filter_buy_allowed = _trend_filter_allows_buy(runtime)
     trend_filter_sell_allowed = _trend_filter_allows_sell(runtime)
     adjusted_buy_enabled = intelligence.buy_enabled and trend_filter_buy_allowed
@@ -5248,6 +5446,13 @@ def process_price_tick(
         inventory_band_high=INVENTORY_BAND_HIGH,
     )
     buy_order, sell_order = engine.create_orders(quote.bid, quote.ask, trade_size_usd, mode)
+    update_quote_decision_runtime(
+        runtime,
+        spread_bps=spread,
+        size_usd=trade_size_usd,
+        bid=quote.bid,
+        ask=quote.ask,
+    )
 
     trend_buy_target_pct = min(TREND_BUY_TARGET_PCT, intelligence.target_inventory_pct)
     trend_signal_allows_buy = (
@@ -6317,6 +6522,7 @@ def build_summary(runtime: BotRuntime) -> dict:
         "inventory_ratio_max": 0.0 if runtime.inventory_ratio_max is None else runtime.inventory_ratio_max,
         "total_cycles": total_cycles,
         "no_trade_ratio": _ratio(runtime.mode_counts.get("NO_TRADE", 0)),
+        "idle_time_ratio": _ratio(runtime.mode_counts.get("NO_TRADE", 0)),
         "mode_counts": dict(runtime.mode_counts),
         "mm_mode_counts": dict(runtime.mm_mode_counts),
         "mode_distribution_pct": mode_distribution_pct,
@@ -6366,10 +6572,25 @@ def build_summary(runtime: BotRuntime) -> dict:
         "fill_quality_tier": runtime.current_fill_quality_tier,
         "fill_quality_score": runtime.current_fill_quality_score,
         "fill_rate": runtime.current_fill_rate,
+        "toxic_fill_ratio": runtime.current_toxic_fill_ratio,
+        "adverse_fill_ratio": runtime.current_adverse_fill_ratio,
+        "expected_vs_realized_edge_bps": runtime.current_expected_vs_realized_edge_bps,
+        "liquidity_estimate_usd": runtime.current_liquidity_estimate_usd,
         "realized_spread_bps": runtime.current_realized_spread_bps,
         "adverse_selection_bps": runtime.current_adverse_selection_bps,
         "post_fill_reversion_bps": runtime.current_post_fill_reversion_bps,
         "edge_bucket": runtime.current_edge_bucket,
+        "adaptive_regime": runtime.current_adaptive_regime,
+        "adaptive_regime_confidence": runtime.current_adaptive_regime_confidence,
+        "adaptive_edge_score": runtime.current_adaptive_edge_score,
+        "adaptive_mode": runtime.current_adaptive_mode,
+        "aggressiveness_score": runtime.current_aggressiveness_score,
+        "risk_governor_state": runtime.current_risk_governor_state,
+        "risk_governor_reasons": runtime.current_risk_governor_reasons,
+        "quote_decision": runtime.current_quote_decision,
+        "quote_spread_bps": runtime.current_quote_spread_bps,
+        "quote_size_usd": runtime.current_quote_size_usd,
+        "quote_skew_multiplier": runtime.current_quote_skew_multiplier,
         "inactivity_fallback_active": runtime.current_inactivity_fallback_active,
         "regime_confidence": 0.0 if regime is None else regime.regime_confidence,
         "range_width_pct": 0.0 if regime is None else regime.range_width_pct,
@@ -6466,5 +6687,12 @@ def log_summary(summary: dict) -> None:
     log(
         f"Activity/fill quality: boost {summary['activity_boost']:.2f} | cooldown {summary['dynamic_cooldown_sec']:.1f}s | "
         f"freeze {summary['freeze_recovery_mode']} | mins_since_fill {summary['minutes_since_last_fill']:.1f} | "
-        f"fill_quality {summary['fill_quality_tier']}:{summary['fill_quality_score']:.2f}"
+        f"fill_quality {summary['fill_quality_tier']}:{summary['fill_quality_score']:.2f} | "
+        f"toxic_fill_ratio {summary['toxic_fill_ratio']:.2f}"
+    )
+    log(
+        f"Adaptive state: regime {summary['adaptive_regime'] or '-'} ({summary['adaptive_regime_confidence']:.1f}) | "
+        f"edge {summary['adaptive_edge_score']:.1f} | mode {summary['adaptive_mode'] or summary['mm_mode']} | "
+        f"aggr {summary['aggressiveness_score']:.1f} | risk {summary['risk_governor_state']} | "
+        f"quote {summary['quote_decision'] or '-'}"
     )

@@ -28,6 +28,21 @@ def _rounded_or_blank(value: object) -> object:
         return ""
 
 
+def _compact_mapping_for_log(mapping: object) -> str:
+    if not isinstance(mapping, dict):
+        return "-"
+    parts: list[str] = []
+    for key in sorted(mapping.keys()):
+        value = mapping.get(key)
+        if not value:
+            continue
+        if isinstance(value, (int, float)):
+            parts.append(f"{key}:{float(value):.2f}")
+        else:
+            parts.append(f"{key}:{value}")
+    return ",".join(parts) if parts else "-"
+
+
 def extract_signal_log_fields(filter_values: str) -> dict[str, object]:
     payload = _deserialize_filter_values(filter_values)
     return {
@@ -50,6 +65,16 @@ def extract_signal_log_fields(filter_values: str) -> dict[str, object]:
             or payload.get("block_reason")
             or ""
         ),
+        "adaptive_regime": str(payload.get("adaptive_regime") or ""),
+        "adaptive_regime_confidence": _rounded_or_blank(payload.get("adaptive_regime_confidence")),
+        "adaptive_edge_score": _rounded_or_blank(payload.get("adaptive_edge_score")),
+        "adaptive_mode": str(payload.get("adaptive_mode") or ""),
+        "aggressiveness_score": _rounded_or_blank(payload.get("adaptive_aggressiveness")),
+        "risk_governor_state": str(payload.get("adaptive_risk_state") or ""),
+        "toxic_fill_ratio": _rounded_or_blank(payload.get("adaptive_toxic_fill_ratio")),
+        "adverse_fill_ratio": _rounded_or_blank(payload.get("adaptive_adverse_fill_ratio")),
+        "liquidity_estimate_usd": _rounded_or_blank(payload.get("adaptive_liquidity_estimate_usd")),
+        "quote_decision": str(payload.get("quote_decision") or payload.get("adaptive_mode_reason") or ""),
     }
 
 
@@ -71,6 +96,16 @@ def trade_log_headers() -> list[str]:
         "inventory_drift_pct",
         "signal_block_reason",
         "inactivity_fallback_active",
+        "adaptive_regime",
+        "adaptive_regime_confidence",
+        "adaptive_edge_score",
+        "adaptive_mode",
+        "aggressiveness_score",
+        "risk_governor_state",
+        "toxic_fill_ratio",
+        "adverse_fill_ratio",
+        "liquidity_estimate_usd",
+        "quote_decision",
         "side",
         "execution_type",
         "execution_mode",
@@ -130,6 +165,16 @@ def equity_log_headers() -> list[str]:
         "inventory_drift_pct",
         "signal_block_reason",
         "inactivity_fallback_active",
+        "adaptive_regime",
+        "adaptive_regime_confidence",
+        "adaptive_edge_score",
+        "adaptive_mode",
+        "aggressiveness_score",
+        "risk_governor_state",
+        "toxic_fill_ratio",
+        "adverse_fill_ratio",
+        "liquidity_estimate_usd",
+        "quote_decision",
         "feed_state",
         "regime",
         "volatility_state",
@@ -304,6 +349,20 @@ def log_cycle(
     aggressive_enabled = getattr(runtime, "current_aggressive_enabled", False)
     freeze_recovery_mode = getattr(runtime, "current_freeze_recovery_mode", False)
     edge_bucket = getattr(runtime, "current_edge_bucket", "bad")
+    adaptive_regime = getattr(runtime, "current_adaptive_regime", "")
+    adaptive_edge_score = getattr(runtime, "current_adaptive_edge_score", 0.0)
+    adaptive_mode = getattr(runtime, "current_adaptive_mode", "")
+    aggressiveness_score = getattr(runtime, "current_aggressiveness_score", 0.0)
+    risk_governor_state = getattr(runtime, "current_risk_governor_state", "normal")
+    toxic_fill_ratio = getattr(runtime, "current_toxic_fill_ratio", 0.0)
+    adaptive_plan = getattr(runtime, "current_adaptive_plan", None)
+    adaptive_profile = getattr(getattr(runtime, "adaptive_config", None), "profile", "") or "-"
+    adaptive_penalties = _compact_mapping_for_log(
+        {} if adaptive_plan is None else getattr(getattr(adaptive_plan, "edge", None), "penalties", {})
+    )
+    adaptive_size_multiplier = 1.0 if adaptive_plan is None else getattr(adaptive_plan.aggressiveness, "size_multiplier", 1.0)
+    adaptive_spread_multiplier = 1.0 if adaptive_plan is None else getattr(adaptive_plan.aggressiveness, "spread_multiplier", 1.0)
+    adaptive_skew_multiplier = 1.0 if adaptive_plan is None else getattr(adaptive_plan.aggressiveness, "skew_multiplier", 1.0)
     confirmation_text = (
         f"{getattr(runtime, 'current_confirmation_momentum_bps', 0.0):.1f}bps/"
         f"{'slow' if getattr(runtime, 'current_confirmation_slowing', False) else 'fast'}"
@@ -337,6 +396,11 @@ def log_cycle(
         f"inactivity_fallback_active {inactivity_fallback_active} | "
         f"upper_tf {upper_tf_bias} | confirm {confirmation_text} | "
         f"edge {edge_score:.1f} | exp_edge {expected_edge_usd:.4f} | "
+        f"adaptive_regime {adaptive_regime or '-'} | adaptive_edge {adaptive_edge_score:.1f} | "
+        f"adaptive_mode {adaptive_mode or '-'} | adaptive_profile {adaptive_profile} | aggr {aggressiveness_score:.1f} | "
+        f"adaptive_penalties {adaptive_penalties} | "
+        f"adaptive_mult size={adaptive_size_multiplier:.2f}/spread={adaptive_spread_multiplier:.2f}/skew={adaptive_skew_multiplier:.2f} | "
+        f"risk_governor {risk_governor_state} | toxic_fill_ratio {toxic_fill_ratio:.2f} | "
         f"gate {gate_text} | gate_reason {gate_reason} | trade_blocked_reason {trade_blocked_reason} | "
         f"loss_streak {getattr(runtime, 'loss_streak', 0)} | "
         f"drawdown {getattr(runtime, 'current_drawdown_pct', 0.0):.2%} | dd_stage {getattr(runtime, 'drawdown_guard_stage', 'normal')} | "
@@ -378,19 +442,31 @@ def log_execution_decision(runtime, cycle_index: int) -> None:
 
 
 def log_trade_intent(runtime, cycle_index: int) -> None:
+    adaptive_plan = getattr(runtime, "current_adaptive_plan", None)
+    adaptive_penalties = _compact_mapping_for_log(
+        {} if adaptive_plan is None else getattr(getattr(adaptive_plan, "edge", None), "penalties", {})
+    )
     if runtime.last_final_action in {"BUY", "SELL"} and runtime.last_allow_trade:
         log(
             f"{cycle_index} | traded_why {runtime.last_final_action.lower()} | "
             f"reason {runtime.last_decision_reason or '-'} | "
             f"source {runtime.last_decision_source or '-'} | "
-            f"size {runtime.last_decision_size_usd:.2f}"
+            f"size {runtime.last_decision_size_usd:.2f} | "
+            f"mode {getattr(runtime, 'current_adaptive_mode', getattr(runtime, 'current_mm_mode', '-')) or '-'} | "
+            f"penalties {adaptive_penalties} | "
+            f"quote {getattr(runtime, 'current_quote_decision', '-') or '-'} | "
+            f"risk {getattr(runtime, 'current_risk_governor_state', 'normal')}"
         )
         return
 
     log(
         f"{cycle_index} | no_trade_why action {runtime.last_final_action or 'NONE'} | "
         f"reason {runtime.last_decision_block_reason or runtime.last_decision_reason or 'no_signal'} | "
-        f"source {runtime.last_decision_source or '-'}"
+        f"source {runtime.last_decision_source or '-'} | "
+        f"mode {getattr(runtime, 'current_adaptive_mode', getattr(runtime, 'current_mm_mode', '-')) or '-'} | "
+        f"penalties {adaptive_penalties} | "
+        f"quote {getattr(runtime, 'current_quote_decision', '-') or '-'} | "
+        f"risk {getattr(runtime, 'current_risk_governor_state', 'normal')}"
     )
 
 
@@ -489,6 +565,16 @@ def append_equity_row(
             signal_fields["inventory_drift_pct"],
             signal_fields["signal_block_reason"],
             int(signal_fields["inactivity_fallback_active"]),
+            signal_fields["adaptive_regime"],
+            signal_fields["adaptive_regime_confidence"],
+            signal_fields["adaptive_edge_score"],
+            signal_fields["adaptive_mode"],
+            signal_fields["aggressiveness_score"],
+            signal_fields["risk_governor_state"],
+            signal_fields["toxic_fill_ratio"],
+            signal_fields["adverse_fill_ratio"],
+            signal_fields["liquidity_estimate_usd"],
+            signal_fields["quote_decision"],
             feed_state,
             regime,
             volatility_state,
@@ -613,6 +699,16 @@ def append_trade_row(
             signal_fields["inventory_drift_pct"],
             signal_fields["signal_block_reason"],
             int(signal_fields["inactivity_fallback_active"]),
+            signal_fields["adaptive_regime"],
+            signal_fields["adaptive_regime_confidence"],
+            signal_fields["adaptive_edge_score"],
+            signal_fields["adaptive_mode"],
+            signal_fields["aggressiveness_score"],
+            signal_fields["risk_governor_state"],
+            signal_fields["toxic_fill_ratio"],
+            signal_fields["adverse_fill_ratio"],
+            signal_fields["liquidity_estimate_usd"],
+            signal_fields["quote_decision"],
             fill.side,
             fill.execution_type,
             execution_analytics.execution_mode,
