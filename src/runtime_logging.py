@@ -67,13 +67,19 @@ def extract_signal_log_fields(filter_values: str) -> dict[str, object]:
         ),
         "adaptive_regime": str(payload.get("adaptive_regime") or ""),
         "adaptive_regime_confidence": _rounded_or_blank(payload.get("adaptive_regime_confidence")),
+        "regime_reason": str("|".join(payload.get("regime_reason") or []) if isinstance(payload.get("regime_reason"), list) else payload.get("regime_reason") or ""),
         "adaptive_edge_score": _rounded_or_blank(payload.get("adaptive_edge_score")),
+        "trade_permission_state": str(payload.get("trade_permission_state") or ""),
         "adaptive_mode": str(payload.get("adaptive_mode") or ""),
         "aggressiveness_score": _rounded_or_blank(payload.get("adaptive_aggressiveness")),
         "risk_governor_state": str(payload.get("adaptive_risk_state") or ""),
+        "defensive_stage": _rounded_or_blank(payload.get("defensive_stage")),
         "toxic_fill_ratio": _rounded_or_blank(payload.get("adaptive_toxic_fill_ratio")),
         "adverse_fill_ratio": _rounded_or_blank(payload.get("adaptive_adverse_fill_ratio")),
         "liquidity_estimate_usd": _rounded_or_blank(payload.get("adaptive_liquidity_estimate_usd")),
+        "activity_floor_state": str(payload.get("activity_floor_state") or ""),
+        "inactivity_cycles": _rounded_or_blank(payload.get("inactivity_cycles")),
+        "inventory_pressure_score": _rounded_or_blank(payload.get("inventory_pressure_score")),
         "quote_decision": str(payload.get("quote_decision") or payload.get("adaptive_mode_reason") or ""),
     }
 
@@ -98,13 +104,19 @@ def trade_log_headers() -> list[str]:
         "inactivity_fallback_active",
         "adaptive_regime",
         "adaptive_regime_confidence",
+        "regime_reason",
         "adaptive_edge_score",
+        "trade_permission_state",
         "adaptive_mode",
         "aggressiveness_score",
         "risk_governor_state",
+        "defensive_stage",
         "toxic_fill_ratio",
         "adverse_fill_ratio",
         "liquidity_estimate_usd",
+        "activity_floor_state",
+        "inactivity_cycles",
+        "inventory_pressure_score",
         "quote_decision",
         "side",
         "execution_type",
@@ -167,13 +179,19 @@ def equity_log_headers() -> list[str]:
         "inactivity_fallback_active",
         "adaptive_regime",
         "adaptive_regime_confidence",
+        "regime_reason",
         "adaptive_edge_score",
+        "trade_permission_state",
         "adaptive_mode",
         "aggressiveness_score",
         "risk_governor_state",
+        "defensive_stage",
         "toxic_fill_ratio",
         "adverse_fill_ratio",
         "liquidity_estimate_usd",
+        "activity_floor_state",
+        "inactivity_cycles",
+        "inventory_pressure_score",
         "quote_decision",
         "feed_state",
         "regime",
@@ -354,6 +372,12 @@ def log_cycle(
     adaptive_mode = getattr(runtime, "current_adaptive_mode", "")
     aggressiveness_score = getattr(runtime, "current_aggressiveness_score", 0.0)
     risk_governor_state = getattr(runtime, "current_risk_governor_state", "normal")
+    defensive_stage = getattr(runtime, "current_defensive_stage", 0)
+    trade_permission_state = getattr(runtime, "current_trade_permission_state", "")
+    activity_floor_state = getattr(runtime, "current_activity_floor_state", "")
+    inactivity_cycles = getattr(runtime, "current_inactivity_cycles", 0)
+    inventory_pressure_score = getattr(runtime, "current_inventory_pressure_score", 0.0)
+    regime_reason = getattr(runtime, "current_regime_reason", "")
     toxic_fill_ratio = getattr(runtime, "current_toxic_fill_ratio", 0.0)
     adaptive_plan = getattr(runtime, "current_adaptive_plan", None)
     adaptive_profile = getattr(getattr(runtime, "adaptive_config", None), "profile", "") or "-"
@@ -398,8 +422,11 @@ def log_cycle(
         f"edge {edge_score:.1f} | exp_edge {expected_edge_usd:.4f} | "
         f"adaptive_regime {adaptive_regime or '-'} | adaptive_edge {adaptive_edge_score:.1f} | "
         f"adaptive_mode {adaptive_mode or '-'} | adaptive_profile {adaptive_profile} | aggr {aggressiveness_score:.1f} | "
+        f"perm {trade_permission_state or '-'} | stage {defensive_stage} | "
         f"adaptive_penalties {adaptive_penalties} | "
         f"adaptive_mult size={adaptive_size_multiplier:.2f}/spread={adaptive_spread_multiplier:.2f}/skew={adaptive_skew_multiplier:.2f} | "
+        f"activity_floor {activity_floor_state or '-'} | inactivity_cycles {inactivity_cycles} | "
+        f"inventory_pressure_score {inventory_pressure_score:.1f} | regime_reason {regime_reason or '-'} | "
         f"risk_governor {risk_governor_state} | toxic_fill_ratio {toxic_fill_ratio:.2f} | "
         f"gate {gate_text} | gate_reason {gate_reason} | trade_blocked_reason {trade_blocked_reason} | "
         f"loss_streak {getattr(runtime, 'loss_streak', 0)} | "
@@ -567,13 +594,19 @@ def append_equity_row(
             int(signal_fields["inactivity_fallback_active"]),
             signal_fields["adaptive_regime"],
             signal_fields["adaptive_regime_confidence"],
+            signal_fields["regime_reason"],
             signal_fields["adaptive_edge_score"],
+            signal_fields["trade_permission_state"],
             signal_fields["adaptive_mode"],
             signal_fields["aggressiveness_score"],
             signal_fields["risk_governor_state"],
+            signal_fields["defensive_stage"],
             signal_fields["toxic_fill_ratio"],
             signal_fields["adverse_fill_ratio"],
             signal_fields["liquidity_estimate_usd"],
+            signal_fields["activity_floor_state"],
+            signal_fields["inactivity_cycles"],
+            signal_fields["inventory_pressure_score"],
             signal_fields["quote_decision"],
             feed_state,
             regime,
@@ -701,13 +734,19 @@ def append_trade_row(
             int(signal_fields["inactivity_fallback_active"]),
             signal_fields["adaptive_regime"],
             signal_fields["adaptive_regime_confidence"],
+            signal_fields["regime_reason"],
             signal_fields["adaptive_edge_score"],
+            signal_fields["trade_permission_state"],
             signal_fields["adaptive_mode"],
             signal_fields["aggressiveness_score"],
             signal_fields["risk_governor_state"],
+            signal_fields["defensive_stage"],
             signal_fields["toxic_fill_ratio"],
             signal_fields["adverse_fill_ratio"],
             signal_fields["liquidity_estimate_usd"],
+            signal_fields["activity_floor_state"],
+            signal_fields["inactivity_cycles"],
+            signal_fields["inventory_pressure_score"],
             signal_fields["quote_decision"],
             fill.side,
             fill.execution_type,

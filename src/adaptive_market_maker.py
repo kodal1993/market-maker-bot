@@ -77,6 +77,7 @@ from config import (
     ADAPTIVE_STRONG_TREND_SKEW_STRENGTH,
     ADAPTIVE_TREND_ASSIST_SIZE_MULTIPLIER,
     ADAPTIVE_TREND_ASSIST_SPREAD_MULTIPLIER,
+    BOT_MODE,
     HIGH_VOL_THRESHOLD,
     RANGE_TARGET_INVENTORY_MAX,
     RANGE_TARGET_INVENTORY_MIN,
@@ -202,13 +203,236 @@ def _adverse_fill_move_bps(side: str, fill_price: float, current_mid: float) -> 
 
 
 def _score_bucket(score: float) -> str:
-    if score >= 72.0:
+    if score >= 40.0:
         return "strong_positive"
-    if score >= 48.0:
+    if score >= 20.0:
         return "weak_positive"
-    if score >= 25.0:
+    if score >= -20.0:
         return "slightly_negative"
     return "bad"
+
+
+def _stdev(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    average = _mean(values)
+    variance = sum((value - average) ** 2 for value in values) / len(values)
+    return variance ** 0.5
+
+
+def _returns_bps(prices: list[float], lookback: int) -> list[float]:
+    if len(prices) < max(lookback + 1, 2):
+        return []
+    values: list[float] = []
+    window = prices[-(lookback + 1):]
+    for index in range(1, len(window)):
+        previous = window[index - 1]
+        current = window[index]
+        if previous <= 0:
+            continue
+        values.append(((current / previous) - 1.0) * 10_000.0)
+    return values
+
+
+def _realized_volatility_bps(prices: list[float], lookback: int) -> float:
+    return _stdev(_returns_bps(prices, lookback))
+
+
+def _microtrend_strength(prices: list[float], lookback: int) -> float:
+    if len(prices) < max(lookback + 1, 2):
+        return 0.0
+    realized = abs(_return_bps(prices, lookback))
+    persistence = _direction_consistency(prices, lookback)
+    return _clamp((realized / max(ADAPTIVE_REGIME_BREAKOUT_BPS, 8.0)) * (0.55 + (persistence * 0.70)), 0.0, 2.0)
+
+
+def _jump_frequency(prices: list[float], lookback: int, *, jump_threshold_bps: float) -> float:
+    returns = _returns_bps(prices, lookback)
+    if not returns:
+        return 0.0
+    threshold = max(jump_threshold_bps, 1.0)
+    return sum(1 for value in returns if abs(value) >= threshold) / len(returns)
+
+
+def _spread_instability(runtime, spread_bps: float, lookback_cycles: int = 24) -> float:
+    spreads = [
+        float(event.get("quote_spread_bps", 0.0) or 0.0)
+        for event in list(getattr(runtime, "adaptive_cycle_history", []))[-lookback_cycles:]
+        if float(event.get("quote_spread_bps", 0.0) or 0.0) > 0.0
+    ]
+    if spread_bps > 0:
+        spreads.append(spread_bps)
+    if len(spreads) < 2:
+        return 0.0
+    mean_spread = max(_mean(spreads), 1e-9)
+    return _clamp(_stdev(spreads) / mean_spread, 0.0, 1.5)
+
+
+def _recent_toxic_cycle_count(runtime, cycle_index: int, lookback_cycles: int = 12) -> int:
+    floor_cycle = max(cycle_index - lookback_cycles, 0)
+    count = 0
+    for event in list(getattr(runtime, "adaptive_cycle_history", [])):
+        if int(event.get("cycle", -1)) < floor_cycle:
+            continue
+        if float(event.get("toxic_fill_ratio", 0.0) or 0.0) >= 0.55 or int(event.get("defensive_stage", 0) or 0) >= 2:
+            count += 1
+    return count
+
+
+def _recent_negative_pnl_deterioration(runtime, cycle_index: int, lookback_cycles: int = 12) -> float:
+    floor_cycle = max(cycle_index - lookback_cycles, 0)
+    values = [
+        float(event.get("realized_pnl_delta", 0.0) or 0.0)
+        for event in list(getattr(runtime, "adaptive_cycle_history", []))
+        if int(event.get("cycle", -1)) >= floor_cycle
+    ]
+    return abs(sum(min(value, 0.0) for value in values))
+
+
+def _paper_mode() -> bool:
+    return BOT_MODE.strip().lower().startswith("paper")
+
+
+V6_PROFILE_PRESETS: dict[str, dict[str, float]] = {
+    "v6_balanced_paper": {
+        "full_quote_edge": 18.0,
+        "cautious_quote_edge": -1.0,
+        "reduced_quote_edge": -20.0,
+        "hard_block_edge": -44.0,
+        "regime_sensitivity": 1.00,
+        "blocker_strictness": 0.92,
+        "range_spread_mult": 0.92,
+        "trend_spread_mult": 1.03,
+        "chaos_spread_mult": 1.26,
+        "range_size_mult": 1.08,
+        "trend_size_mult": 1.00,
+        "chaos_size_mult": 0.62,
+        "trend_inventory_shift": 0.07,
+        "paper_min_quotes_per_hour": 160.0,
+        "paper_min_fills_low": 3.0,
+        "paper_min_fills_high": 8.0,
+        "paper_tighten_after_cycles": 10.0,
+        "paper_relax_after_cycles": 18.0,
+        "paper_tighten_step": 0.03,
+        "paper_min_spread_mult": 0.82,
+        "paper_edge_relax_mult": 0.86,
+        "paper_size_boost": 1.05,
+        "stage1_toxic_cycles": 3.0,
+        "stage2_toxic_cycles": 6.0,
+        "stage3_toxic_cycles": 9.0,
+        "stage4_toxic_cycles": 12.0,
+    },
+    "v6_aggressive_paper": {
+        "full_quote_edge": 15.0,
+        "cautious_quote_edge": -4.0,
+        "reduced_quote_edge": -24.0,
+        "hard_block_edge": -52.0,
+        "regime_sensitivity": 1.08,
+        "blocker_strictness": 0.84,
+        "range_spread_mult": 0.88,
+        "trend_spread_mult": 0.99,
+        "chaos_spread_mult": 1.18,
+        "range_size_mult": 1.15,
+        "trend_size_mult": 1.08,
+        "chaos_size_mult": 0.72,
+        "trend_inventory_shift": 0.09,
+        "paper_min_quotes_per_hour": 200.0,
+        "paper_min_fills_low": 4.0,
+        "paper_min_fills_high": 10.0,
+        "paper_tighten_after_cycles": 8.0,
+        "paper_relax_after_cycles": 14.0,
+        "paper_tighten_step": 0.04,
+        "paper_min_spread_mult": 0.78,
+        "paper_edge_relax_mult": 0.78,
+        "paper_size_boost": 1.10,
+        "stage1_toxic_cycles": 4.0,
+        "stage2_toxic_cycles": 7.0,
+        "stage3_toxic_cycles": 10.0,
+        "stage4_toxic_cycles": 13.0,
+    },
+    "v6_balanced_live": {
+        "full_quote_edge": 22.0,
+        "cautious_quote_edge": 2.0,
+        "reduced_quote_edge": -16.0,
+        "hard_block_edge": -34.0,
+        "regime_sensitivity": 0.98,
+        "blocker_strictness": 1.04,
+        "range_spread_mult": 0.95,
+        "trend_spread_mult": 1.07,
+        "chaos_spread_mult": 1.34,
+        "range_size_mult": 1.00,
+        "trend_size_mult": 0.96,
+        "chaos_size_mult": 0.52,
+        "trend_inventory_shift": 0.06,
+        "paper_min_quotes_per_hour": 0.0,
+        "paper_min_fills_low": 0.0,
+        "paper_min_fills_high": 0.0,
+        "paper_tighten_after_cycles": 0.0,
+        "paper_relax_after_cycles": 0.0,
+        "paper_tighten_step": 0.0,
+        "paper_min_spread_mult": 1.0,
+        "paper_edge_relax_mult": 1.0,
+        "paper_size_boost": 1.0,
+        "stage1_toxic_cycles": 3.0,
+        "stage2_toxic_cycles": 5.0,
+        "stage3_toxic_cycles": 7.0,
+        "stage4_toxic_cycles": 9.0,
+    },
+    "v6_defensive_live": {
+        "full_quote_edge": 26.0,
+        "cautious_quote_edge": 6.0,
+        "reduced_quote_edge": -10.0,
+        "hard_block_edge": -24.0,
+        "regime_sensitivity": 0.94,
+        "blocker_strictness": 1.14,
+        "range_spread_mult": 1.00,
+        "trend_spread_mult": 1.12,
+        "chaos_spread_mult": 1.42,
+        "range_size_mult": 0.94,
+        "trend_size_mult": 0.90,
+        "chaos_size_mult": 0.42,
+        "trend_inventory_shift": 0.05,
+        "paper_min_quotes_per_hour": 0.0,
+        "paper_min_fills_low": 0.0,
+        "paper_min_fills_high": 0.0,
+        "paper_tighten_after_cycles": 0.0,
+        "paper_relax_after_cycles": 0.0,
+        "paper_tighten_step": 0.0,
+        "paper_min_spread_mult": 1.0,
+        "paper_edge_relax_mult": 1.0,
+        "paper_size_boost": 1.0,
+        "stage1_toxic_cycles": 2.0,
+        "stage2_toxic_cycles": 4.0,
+        "stage3_toxic_cycles": 6.0,
+        "stage4_toxic_cycles": 8.0,
+    },
+}
+
+V6_PROFILE_ALIASES = {
+    "default": "",
+    "balanced_paper": "v6_balanced_paper",
+    "aggressive_paper": "v6_aggressive_paper",
+    "balanced_live": "v6_balanced_live",
+    "defensive_live": "v6_defensive_live",
+    "v6_balanced_paper": "v6_balanced_paper",
+    "v6_aggressive_paper": "v6_aggressive_paper",
+    "v6_balanced_live": "v6_balanced_live",
+    "v6_defensive_live": "v6_defensive_live",
+}
+
+
+def _normalize_v6_profile(profile: str | None) -> str:
+    raw_profile = str(profile or "").strip().lower()
+    resolved = V6_PROFILE_ALIASES.get(raw_profile, raw_profile)
+    if not resolved:
+        return "v6_balanced_paper" if _paper_mode() else "v6_balanced_live"
+    if resolved not in V6_PROFILE_PRESETS:
+        return "v6_balanced_paper" if _paper_mode() else "v6_balanced_live"
+    return resolved
+
+
+def _profile_settings(profile: str | None) -> dict[str, float]:
+    return dict(V6_PROFILE_PRESETS[_normalize_v6_profile(profile)])
 
 
 @dataclass(frozen=True)
@@ -255,7 +479,10 @@ class MarketStateSnapshot:
     medium_return_bps: float
     volatility: float
     volatility_bps: float
+    microtrend_strength: float
     spread_bps: float
+    spread_instability: float
+    price_jump_frequency: float
     liquidity_estimate_usd: float
     inventory_pct: float
     inventory_deviation_pct: float
@@ -274,6 +501,7 @@ class MarketStateSnapshot:
     sign_flip_ratio: float
     quote_pressure_score: float
     source_health_score: float
+    queue_latency_quality: float
 
 
 @dataclass(frozen=True)
@@ -281,6 +509,7 @@ class AdaptiveRegimeAssessment:
     regime: str
     confidence: float
     sub_scores: dict[str, float]
+    reason: list[str] = field(default_factory=list)
     trend_bias: float = 0.0
 
 
@@ -290,6 +519,8 @@ class AdaptiveEdgeAssessment:
     breakdown: dict[str, float]
     penalties: dict[str, float]
     bucket: str
+    permission_state: str
+    hard_block_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -298,6 +529,10 @@ class InventoryBandState:
     target_inventory_pct: float
     rebalance_side: str = ""
     inventory_pressure: float = 0.0
+    lower_bound: float = 0.0
+    upper_bound: float = 1.0
+    inventory_pressure_score: float = 0.0
+    recovery_mode: bool = False
 
 
 @dataclass(frozen=True)
@@ -316,10 +551,13 @@ class PerformanceAdaptationState:
 @dataclass(frozen=True)
 class RiskGovernorState:
     state: str
+    stage: int
     size_multiplier: float
     spread_multiplier: float
     inventory_cap_multiplier: float
     quote_enabled: bool
+    buy_enabled: bool = True
+    sell_enabled: bool = True
     reasons: list[str] = field(default_factory=list)
 
 
@@ -345,6 +583,19 @@ class AggressivenessProfile:
 
 
 @dataclass(frozen=True)
+class ActivityFloorState:
+    state: str
+    inactivity_cycles: int
+    quote_opportunities_per_hour: float
+    fills_per_hour: float
+    spread_multiplier: float = 1.0
+    size_multiplier: float = 1.0
+    edge_threshold_multiplier: float = 1.0
+    cooldown_multiplier: float = 1.0
+    override_applied: bool = False
+
+
+@dataclass(frozen=True)
 class AdaptiveCyclePlan:
     config: AdaptiveFeatureConfig
     snapshot: MarketStateSnapshot
@@ -354,13 +605,14 @@ class AdaptiveCyclePlan:
     inventory_band: InventoryBandState
     performance: PerformanceAdaptationState
     risk: RiskGovernorState
+    activity_floor: ActivityFloorState
     mode: ModeSelection
     aggressiveness: AggressivenessProfile
 
 
 def build_adaptive_feature_config(overrides: dict[str, bool] | None = None) -> AdaptiveFeatureConfig:
     values = {
-        "profile": ADAPTIVE_MM_PROFILE.upper(),
+        "profile": _normalize_v6_profile(ADAPTIVE_MM_PROFILE).upper(),
         "enabled": ADAPTIVE_MARKET_MAKER_ENABLED,
         "regime_enabled": ADAPTIVE_REGIME_ENABLED,
         "edge_enabled": ADAPTIVE_EDGE_ENABLED,
@@ -375,7 +627,10 @@ def build_adaptive_feature_config(overrides: dict[str, bool] | None = None) -> A
     }
     for key, value in (overrides or {}).items():
         if key in values:
-            values[key] = bool(value)
+            if key == "profile":
+                values[key] = _normalize_v6_profile(str(value)).upper()
+            else:
+                values[key] = bool(value)
 
     if not values["enabled"]:
         for key in list(values.keys()):
@@ -486,13 +741,22 @@ def build_market_snapshot(
     recent_equities = list(runtime.recent_equities)[-lookback:]
     rolling_drawdown_pct = _rolling_drawdown_pct(recent_equities)
     price_mean = _price_mean(prices, min(max(lookback, 12), max(len(prices), 1)))
+    realized_volatility_bps = _realized_volatility_bps(prices, min(max(lookback, 12), max(len(prices) - 1, 1)))
     mean_reversion_distance_bps = 0.0
     if price_mean > 0 and mid > 0:
         mean_reversion_distance_bps = ((mid / price_mean) - 1.0) * 10_000.0
     range_width_bps = _range_width_bps(prices, min(max(lookback, 12), max(len(prices), 1)))
     direction_consistency = _direction_consistency(prices, min(max(lookback, 12), max(len(prices) - 1, 1)))
     sign_flip_ratio = _sign_flip_ratio(prices, min(max(lookback, 12), max(len(prices) - 1, 1)))
-    volatility_bps = max(getattr(getattr(runtime, "current_regime_assessment", None), "volatility_score", 0.0), 0.0)
+    regime_volatility_bps = max(getattr(getattr(runtime, "current_regime_assessment", None), "volatility_score", 0.0), 0.0)
+    volatility_bps = max(regime_volatility_bps, realized_volatility_bps)
+    microtrend_strength = _microtrend_strength(prices, min(max(lookback, 10), max(len(prices) - 1, 1)))
+    spread_instability = _spread_instability(runtime, spread_bps)
+    price_jump_frequency = _jump_frequency(
+        prices,
+        min(max(lookback, 12), max(len(prices) - 1, 1)),
+        jump_threshold_bps=max(ADAPTIVE_REGIME_BREAKOUT_BPS * 0.45, max(realized_volatility_bps * 1.35, 6.0)),
+    )
     raw_volatility = max(float(getattr(runtime, "current_fill_quality_score", 1.0) or 0.0), 0.0)
     liquidity_estimate_usd = max(
         base_trade_size_usd * max(18.0 - min(spread_bps, 15.0), 4.0),
@@ -509,13 +773,23 @@ def build_market_snapshot(
         100.0,
     )
     source_health_score = 0.0 if getattr(runtime, "consecutive_invalid_price_cycles", 0) >= 3 else 1.0
+    queue_latency_quality = _clamp(
+        source_health_score
+        - min(abs(fill_quality.expected_vs_realized_edge_bps) / 25.0, 1.0) * 0.35
+        - spread_instability * 0.20,
+        0.0,
+        1.0,
+    )
     return MarketStateSnapshot(
         mid_price=_safe_round(mid),
         short_return_bps=_safe_round(short_return_bps),
         medium_return_bps=_safe_round(medium_return_bps),
         volatility=_safe_round(max(volatility_bps, 0.0) / 10_000.0),
         volatility_bps=_safe_round(volatility_bps),
+        microtrend_strength=_safe_round(microtrend_strength),
         spread_bps=_safe_round(spread_bps),
+        spread_instability=_safe_round(spread_instability),
+        price_jump_frequency=_safe_round(price_jump_frequency),
         liquidity_estimate_usd=_safe_round(liquidity_estimate_usd),
         inventory_pct=_safe_round(inventory_pct),
         inventory_deviation_pct=_safe_round((inventory_pct - 0.50) * 100.0),
@@ -534,97 +808,129 @@ def build_market_snapshot(
         sign_flip_ratio=_safe_round(sign_flip_ratio),
         quote_pressure_score=_safe_round(quote_pressure_score),
         source_health_score=_safe_round(source_health_score),
+        queue_latency_quality=_safe_round(queue_latency_quality),
     )
 
 
-def classify_regime(snapshot: MarketStateSnapshot) -> AdaptiveRegimeAssessment:
-    breakout_bps = max(ADAPTIVE_REGIME_BREAKOUT_BPS, 8.0)
+def classify_regime(snapshot: MarketStateSnapshot, profile: str | None = None) -> AdaptiveRegimeAssessment:
+    settings = _profile_settings(profile)
+    breakout_bps = max(ADAPTIVE_REGIME_BREAKOUT_BPS * settings["regime_sensitivity"], 8.0)
     high_vol_bps = max(HIGH_VOL_THRESHOLD * 10_000.0, 1.0)
     vol_ratio = snapshot.volatility_bps / high_vol_bps
     abs_short = abs(snapshot.short_return_bps)
     abs_medium = abs(snapshot.medium_return_bps)
-    trend_consistency = snapshot.direction_consistency
+    persistence = snapshot.direction_consistency
     noise = snapshot.sign_flip_ratio
     toxicity = snapshot.toxic_fill_ratio
     adverse = snapshot.adverse_fill_ratio
+    spread_instability = snapshot.spread_instability
+    jumps = snapshot.price_jump_frequency
+    microtrend = snapshot.microtrend_strength
     mean_distance = abs(snapshot.mean_reversion_distance_bps)
-    spread = snapshot.spread_bps
-    liquidity = snapshot.liquidity_estimate_usd
 
-    trend_up_base = (
-        max(snapshot.medium_return_bps, 0.0) / breakout_bps * 38.0
-        + max(snapshot.short_return_bps, 0.0) / breakout_bps * 22.0
-        + trend_consistency * 32.0
-        - noise * 18.0
-        - toxicity * 15.0
+    range_score = (
+        max(1.25 - vol_ratio, 0.0) * 18.0
+        + max(1.0 - microtrend * 0.70, 0.0) * 18.0
+        + noise * 16.0
+        + max(1.0 - persistence, 0.0) * 14.0
+        + min(mean_distance / max(breakout_bps, 1.0), 1.5) * 14.0
+        + max(1.0 - spread_instability, 0.0) * 10.0
+        + max(1.0 - toxicity, 0.0) * 10.0
+        + max(1.0 - jumps * 1.5, 0.0) * 10.0
     )
-    trend_down_base = (
-        max(-snapshot.medium_return_bps, 0.0) / breakout_bps * 38.0
-        + max(-snapshot.short_return_bps, 0.0) / breakout_bps * 22.0
-        + trend_consistency * 32.0
-        - noise * 18.0
-        - toxicity * 15.0
-    )
-    range_clean = (
-        max(1.0 - (abs_medium / max(breakout_bps * 1.25, 1.0)), 0.0) * 36.0
-        + max(1.0 - abs(vol_ratio - 0.75), 0.0) * 18.0
-        + min(mean_distance / max(breakout_bps, 1.0), 1.5) * 16.0
-        + max(1.0 - toxicity, 0.0) * 16.0
-        + max(min(noise * 1.15, 1.0), 0.0) * 14.0
-    )
-    range_dirty = (
-        max(range_clean * 0.58, 0.0)
-        + noise * 20.0
-        + toxicity * 18.0
-        + adverse * 12.0
-        + max(vol_ratio - 0.75, 0.0) * 18.0
-    )
-    breakout = (
-        abs_short / breakout_bps * 40.0
-        + abs_medium / breakout_bps * 18.0
-        + trend_consistency * 20.0
-        + max(vol_ratio - 0.9, 0.0) * 18.0
+    trend_up_score = (
+        max(snapshot.medium_return_bps, 0.0) / breakout_bps * 28.0
+        + max(snapshot.short_return_bps, 0.0) / breakout_bps * 16.0
+        + microtrend * 18.0
+        + persistence * 18.0
+        + max(1.0 - noise, 0.0) * 10.0
+        + max(1.0 - spread_instability, 0.0) * 6.0
+        + max(1.0 - toxicity, 0.0) * 4.0
         - toxicity * 10.0
+        - adverse * 6.0
+        - spread_instability * 8.0
+        - jumps * 10.0
+        - max(vol_ratio - 1.0, 0.0) * 8.0
     )
-    event = (
-        max(vol_ratio - ADAPTIVE_REGIME_EVENT_VOL_MULTIPLIER, 0.0) * 42.0
-        + abs_short / breakout_bps * 16.0
+    trend_down_score = (
+        max(-snapshot.medium_return_bps, 0.0) / breakout_bps * 28.0
+        + max(-snapshot.short_return_bps, 0.0) / breakout_bps * 16.0
+        + microtrend * 18.0
+        + persistence * 18.0
+        + max(1.0 - noise, 0.0) * 10.0
+        + max(1.0 - spread_instability, 0.0) * 6.0
+        + max(1.0 - toxicity, 0.0) * 4.0
+        - toxicity * 10.0
+        - adverse * 6.0
+        - spread_instability * 8.0
+        - jumps * 10.0
+        - max(vol_ratio - 1.0, 0.0) * 8.0
+    )
+    chaos_score = (
+        max(vol_ratio - 1.0, 0.0) * 26.0
+        + spread_instability * 22.0
         + toxicity * 24.0
-        + adverse * 20.0
-        + snapshot.rolling_drawdown_pct * 260.0
-    )
-    illiquid = (
-        max(spread - ADAPTIVE_REGIME_ILLIQUID_SPREAD_BPS, 0.0) * 3.0
-        + max((ADAPTIVE_REGIME_ILLIQUID_LIQUIDITY_USD - liquidity) / max(ADAPTIVE_REGIME_ILLIQUID_LIQUIDITY_USD, 1.0), 0.0) * 80.0
-        + snapshot.quote_pressure_score * 0.30
+        + adverse * 16.0
+        + jumps * 20.0
+        + min(snapshot.quote_pressure_score / 100.0, 1.0) * 12.0
+        + min(snapshot.rolling_drawdown_pct * 12.0, 1.0) * 8.0
+        + microtrend * 4.0
     )
 
     sub_scores = {
-        "trend_up_low_vol": _clamp(trend_up_base + max(1.0 - vol_ratio, 0.0) * 12.0, 0.0, 100.0),
-        "trend_up_high_vol": _clamp(trend_up_base + max(vol_ratio - 0.9, 0.0) * 16.0, 0.0, 100.0),
-        "trend_down_low_vol": _clamp(trend_down_base + max(1.0 - vol_ratio, 0.0) * 12.0, 0.0, 100.0),
-        "trend_down_high_vol": _clamp(trend_down_base + max(vol_ratio - 0.9, 0.0) * 16.0, 0.0, 100.0),
-        "range_clean": _clamp(range_clean, 0.0, 100.0),
-        "range_dirty": _clamp(range_dirty, 0.0, 100.0),
-        "breakout": _clamp(breakout, 0.0, 100.0),
-        "event": _clamp(event, 0.0, 100.0),
-        "illiquid": _clamp(illiquid, 0.0, 100.0),
+        "RANGE": _safe_round(_clamp(range_score, 0.0, 100.0)),
+        "TREND_UP": _safe_round(_clamp(trend_up_score, 0.0, 100.0)),
+        "TREND_DOWN": _safe_round(_clamp(trend_down_score, 0.0, 100.0)),
+        "CHAOS": _safe_round(_clamp(chaos_score, 0.0, 100.0)),
     }
     ranked = sorted(sub_scores.items(), key=lambda item: (-item[1], item[0]))
     best_regime, best_score = ranked[0]
     second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-    confidence = _clamp(best_score - (second_score * 0.35), 0.0, 100.0)
+    confidence = _clamp((best_score / 100.0) * 0.60 + max(best_score - second_score, 0.0) / 100.0 * 0.40, 0.0, 1.0)
     trend_bias = 0.0
-    if best_regime.startswith("trend_up"):
-        trend_bias = _clamp(best_score / 100.0, 0.0, 1.0)
-    elif best_regime.startswith("trend_down"):
-        trend_bias = -_clamp(best_score / 100.0, 0.0, 1.0)
-    elif best_regime == "breakout":
-        trend_bias = _clamp(snapshot.short_return_bps / max(breakout_bps, 1.0), -1.0, 1.0)
+    if best_regime == "TREND_UP":
+        trend_bias = _clamp((snapshot.short_return_bps / max(breakout_bps, 1.0)) * 0.55 + persistence * 0.45, 0.0, 1.0)
+    elif best_regime == "TREND_DOWN":
+        trend_bias = -_clamp((abs(snapshot.short_return_bps) / max(breakout_bps, 1.0)) * 0.55 + persistence * 0.45, 0.0, 1.0)
+    elif best_regime == "CHAOS":
+        trend_bias = _clamp(snapshot.short_return_bps / max(breakout_bps * 1.5, 1.0), -0.40, 0.40)
+    else:
+        trend_bias = _clamp(snapshot.short_return_bps / max(breakout_bps * 2.5, 1.0), -0.18, 0.18)
+
+    reason: list[str] = []
+    if best_regime == "RANGE":
+        if noise >= 0.45:
+            reason.append("sign_flips_support_range")
+        if mean_distance >= breakout_bps * 0.35:
+            reason.append("mean_reversion_distance_present")
+        if vol_ratio <= 1.05:
+            reason.append("volatility_contained")
+    elif best_regime == "TREND_UP":
+        if snapshot.medium_return_bps > breakout_bps * 0.70:
+            reason.append("positive_drift_strong")
+        if persistence >= 0.65:
+            reason.append("directional_persistence_high")
+        if microtrend >= 0.80:
+            reason.append("microtrend_strength_high")
+    elif best_regime == "TREND_DOWN":
+        if snapshot.medium_return_bps < -(breakout_bps * 0.70):
+            reason.append("negative_drift_strong")
+        if persistence >= 0.65:
+            reason.append("directional_persistence_high")
+        if microtrend >= 0.80:
+            reason.append("microtrend_strength_high")
+    else:
+        if vol_ratio >= ADAPTIVE_REGIME_EVENT_VOL_MULTIPLIER:
+            reason.append("realized_volatility_spike")
+        if spread_instability >= 0.35:
+            reason.append("spread_instability_high")
+        if toxicity >= 0.45 or jumps >= 0.25:
+            reason.append("toxicity_or_jumps_elevated")
     return AdaptiveRegimeAssessment(
         regime=best_regime,
         confidence=_safe_round(confidence),
-        sub_scores={key: _safe_round(value) for key, value in sub_scores.items()},
+        sub_scores=sub_scores,
+        reason=reason,
         trend_bias=_safe_round(trend_bias),
     )
 
@@ -634,131 +940,178 @@ def score_edge(
     regime: AdaptiveRegimeAssessment,
     *,
     cooldown_active: bool,
+    profile: str | None = None,
 ) -> AdaptiveEdgeAssessment:
+    settings = _profile_settings(profile)
+    strictness = settings["blocker_strictness"]
     high_vol_bps = max(HIGH_VOL_THRESHOLD * 10_000.0, 1.0)
+    breakout_bps = max(ADAPTIVE_REGIME_BREAKOUT_BPS, 8.0)
     vol_ratio = snapshot.volatility_bps / high_vol_bps
-    clean_range_score = regime.sub_scores.get("range_clean", 0.0)
-    trend_score = max(
-        regime.sub_scores.get("trend_up_low_vol", 0.0),
-        regime.sub_scores.get("trend_up_high_vol", 0.0),
-        regime.sub_scores.get("trend_down_low_vol", 0.0),
-        regime.sub_scores.get("trend_down_high_vol", 0.0),
-        regime.sub_scores.get("breakout", 0.0),
+    trend_direction = 1.0 if regime.regime == "TREND_UP" else -1.0 if regime.regime == "TREND_DOWN" else 0.0
+    trend_alignment = trend_direction * _clamp(snapshot.medium_return_bps / max(breakout_bps * 1.2, 1.0), -1.0, 1.0)
+    range_reversion = _clamp(
+        min(abs(snapshot.mean_reversion_distance_bps) / max(breakout_bps, 1.0), 1.4) * 0.65
+        + snapshot.sign_flip_ratio * 0.35
+        - snapshot.price_jump_frequency * 0.45,
+        -1.0,
+        1.0,
     )
-    market_quality = _clamp(
-        82.0
-        - max(vol_ratio - 1.0, 0.0) * 20.0
-        - snapshot.toxic_fill_ratio * 24.0
-        - snapshot.adverse_fill_ratio * 18.0
-        - max(snapshot.spread_bps - ADAPTIVE_REGIME_ILLIQUID_SPREAD_BPS, 0.0) * 1.2,
+    if regime.regime != "RANGE":
+        range_reversion *= 0.55
+    spread_capture = _clamp(
+        min(snapshot.spread_bps / max(snapshot.volatility_bps * 0.55, 4.0), 1.5) * 0.75
+        + min(snapshot.fill_rate * 2.5, 0.35)
+        - snapshot.spread_instability * 0.35,
+        -1.0,
+        1.0,
+    )
+    realized_vol_penalty = _clamp(max(vol_ratio - 0.95, 0.0) * 0.55 + snapshot.price_jump_frequency * 0.45, 0.0, 1.6)
+    adverse_penalty = _clamp(snapshot.adverse_fill_ratio * 1.25 + max(snapshot.expected_vs_realized_edge_bps, 0.0) / 35.0, 0.0, 1.6)
+    fill_quality_penalty = _clamp(
+        snapshot.toxic_fill_ratio * 1.05
+        + max(snapshot.expected_vs_realized_edge_bps, 0.0) / 40.0
+        + snapshot.spread_instability * 0.35,
         0.0,
-        100.0,
+        1.6,
     )
-    direction_clarity = _clamp(
-        max(trend_score, regime.confidence * 0.82)
-        - snapshot.sign_flip_ratio * 18.0,
+    toxic_flow_penalty = _clamp(
+        snapshot.toxic_fill_ratio * 1.20
+        + snapshot.quote_pressure_score / 100.0 * 0.65
+        + snapshot.price_jump_frequency * 0.40,
         0.0,
-        100.0,
+        1.8,
     )
-    mean_reversion_potential = _clamp(
-        clean_range_score * 0.60
-        + min(abs(snapshot.mean_reversion_distance_bps) / max(ADAPTIVE_REGIME_BREAKOUT_BPS, 1.0), 2.0) * 18.0
-        - regime.sub_scores.get("breakout", 0.0) * 0.25
-        - regime.sub_scores.get("event", 0.0) * 0.20,
-        0.0,
-        100.0,
-    )
-    spread_capture_potential = _clamp(
-        min(snapshot.spread_bps / max(snapshot.volatility_bps * 0.35, 3.0), 2.0) * 34.0
-        + snapshot.fill_rate * 34.0
-        + max(1.0 - snapshot.toxic_fill_ratio, 0.0) * 18.0,
-        0.0,
-        100.0,
-    )
-    execution_safety = _clamp(
-        86.0
-        - snapshot.rolling_drawdown_pct * 320.0
-        - snapshot.toxic_fill_ratio * 30.0
-        - snapshot.adverse_fill_ratio * 18.0
-        - max(1.0 - snapshot.source_health_score, 0.0) * 100.0,
-        0.0,
-        100.0,
-    )
-    liquidity_stability = _clamp(
-        min(snapshot.liquidity_estimate_usd / max(ADAPTIVE_REGIME_ILLIQUID_LIQUIDITY_USD * 2.0, 1.0), 2.0) * 40.0
-        + max(1.0 - max(snapshot.spread_bps - 8.0, 0.0) / max(ADAPTIVE_REGIME_ILLIQUID_SPREAD_BPS, 1.0), 0.0) * 30.0
-        + max(1.0 - snapshot.adverse_fill_ratio, 0.0) * 18.0,
-        0.0,
-        100.0,
-    )
+    inventory_pressure = _clamp(abs(snapshot.inventory_pct - 0.50) / 0.18, 0.0, 1.5)
+    inventory_recovery_bonus = inventory_pressure * (0.60 if regime.regime == "RANGE" else 0.42 if regime.regime.startswith("TREND") else 0.18)
+    queue_latency_quality = _clamp((snapshot.queue_latency_quality * 2.0) - 1.0, -1.0, 1.0)
+    if cooldown_active:
+        queue_latency_quality -= 0.10
 
-    penalties = {
-        "cooldown_penalty": 8.0 if cooldown_active else 0.0,
-        "volatility_penalty": _clamp(max(vol_ratio - 1.0, 0.0) * 12.0, 0.0, 18.0),
-        "toxic_penalty": _clamp(snapshot.toxic_fill_ratio * 18.0, 0.0, 18.0),
-        "illiquidity_penalty": _clamp(max(regime.sub_scores.get("illiquid", 0.0) - 50.0, 0.0) * 0.20, 0.0, 16.0),
-    }
-    total_score = (
-        market_quality * 0.22
-        + direction_clarity * 0.18
-        + mean_reversion_potential * 0.15
-        + spread_capture_potential * 0.20
-        + execution_safety * 0.15
-        + liquidity_stability * 0.10
-        - sum(penalties.values())
-    )
-    total_score = _clamp(total_score, 0.0, 100.0)
     breakdown = {
-        "market_quality": _safe_round(market_quality),
-        "direction_clarity": _safe_round(direction_clarity),
-        "mean_reversion_potential": _safe_round(mean_reversion_potential),
-        "spread_capture_potential": _safe_round(spread_capture_potential),
-        "execution_safety": _safe_round(execution_safety),
-        "liquidity_stability": _safe_round(liquidity_stability),
+        "microtrend_alignment": _safe_round(trend_alignment * 24.0),
+        "reversion_probability": _safe_round(range_reversion * 18.0),
+        "expected_spread_capture": _safe_round(spread_capture * 22.0),
+        "realized_vol_penalty": _safe_round(-realized_vol_penalty * 16.0 * strictness),
+        "adverse_selection_penalty": _safe_round(-adverse_penalty * 18.0 * strictness),
+        "fill_quality_penalty": _safe_round(-fill_quality_penalty * 15.0 * strictness),
+        "mev_toxic_flow_penalty": _safe_round(-toxic_flow_penalty * 16.0 * strictness),
+        "inventory_recovery_bonus": _safe_round(inventory_recovery_bonus * 12.0),
+        "queue_latency_quality": _safe_round(queue_latency_quality * 10.0),
     }
+    penalties = {
+        "cooldown_penalty": _safe_round(4.0 if cooldown_active else 0.0),
+        "spread_instability_penalty": _safe_round(max(snapshot.spread_instability - 0.25, 0.0) * 12.0 * strictness),
+        "drawdown_penalty": _safe_round(min(snapshot.rolling_drawdown_pct * 80.0, 10.0) * strictness),
+    }
+    total_score = _clamp(sum(breakdown.values()) - sum(penalties.values()), -100.0, 100.0)
+    hard_block_reasons: list[str] = []
+    if snapshot.mid_price <= 0 or snapshot.spread_bps <= 0:
+        hard_block_reasons.append("invalid_quote_inputs")
+    if snapshot.source_health_score < 1.0 and snapshot.queue_latency_quality < 0.40:
+        hard_block_reasons.append("source_health_degraded")
+    if snapshot.spread_bps >= ADAPTIVE_REGIME_ILLIQUID_SPREAD_BPS * 2.4 and snapshot.spread_instability >= 0.45:
+        hard_block_reasons.append("spread_quality_collapsed")
+    if snapshot.toxic_fill_ratio >= (0.90 + max(1.0 - strictness, 0.0) * 0.05):
+        hard_block_reasons.append("toxic_flow_extreme")
+    if snapshot.expected_vs_realized_edge_bps >= 18.0 and snapshot.recent_fill_count >= 3:
+        hard_block_reasons.append("fill_quality_severely_negative")
+
+    if hard_block_reasons:
+        permission_state = "BLOCKED"
+        total_score = min(total_score, settings["hard_block_edge"] - 4.0)
+    elif total_score >= settings["full_quote_edge"]:
+        permission_state = "FULL"
+    elif total_score >= settings["cautious_quote_edge"]:
+        permission_state = "CAUTIOUS"
+    elif total_score >= settings["reduced_quote_edge"]:
+        permission_state = "REDUCED"
+    elif total_score >= settings["hard_block_edge"]:
+        permission_state = "DEFENSIVE_ONLY"
+    else:
+        permission_state = "BLOCKED"
     return AdaptiveEdgeAssessment(
         total_score=_safe_round(total_score),
         breakdown=breakdown,
-        penalties={key: _safe_round(value) for key, value in penalties.items()},
+        penalties=penalties,
         bucket=_score_bucket(total_score),
+        permission_state=permission_state,
+        hard_block_reasons=hard_block_reasons,
     )
 
 
-def classify_inventory_band(snapshot: MarketStateSnapshot) -> InventoryBandState:
+def classify_inventory_band(
+    snapshot: MarketStateSnapshot,
+    regime: AdaptiveRegimeAssessment | None = None,
+) -> InventoryBandState:
     inventory_pct = snapshot.inventory_pct
-    pressure = abs(inventory_pct - 0.50) / 0.15
-    if ADAPTIVE_INVENTORY_NEUTRAL_MIN <= inventory_pct <= ADAPTIVE_INVENTORY_NEUTRAL_MAX:
-        return InventoryBandState("neutral", 0.50, inventory_pressure=_safe_round(pressure))
-    if ADAPTIVE_INVENTORY_SOFT_MIN <= inventory_pct <= ADAPTIVE_INVENTORY_SOFT_MAX:
-        target = 0.48 if inventory_pct > 0.50 else 0.52
-        return InventoryBandState(
-            "soft_skew",
-            target,
-            rebalance_side="sell" if inventory_pct > 0.50 else "buy",
-            inventory_pressure=_safe_round(pressure),
-        )
-    if ADAPTIVE_INVENTORY_STRONG_MIN <= inventory_pct <= ADAPTIVE_INVENTORY_STRONG_MAX:
-        target = 0.46 if inventory_pct > 0.50 else 0.54
-        return InventoryBandState(
-            "strong_skew",
-            target,
-            rebalance_side="sell" if inventory_pct > 0.50 else "buy",
-            inventory_pressure=_safe_round(pressure),
-        )
-    if ADAPTIVE_INVENTORY_HARD_MIN <= inventory_pct <= ADAPTIVE_INVENTORY_HARD_MAX:
-        target = 0.44 if inventory_pct > 0.50 else 0.56
-        return InventoryBandState(
-            "hard_skew",
-            target,
-            rebalance_side="sell" if inventory_pct > 0.50 else "buy",
-            inventory_pressure=_safe_round(max(pressure, 1.10)),
-        )
-    target = 0.42 if inventory_pct > 0.50 else 0.58
+    regime_label = "RANGE" if regime is None else regime.regime
+    trend_shift = 0.0 if regime is None else regime.trend_bias
+    if regime_label == "RANGE":
+        center = 0.50
+        neutral_half = 0.04
+        soft_half = 0.08
+        strong_half = 0.12
+        hard_half = 0.17
+        recovery_mode = abs(inventory_pct - center) >= neutral_half
+    elif regime_label == "TREND_UP":
+        center = _clamp(0.50 + max(trend_shift, 0.0) * 0.08, 0.50, 0.62)
+        neutral_half = 0.06
+        soft_half = 0.11
+        strong_half = 0.16
+        hard_half = 0.21
+        recovery_mode = inventory_pct > center + neutral_half
+    elif regime_label == "TREND_DOWN":
+        center = _clamp(0.50 + min(trend_shift, 0.0) * 0.08, 0.38, 0.50)
+        neutral_half = 0.06
+        soft_half = 0.11
+        strong_half = 0.16
+        hard_half = 0.21
+        recovery_mode = inventory_pct < center - neutral_half or inventory_pct > center + neutral_half
+    else:
+        center = 0.50
+        neutral_half = 0.03
+        soft_half = 0.06
+        strong_half = 0.10
+        hard_half = 0.14
+        recovery_mode = True
+
+    lower_neutral = _clamp(center - neutral_half, 0.0, 1.0)
+    upper_neutral = _clamp(center + neutral_half, 0.0, 1.0)
+    lower_soft = _clamp(center - soft_half, 0.0, 1.0)
+    upper_soft = _clamp(center + soft_half, 0.0, 1.0)
+    lower_strong = _clamp(center - strong_half, 0.0, 1.0)
+    upper_strong = _clamp(center + strong_half, 0.0, 1.0)
+    lower_hard = _clamp(center - hard_half, 0.0, 1.0)
+    upper_hard = _clamp(center + hard_half, 0.0, 1.0)
+    pressure = abs(inventory_pct - center) / max(hard_half, 0.01)
+    pressure_score = _clamp(pressure * 100.0, 0.0, 100.0)
+    rebalance_side = "sell" if inventory_pct > center else "buy"
+
+    if lower_neutral <= inventory_pct <= upper_neutral:
+        zone = "neutral"
+        target = center
+    elif lower_soft <= inventory_pct <= upper_soft:
+        zone = "soft_skew"
+        target = center - 0.02 if inventory_pct > center else center + 0.02
+    elif lower_strong <= inventory_pct <= upper_strong:
+        zone = "strong_skew"
+        target = center - 0.03 if inventory_pct > center else center + 0.03
+    elif lower_hard <= inventory_pct <= upper_hard:
+        zone = "hard_skew"
+        target = center - 0.05 if inventory_pct > center else center + 0.05
+    else:
+        zone = "hard_breach"
+        target = center - 0.07 if inventory_pct > center else center + 0.07
+
     return InventoryBandState(
-        "outside",
-        target,
-        rebalance_side="sell" if inventory_pct > 0.50 else "buy",
-        inventory_pressure=_safe_round(max(pressure, 1.35)),
+        zone=zone,
+        target_inventory_pct=_safe_round(_clamp(target, 0.0, 1.0)),
+        rebalance_side=rebalance_side if zone != "neutral" else "",
+        inventory_pressure=_safe_round(pressure),
+        lower_bound=_safe_round(lower_neutral),
+        upper_bound=_safe_round(upper_neutral),
+        inventory_pressure_score=_safe_round(pressure_score),
+        recovery_mode=recovery_mode,
     )
 
 
@@ -839,95 +1192,193 @@ def adapt_performance(runtime, cycle_index: int, fill_quality: FillQualitySnapsh
     )
 
 
+def assess_activity_floor(
+    runtime,
+    cycle_index: int,
+    snapshot: MarketStateSnapshot,
+    *,
+    profile: str | None,
+) -> ActivityFloorState:
+    settings = _profile_settings(profile)
+    inactivity_cycles = (
+        max(cycle_index - int(getattr(runtime, "last_fill_cycle", cycle_index)), 0)
+        if getattr(runtime, "last_fill_cycle", None) is not None
+        else cycle_index + 1
+    )
+    if not _paper_mode() or settings["paper_min_quotes_per_hour"] <= 0:
+        return ActivityFloorState("disabled", inactivity_cycles, 0.0, 0.0)
+
+    lookback_cycles = max(int(round(3600.0 / max(runtime.cycle_seconds, 1.0))), 1)
+    floor_cycle = max(cycle_index - lookback_cycles, 0)
+    quote_opportunities = sum(1 for cycle in list(getattr(runtime, "quote_cycle_history", [])) if cycle >= floor_cycle)
+    fills = sum(1 for cycle in list(getattr(runtime, "fill_cycle_history", [])) if cycle >= floor_cycle)
+    elapsed_hours = max(min((cycle_index + 1) / lookback_cycles, 1.0), 1.0 / max(lookback_cycles, 1))
+    quotes_per_hour = quote_opportunities / elapsed_hours
+    fills_per_hour = fills / elapsed_hours
+    state = "healthy"
+    spread_multiplier = 1.0
+    size_multiplier = 1.0
+    edge_threshold_multiplier = 1.0
+    cooldown_multiplier = 1.0
+    override_applied = False
+
+    needs_quote_floor = quotes_per_hour < settings["paper_min_quotes_per_hour"]
+    needs_fill_floor = fills_per_hour < settings["paper_min_fills_low"]
+    if needs_quote_floor or needs_fill_floor or inactivity_cycles >= settings["paper_tighten_after_cycles"]:
+        steps = 1 + int(
+            max(inactivity_cycles - settings["paper_tighten_after_cycles"], 0.0)
+            // max(settings["paper_tighten_after_cycles"] / 2.0, 1.0)
+        )
+        spread_multiplier = max(
+            1.0 - (steps * settings["paper_tighten_step"]),
+            settings["paper_min_spread_mult"],
+        )
+        size_multiplier = settings["paper_size_boost"]
+        cooldown_multiplier = 0.94
+        state = "tighten_quotes"
+        override_applied = True
+
+    if inactivity_cycles >= settings["paper_relax_after_cycles"]:
+        edge_threshold_multiplier = settings["paper_edge_relax_mult"]
+        spread_multiplier = max(spread_multiplier - 0.03, settings["paper_min_spread_mult"])
+        size_multiplier = max(size_multiplier, settings["paper_size_boost"])
+        cooldown_multiplier = min(cooldown_multiplier, 0.90)
+        state = "filters_relaxed"
+        override_applied = True
+
+    if fills_per_hour >= settings["paper_min_fills_low"] and fills_per_hour <= max(settings["paper_min_fills_high"], settings["paper_min_fills_low"]):
+        if state == "healthy":
+            state = "within_fill_band"
+
+    return ActivityFloorState(
+        state=state,
+        inactivity_cycles=inactivity_cycles,
+        quote_opportunities_per_hour=_safe_round(quotes_per_hour),
+        fills_per_hour=_safe_round(fills_per_hour),
+        spread_multiplier=_safe_round(spread_multiplier),
+        size_multiplier=_safe_round(size_multiplier),
+        edge_threshold_multiplier=_safe_round(edge_threshold_multiplier),
+        cooldown_multiplier=_safe_round(cooldown_multiplier),
+        override_applied=override_applied,
+    )
+
+
 def govern_risk(
     runtime,
+    cycle_index: int,
     snapshot: MarketStateSnapshot,
     fill_quality: FillQualitySnapshot,
     regime: AdaptiveRegimeAssessment,
     edge: AdaptiveEdgeAssessment,
+    inventory_band: InventoryBandState,
 ) -> RiskGovernorState:
+    settings = _profile_settings(getattr(getattr(runtime, "adaptive_config", None), "profile", None))
     reasons: list[str] = []
+    stage = 0
     state = "normal"
     size_multiplier = 1.0
     spread_multiplier = 1.0
     inventory_cap_multiplier = 1.0
     quote_enabled = True
+    buy_enabled = True
+    sell_enabled = True
 
-    recent_equities = list(getattr(runtime, "recent_equities", []))[-12:]
+    recent_equities = list(getattr(runtime, "recent_equities", []))[-14:]
     drawdown_acceleration = _drawdown_acceleration_pct(recent_equities)
     invalid_price_cycles = int(getattr(runtime, "consecutive_invalid_price_cycles", 0) or 0)
-    extreme_event_risk = regime.sub_scores.get("event", 0.0) >= ADAPTIVE_REGIME_EXTREME_EVENT_SCORE
+    toxic_cycles = _recent_toxic_cycle_count(runtime, cycle_index, int(settings["stage4_toxic_cycles"]))
+    pnl_deterioration = _recent_negative_pnl_deterioration(runtime, cycle_index)
     severe_illiquidity = (
-        regime.sub_scores.get("illiquid", 0.0) >= ADAPTIVE_REGIME_SEVERE_ILLIQUID_SCORE
+        snapshot.spread_bps >= ADAPTIVE_REGIME_ILLIQUID_SPREAD_BPS * 2.0
         or snapshot.liquidity_estimate_usd <= ADAPTIVE_RISK_KILL_LIQUIDITY_USD
     )
     weak_liquidity = (
         snapshot.liquidity_estimate_usd <= ADAPTIVE_RISK_SOFT_LIQUIDITY_USD
-        or regime.sub_scores.get("illiquid", 0.0) >= 60.0
+        or snapshot.spread_bps >= ADAPTIVE_REGIME_ILLIQUID_SPREAD_BPS * 1.35
     )
 
     if invalid_price_cycles >= ADAPTIVE_RISK_KILL_INVALID_PRICE_CYCLES:
         reasons.append("invalid_market_data")
-    if severe_illiquidity:
-        reasons.append("severe_liquidity_collapse")
+    if inventory_band.zone == "hard_breach":
+        reasons.append("inventory_hard_cap_breach")
+    if severe_illiquidity and snapshot.spread_instability >= 0.40:
+        reasons.append("spread_quality_collapsed")
     if snapshot.rolling_drawdown_pct >= ADAPTIVE_RISK_KILL_DRAWDOWN_PCT:
         reasons.append("extreme_drawdown")
-    if (
-        fill_quality.toxic_fill_ratio >= ADAPTIVE_RISK_KILL_TOXIC_FILL_RATIO
-        and fill_quality.toxic_cluster_count >= ADAPTIVE_RISK_KILL_TOXIC_CLUSTER_COUNT
-    ):
-        reasons.append("extreme_toxic_fill_cluster")
+    if edge.hard_block_reasons:
+        reasons.extend(edge.hard_block_reasons)
 
     if reasons:
-        state = "kill_switch"
+        stage = 4
+        state = "hard_pause"
         size_multiplier = 0.0
         spread_multiplier = 1.35
-        inventory_cap_multiplier = 0.60
+        inventory_cap_multiplier = 0.65
         quote_enabled = False
+        buy_enabled = False
+        sell_enabled = False
     elif (
-        fill_quality.toxic_cluster_count >= ADAPTIVE_RISK_HARD_TOXIC_CLUSTER_COUNT
-        or drawdown_acceleration >= ADAPTIVE_RISK_HARD_DRAWDOWN_ACCEL_PCT
-        or invalid_price_cycles > 0
-        or snapshot.source_health_score < 1.0
-        or snapshot.rolling_drawdown_pct >= ADAPTIVE_RISK_HARD_DRAWDOWN_PCT
+        toxic_cycles >= int(settings["stage3_toxic_cycles"])
         or fill_quality.toxic_fill_ratio >= ADAPTIVE_RISK_HARD_TOXIC_FILL_RATIO
-        or (extreme_event_risk and edge.total_score < ADAPTIVE_NORMAL_MODE_MIN_EDGE)
+        or fill_quality.adverse_fill_ratio >= max(ADAPTIVE_ADVERSE_DEFENSIVE_THRESHOLD, 0.70)
+        or edge.permission_state == "DEFENSIVE_ONLY"
+        or snapshot.rolling_drawdown_pct >= ADAPTIVE_RISK_HARD_DRAWDOWN_PCT
+        or drawdown_acceleration >= ADAPTIVE_RISK_HARD_DRAWDOWN_ACCEL_PCT
     ):
-        state = "hard_brake"
-        size_multiplier = 0.58
-        spread_multiplier = 1.15
-        inventory_cap_multiplier = 0.80
-        reasons.append("risk_hard_brake")
-        if drawdown_acceleration >= ADAPTIVE_RISK_HARD_DRAWDOWN_ACCEL_PCT:
-            reasons.append("drawdown_acceleration")
-        if fill_quality.toxic_cluster_count >= ADAPTIVE_RISK_HARD_TOXIC_CLUSTER_COUNT:
-            reasons.append("toxic_fill_cluster")
-        if invalid_price_cycles > 0 or snapshot.source_health_score < 1.0:
-            reasons.append("feed_rpc_anomaly")
+        stage = 3
+        state = "defensive_only"
+        size_multiplier = 0.46
+        spread_multiplier = 1.22
+        inventory_cap_multiplier = 0.78
+        reasons.append("defensive_stage_3")
+        if fill_quality.toxic_fill_ratio >= ADAPTIVE_RISK_HARD_TOXIC_FILL_RATIO:
+            reasons.append("toxic_fill_ratio_high")
+        if fill_quality.adverse_fill_ratio >= max(ADAPTIVE_ADVERSE_DEFENSIVE_THRESHOLD, 0.70):
+            reasons.append("adverse_selection_high")
+        if regime.regime == "CHAOS" and snapshot.toxic_fill_ratio >= 0.78:
+            if inventory_band.rebalance_side == "sell":
+                buy_enabled = False
+            elif inventory_band.rebalance_side == "buy":
+                sell_enabled = False
     elif (
-        snapshot.rolling_drawdown_pct >= ADAPTIVE_RISK_SOFT_DRAWDOWN_PCT
+        toxic_cycles >= int(settings["stage2_toxic_cycles"])
         or fill_quality.toxic_fill_ratio >= ADAPTIVE_RISK_SOFT_TOXIC_FILL_RATIO
-        or weak_liquidity
         or fill_quality.adverse_fill_ratio >= ADAPTIVE_ADVERSE_SIZE_REDUCE_THRESHOLD
+        or weak_liquidity
+        or pnl_deterioration >= max(abs(snapshot.rolling_pnl_usd) * 0.35, 1.0)
     ):
-        state = "soft_brake"
-        size_multiplier = 0.82
-        spread_multiplier = 1.05
-        inventory_cap_multiplier = 0.92
-        reasons.append("risk_soft_brake")
+        stage = 2
+        state = "strong_defense"
+        size_multiplier = 0.70
+        spread_multiplier = 1.12
+        inventory_cap_multiplier = 0.88
+        reasons.append("defensive_stage_2")
         if weak_liquidity:
             reasons.append("liquidity_weak")
-        if fill_quality.toxic_fill_ratio >= ADAPTIVE_RISK_SOFT_TOXIC_FILL_RATIO:
-            reasons.append("toxic_fill_ratio_elevated")
-        if fill_quality.adverse_fill_ratio >= ADAPTIVE_ADVERSE_SIZE_REDUCE_THRESHOLD:
-            reasons.append("adverse_selection_elevated")
+        if pnl_deterioration >= max(abs(snapshot.rolling_pnl_usd) * 0.35, 1.0):
+            reasons.append("recent_pnl_deterioration")
+    elif (
+        toxic_cycles >= int(settings["stage1_toxic_cycles"])
+        or fill_quality.adverse_fill_ratio >= ADAPTIVE_ADVERSE_WIDEN_THRESHOLD
+        or snapshot.rolling_drawdown_pct >= ADAPTIVE_RISK_SOFT_DRAWDOWN_PCT
+        or edge.permission_state == "REDUCED"
+    ):
+        stage = 1
+        state = "mild_defense"
+        size_multiplier = 0.88
+        spread_multiplier = 1.05
+        inventory_cap_multiplier = 0.95
+        reasons.append("defensive_stage_1")
 
     return RiskGovernorState(
         state=state,
+        stage=stage,
         size_multiplier=_safe_round(size_multiplier),
         spread_multiplier=_safe_round(spread_multiplier),
         inventory_cap_multiplier=_safe_round(inventory_cap_multiplier),
         quote_enabled=quote_enabled,
+        buy_enabled=buy_enabled,
+        sell_enabled=sell_enabled,
         reasons=reasons,
     )
 
@@ -939,97 +1390,110 @@ def select_mode(
     inventory_band: InventoryBandState,
     performance: PerformanceAdaptationState,
     risk: RiskGovernorState,
+    activity_floor: ActivityFloorState,
     intelligence,
+    *,
+    profile: str | None = None,
 ) -> ModeSelection:
-    aggressive_edge = ADAPTIVE_AGGRESSIVE_MODE_MIN_EDGE * performance.edge_threshold_multiplier
-    normal_edge = ADAPTIVE_NORMAL_MODE_MIN_EDGE * performance.edge_threshold_multiplier
-    defensive_edge = ADAPTIVE_DEFENSIVE_MODE_MIN_EDGE * performance.edge_threshold_multiplier
-    standby_edge = ADAPTIVE_EDGE_STANDBY_SCORE * performance.edge_threshold_multiplier
-    medium_confidence = ADAPTIVE_REGIME_MEDIUM_CONFIDENCE
-    trend_confidence = ADAPTIVE_REGIME_TREND_CONFIDENCE
-    extreme_event_risk = regime.sub_scores.get("event", 0.0) >= ADAPTIVE_REGIME_EXTREME_EVENT_SCORE
-    severe_illiquidity = regime.sub_scores.get("illiquid", 0.0) >= ADAPTIVE_REGIME_SEVERE_ILLIQUID_SCORE
+    del performance
+    settings = _profile_settings(profile)
+    permission_state = edge.permission_state
+    if risk.stage >= 4 or permission_state == "BLOCKED":
+        return ModeSelection("standby", "NO_TRADE", False, False, False, inventory_band.target_inventory_pct, 0.0, "hard_pause")
 
-    if risk.state == "kill_switch":
-        return ModeSelection("standby", "NO_TRADE", False, False, False, inventory_band.target_inventory_pct, 0.0, "risk_kill_switch")
+    quote_enabled = risk.quote_enabled
+    buy_enabled = bool(getattr(intelligence, "buy_enabled", True)) and risk.buy_enabled
+    sell_enabled = bool(getattr(intelligence, "sell_enabled", True)) and risk.sell_enabled
 
-    if inventory_band.zone == "outside":
+    if inventory_band.zone == "hard_breach":
         if inventory_band.rebalance_side == "sell":
-            return ModeSelection("rebalance_only", "OVERWEIGHT_EXIT", True, False, True, inventory_band.target_inventory_pct, -0.55, "inventory_outside_sell_rebalance")
-        return ModeSelection("rebalance_only", "RANGE_MAKER", True, True, False, inventory_band.target_inventory_pct, 0.55, "inventory_outside_buy_rebalance")
+            return ModeSelection("rebalance_only", "OVERWEIGHT_EXIT", quote_enabled, False, sell_enabled, inventory_band.target_inventory_pct, -0.70, "inventory_hard_breach")
+        return ModeSelection("rebalance_only", "RANGE_MAKER", quote_enabled, buy_enabled, False, inventory_band.target_inventory_pct, 0.70, "inventory_hard_breach")
 
-    if (extreme_event_risk or severe_illiquidity) and edge.total_score <= normal_edge:
-        return ModeSelection("standby", "NO_TRADE", False, False, False, inventory_band.target_inventory_pct, 0.0, "extreme_regime_standby")
+    if risk.stage >= 3 and permission_state in {"FULL", "CAUTIOUS", "REDUCED"}:
+        permission_state = "DEFENSIVE_ONLY"
+    elif risk.stage >= 1 and permission_state == "FULL":
+        permission_state = "CAUTIOUS"
 
-    if edge.total_score <= standby_edge and risk.state == "hard_brake":
-        return ModeSelection("standby", "NO_TRADE", False, False, False, inventory_band.target_inventory_pct, 0.0, "edge_and_risk_standby")
-
-    if (
-        regime.regime.startswith("trend_up")
-        and regime.confidence >= trend_confidence
-        and edge.total_score >= aggressive_edge
-    ):
+    if regime.regime == "RANGE":
+        directional_bias = 0.0 if inventory_band.zone == "neutral" else _clamp((inventory_band.target_inventory_pct - snapshot.inventory_pct) * 4.0, -0.45, 0.45)
+        if permission_state == "DEFENSIVE_ONLY":
+            if inventory_band.rebalance_side == "sell":
+                buy_enabled = False
+            elif inventory_band.rebalance_side == "buy":
+                sell_enabled = False
         return ModeSelection(
-            "trend_assist",
+            "base_mm" if permission_state in {"FULL", "CAUTIOUS"} else ("skewed_mm" if inventory_band.zone != "neutral" else "defensive_mm"),
+            "RANGE_MAKER",
+            quote_enabled,
+            quote_enabled and buy_enabled,
+            quote_enabled and sell_enabled,
+            0.50 if inventory_band.zone == "neutral" else inventory_band.target_inventory_pct,
+            directional_bias,
+            "paper_activity_floor" if activity_floor.override_applied else "range_reversion",
+        )
+
+    if regime.regime == "TREND_UP":
+        target_inventory_pct = _clamp(
+            max(inventory_band.target_inventory_pct, 0.50 + (settings["trend_inventory_shift"] * max(regime.confidence, 0.35))),
+            0.52,
+            0.68,
+        )
+        if permission_state == "DEFENSIVE_ONLY" and inventory_band.rebalance_side == "sell":
+            buy_enabled = False
+        return ModeSelection(
+            "trend_assist" if permission_state in {"FULL", "CAUTIOUS"} else "skewed_mm",
             "TREND_UP",
-            True,
-            bool(getattr(intelligence, "buy_enabled", True)),
-            bool(getattr(intelligence, "sell_enabled", True)),
-            max(inventory_band.target_inventory_pct, 0.56),
-            _clamp(regime.trend_bias + 0.18, -1.0, 1.0),
-            "uptrend_with_edge",
+            quote_enabled,
+            quote_enabled and buy_enabled,
+            quote_enabled and sell_enabled,
+            target_inventory_pct,
+            _clamp(max(regime.trend_bias, 0.18) + 0.08, -1.0, 1.0),
+            "trend_up_edge_support",
         )
 
-    if regime.regime.startswith("trend_down") and regime.confidence >= medium_confidence:
+    if regime.regime == "TREND_DOWN":
+        target_inventory_pct = _clamp(
+            min(inventory_band.target_inventory_pct, 0.50 - (settings["trend_inventory_shift"] * max(regime.confidence, 0.35))),
+            0.32,
+            0.48,
+        )
+        if permission_state == "DEFENSIVE_ONLY":
+            buy_enabled = inventory_band.rebalance_side == "buy"
         return ModeSelection(
-            "skewed_mm" if inventory_band.zone != "neutral" and edge.total_score >= defensive_edge else "defensive_mm",
+            "skewed_mm" if permission_state in {"FULL", "CAUTIOUS"} else "defensive_mm",
             "RANGE_MAKER",
-            True,
-            edge.total_score >= max(ADAPTIVE_EDGE_MIN_SCORE_TO_QUOTE, standby_edge),
-            True,
-            min(inventory_band.target_inventory_pct, 0.44),
-            _clamp(regime.trend_bias - 0.10, -1.0, 1.0),
-            "downtrend_inventory_preservation",
+            quote_enabled,
+            quote_enabled and buy_enabled and inventory_band.rebalance_side != "sell",
+            quote_enabled and sell_enabled,
+            target_inventory_pct,
+            _clamp(min(regime.trend_bias, -0.18) - 0.08, -1.0, 1.0),
+            "trend_down_inventory_protection",
         )
 
-    if (
-        regime.regime in {"event", "illiquid"}
-        or risk.state == "hard_brake"
-        or edge.total_score < defensive_edge
-        or snapshot.adverse_fill_ratio >= ADAPTIVE_ADVERSE_DEFENSIVE_THRESHOLD
-    ):
-        return ModeSelection(
-            "defensive_mm",
-            "RANGE_MAKER",
-            risk.quote_enabled and edge.total_score >= ADAPTIVE_EDGE_MIN_SCORE_TO_QUOTE,
-            bool(getattr(intelligence, "buy_enabled", True)) and inventory_band.rebalance_side != "sell",
-            bool(getattr(intelligence, "sell_enabled", True)),
-            inventory_band.target_inventory_pct,
-            regime.trend_bias * 0.45,
-            "risk_defensive_regime" if risk.state == "hard_brake" else "low_edge_defensive",
-        )
-
-    if inventory_band.zone in {"soft_skew", "strong_skew", "hard_skew"} and edge.total_score >= max(normal_edge, standby_edge):
-        return ModeSelection(
-            "skewed_mm",
-            "RANGE_MAKER",
-            True,
-            bool(getattr(intelligence, "buy_enabled", True)) and inventory_band.rebalance_side != "sell",
-            bool(getattr(intelligence, "sell_enabled", True)) and inventory_band.rebalance_side != "buy",
-            inventory_band.target_inventory_pct,
-            _clamp((inventory_band.target_inventory_pct - snapshot.inventory_pct) * 4.0, -1.0, 1.0),
-            "inventory_skew",
-        )
-
+    if snapshot.toxic_fill_ratio >= 0.80 or snapshot.adverse_fill_ratio >= 0.82:
+        if inventory_band.rebalance_side == "sell":
+            buy_enabled = False
+        elif inventory_band.rebalance_side == "buy":
+            sell_enabled = False
+        elif regime.trend_bias >= 0:
+            sell_enabled = False
+        else:
+            buy_enabled = False
+    if permission_state == "DEFENSIVE_ONLY":
+        if inventory_band.rebalance_side == "sell":
+            buy_enabled = False
+        elif inventory_band.rebalance_side == "buy":
+            sell_enabled = False
     return ModeSelection(
-        "passive_mm",
+        "defensive_mm",
         "RANGE_MAKER",
-        risk.quote_enabled and edge.total_score >= max(ADAPTIVE_EDGE_MIN_SCORE_TO_QUOTE, standby_edge),
-        bool(getattr(intelligence, "buy_enabled", True)),
-        bool(getattr(intelligence, "sell_enabled", True)),
-        _clamp((RANGE_TARGET_INVENTORY_MIN + RANGE_TARGET_INVENTORY_MAX) / 2.0, 0.0, 1.0),
-        regime.trend_bias * 0.35,
-        "balanced_passive_market_making",
+        quote_enabled and (buy_enabled or sell_enabled),
+        quote_enabled and buy_enabled,
+        quote_enabled and sell_enabled,
+        inventory_band.target_inventory_pct,
+        _clamp(regime.trend_bias * 0.35, -0.40, 0.40),
+        "chaos_protection",
     )
 
 
@@ -1041,88 +1505,51 @@ def build_aggressiveness(
     performance: PerformanceAdaptationState,
     risk: RiskGovernorState,
     mode: ModeSelection,
+    activity_floor: ActivityFloorState,
+    *,
+    profile: str | None = None,
 ) -> AggressivenessProfile:
-    raw_level = edge.total_score
-    if risk.state == "soft_brake":
-        raw_level *= 0.88
-    elif risk.state == "hard_brake":
-        raw_level *= 0.70
-
-    aggressive_edge = max(ADAPTIVE_AGGRESSIVE_MODE_MIN_EDGE, ADAPTIVE_DEFENSIVE_MODE_MIN_EDGE + 1.0)
-    defensive_edge = min(ADAPTIVE_DEFENSIVE_MODE_MIN_EDGE, aggressive_edge - 1.0)
-    edge_range = max(aggressive_edge - defensive_edge, 1.0)
-    score_ratio = _clamp((raw_level - defensive_edge) / edge_range, 0.0, 1.0)
-
-    size_multiplier = 0.72 + (score_ratio * 0.26)
-    spread_multiplier = 1.08 - (score_ratio * 0.10)
-    cooldown_multiplier = 1.02 - (score_ratio * 0.16)
-
-    if raw_level >= ADAPTIVE_AGGRESSIVE_MODE_MIN_EDGE:
-        size_multiplier *= ADAPTIVE_AGGRESSIVE_SIZE_MULTIPLIER
-    elif raw_level >= ADAPTIVE_NORMAL_MODE_MIN_EDGE:
-        size_multiplier *= ADAPTIVE_NORMAL_SIZE_MULTIPLIER
-    else:
-        size_multiplier *= ADAPTIVE_DEFENSIVE_SIZE_MULTIPLIER
-
-    mode_spread_multiplier = ADAPTIVE_PASSIVE_MM_SPREAD_MULTIPLIER
-    mode_size_multiplier = ADAPTIVE_NORMAL_SIZE_MULTIPLIER
-    if mode.mode == "trend_assist":
-        mode_spread_multiplier = ADAPTIVE_TREND_ASSIST_SPREAD_MULTIPLIER
-        mode_size_multiplier = ADAPTIVE_TREND_ASSIST_SIZE_MULTIPLIER
-        cooldown_multiplier *= 0.84
-    elif mode.mode == "skewed_mm":
-        mode_spread_multiplier = ADAPTIVE_SKEWED_MM_SPREAD_MULTIPLIER
-        mode_size_multiplier = ADAPTIVE_NORMAL_SIZE_MULTIPLIER
-        cooldown_multiplier *= 0.90
-    elif mode.mode == "defensive_mm":
-        mode_spread_multiplier = ADAPTIVE_DEFENSIVE_MM_SPREAD_MULTIPLIER
-        mode_size_multiplier = ADAPTIVE_DEFENSIVE_SIZE_MULTIPLIER
-        cooldown_multiplier *= 1.06
-    elif mode.mode == "rebalance_only":
-        mode_spread_multiplier = ADAPTIVE_REBALANCE_ONLY_SPREAD_MULTIPLIER
-        mode_size_multiplier = ADAPTIVE_REBALANCE_SIZE_MULTIPLIER
+    settings = _profile_settings(profile)
+    regime_key = "range" if regime.regime == "RANGE" else "trend" if regime.regime in {"TREND_UP", "TREND_DOWN"} else "chaos"
+    permission = edge.permission_state
+    regime_spread = settings[f"{regime_key}_spread_mult"]
+    regime_size = settings[f"{regime_key}_size_mult"]
+    permission_size = {"FULL": 1.08, "CAUTIOUS": 0.96, "REDUCED": 0.78, "DEFENSIVE_ONLY": 0.52, "BLOCKED": 0.0}.get(permission, 0.90)
+    permission_spread = {"FULL": 0.96, "CAUTIOUS": 1.02, "REDUCED": 1.10, "DEFENSIVE_ONLY": 1.20, "BLOCKED": 1.30}.get(permission, 1.05)
+    cooldown_multiplier = {"FULL": 0.88, "CAUTIOUS": 0.96, "REDUCED": 1.05, "DEFENSIVE_ONLY": 1.18, "BLOCKED": 1.30}.get(permission, 1.0)
+    if regime_key == "range":
         cooldown_multiplier *= 0.94
-    elif mode.mode == "standby":
-        mode_spread_multiplier = max(ADAPTIVE_DEFENSIVE_MM_SPREAD_MULTIPLIER, 1.20)
-        mode_size_multiplier = 0.0
-        cooldown_multiplier *= 1.15
+    elif regime_key == "chaos":
+        cooldown_multiplier *= 1.16
 
-    size_multiplier *= mode_size_multiplier
-    spread_multiplier *= mode_spread_multiplier
-
-    skew_multiplier = 1.0 + (inventory_band.inventory_pressure * 0.18)
+    size_multiplier = regime_size * permission_size * performance.size_cap_multiplier * risk.size_multiplier * activity_floor.size_multiplier
+    spread_multiplier = regime_spread * permission_spread * performance.spread_baseline_multiplier * risk.spread_multiplier * activity_floor.spread_multiplier
+    cooldown_multiplier *= activity_floor.cooldown_multiplier
+    skew_multiplier = 1.0 + (inventory_band.inventory_pressure * (0.20 if regime_key == "range" else 0.16))
+    if inventory_band.recovery_mode:
+        skew_multiplier *= 1.10
     if abs(regime.trend_bias) >= 0.55:
         skew_multiplier *= ADAPTIVE_STRONG_TREND_SKEW_STRENGTH
     elif abs(regime.trend_bias) >= 0.18:
         skew_multiplier *= ADAPTIVE_MILD_TREND_SKEW_STRENGTH
     if mode.mode == "rebalance_only":
         skew_multiplier *= ADAPTIVE_REBALANCE_SKEW_STRENGTH
-    elif inventory_band.zone == "hard_skew":
-        skew_multiplier *= 1.10
-
-    size_multiplier *= performance.size_cap_multiplier
-    spread_multiplier *= performance.spread_baseline_multiplier
-    skew_multiplier *= performance.skew_strength_multiplier
-    spread_multiplier *= risk.spread_multiplier
-    size_multiplier *= risk.size_multiplier
-
-    if mode.mode == "standby":
-        size_multiplier = 0.0
-        spread_multiplier = max(spread_multiplier, 1.25)
-        cooldown_multiplier = max(cooldown_multiplier, 1.25)
 
     if snapshot.adverse_fill_ratio >= ADAPTIVE_ADVERSE_WIDEN_THRESHOLD:
         spread_multiplier *= ADAPTIVE_ADVERSE_WIDEN_MULTIPLIER
     if snapshot.adverse_fill_ratio >= ADAPTIVE_ADVERSE_SIZE_REDUCE_THRESHOLD:
         size_multiplier *= ADAPTIVE_ADVERSE_SIZE_REDUCE_MULTIPLIER
-        cooldown_multiplier *= 1.04
-
     if snapshot.toxic_fill_ratio > 0.0:
-        spread_multiplier *= 1.0 + min(snapshot.toxic_fill_ratio * 0.14, 0.12)
-        size_multiplier *= max(1.0 - min(snapshot.toxic_fill_ratio * 0.16, 0.16), 0.46)
+        spread_multiplier *= 1.0 + min(snapshot.toxic_fill_ratio * 0.18, 0.18)
+        size_multiplier *= max(1.0 - min(snapshot.toxic_fill_ratio * 0.22, 0.28), 0.36)
+    if mode.mode == "standby":
+        size_multiplier = 0.0
+        spread_multiplier = max(spread_multiplier, 1.28)
+        cooldown_multiplier = max(cooldown_multiplier, 1.22)
+    level = _clamp(((edge.total_score + 100.0) / 2.0) - (risk.stage * 8.0) + (8.0 if activity_floor.override_applied else 0.0), 0.0, 100.0)
 
     return AggressivenessProfile(
-        level=_safe_round(_clamp(raw_level, 0.0, 100.0)),
+        level=_safe_round(level),
         size_multiplier=_safe_round(_clamp(size_multiplier, 0.0, 1.60)),
         spread_multiplier=_safe_round(_clamp(spread_multiplier, 0.78, 1.90)),
         cooldown_multiplier=_safe_round(_clamp(cooldown_multiplier, 0.50, 2.00)),
@@ -1148,6 +1575,7 @@ def build_cycle_plan(
     config = getattr(runtime, "adaptive_config", None)
     if config is None or not config.enabled:
         return None
+    profile = getattr(config, "profile", "")
 
     fill_quality = (
         update_fill_quality_probes(runtime, cycle_index, mid)
@@ -1167,33 +1595,34 @@ def build_cycle_plan(
         fill_quality=fill_quality,
     )
     regime = (
-        classify_regime(snapshot)
+        classify_regime(snapshot, profile=profile)
         if config.regime_enabled
-        else AdaptiveRegimeAssessment("range_clean", 50.0, {"range_clean": 50.0}, trend_bias=0.0)
+        else AdaptiveRegimeAssessment("RANGE", 0.50, {"RANGE": 50.0, "TREND_UP": 0.0, "TREND_DOWN": 0.0, "CHAOS": 0.0}, reason=["adaptive_disabled"], trend_bias=0.0)
     )
     edge = (
-        score_edge(snapshot, regime, cooldown_active=cooldown_active)
+        score_edge(snapshot, regime, cooldown_active=cooldown_active, profile=profile)
         if config.edge_enabled
-        else AdaptiveEdgeAssessment(50.0, {}, {}, "weak_positive")
+        else AdaptiveEdgeAssessment(10.0, {}, {}, "weak_positive", "CAUTIOUS", [])
     )
-    inventory_band = classify_inventory_band(snapshot) if config.inventory_bands_enabled else InventoryBandState("neutral", 0.50)
+    inventory_band = classify_inventory_band(snapshot, regime) if config.inventory_bands_enabled else InventoryBandState("neutral", 0.50)
     performance = (
         adapt_performance(runtime, cycle_index, fill_quality)
         if config.performance_adaptation_enabled
         else PerformanceAdaptationState(0, 0.0, snapshot.rolling_drawdown_pct, fill_quality.toxic_fill_ratio, 0.0, 1.0, 1.0, 1.0, 1.0)
     )
+    activity_floor = assess_activity_floor(runtime, cycle_index, snapshot, profile=profile)
     risk = (
-        govern_risk(runtime, snapshot, fill_quality, regime, edge)
+        govern_risk(runtime, cycle_index, snapshot, fill_quality, regime, edge, inventory_band)
         if config.risk_governor_enabled
-        else RiskGovernorState("normal", 1.0, 1.0, 1.0, True, [])
+        else RiskGovernorState("normal", 0, 1.0, 1.0, 1.0, True, True, True, [])
     )
     mode = (
-        select_mode(snapshot, regime, edge, inventory_band, performance, risk, intelligence)
+        select_mode(snapshot, regime, edge, inventory_band, performance, risk, activity_floor, intelligence, profile=profile)
         if config.mode_selector_enabled
         else ModeSelection("passive_mm", "RANGE_MAKER", True, True, True, 0.50, 0.0, "disabled")
     )
     aggressiveness = (
-        build_aggressiveness(snapshot, regime, edge, inventory_band, performance, risk, mode)
+        build_aggressiveness(snapshot, regime, edge, inventory_band, performance, risk, mode, activity_floor, profile=profile)
         if config.dynamic_quoting_enabled
         else AggressivenessProfile(edge.total_score, 1.0, 1.0, 1.0, 1.0)
     )
@@ -1206,6 +1635,7 @@ def build_cycle_plan(
         inventory_band=inventory_band,
         performance=performance,
         risk=risk,
+        activity_floor=activity_floor,
         mode=mode,
         aggressiveness=aggressiveness,
     )
@@ -1224,12 +1654,15 @@ def soften_edge_assessment(
         "expected_edge_bad",
         "expected_edge_below_min",
         "edge_score_too_low",
+        "expected_edge_negative",
     }
     if edge_assessment.edge_reject_reason not in soft_reasons:
         return edge_assessment, {}
+    if cycle_plan.edge.permission_state == "BLOCKED" or cycle_plan.risk.stage >= 4:
+        return edge_assessment, {}
 
     softened_size = _clamp(
-        min(edge_assessment.size_multiplier, max(cycle_plan.aggressiveness.size_multiplier * 0.85, 0.30)),
+        min(edge_assessment.size_multiplier, max(cycle_plan.aggressiveness.size_multiplier * 0.88, 0.28)),
         0.25,
         0.90,
     )
@@ -1245,7 +1678,7 @@ def soften_edge_assessment(
     )
     softened_edge = replace(
         edge_assessment,
-        edge_score=max(edge_assessment.edge_score, cycle_plan.edge.total_score),
+        edge_score=max(edge_assessment.edge_score, ((cycle_plan.edge.total_score + 100.0) / 2.0)),
         edge_pass=True,
         edge_reject_reason="",
         edge_bucket=_score_bucket(cycle_plan.edge.total_score),
@@ -1260,6 +1693,7 @@ def soften_edge_assessment(
         "adaptive_edge_soft_bucket": softened_edge.edge_bucket,
         "adaptive_edge_soft_size_multiplier": softened_edge.size_multiplier,
         "adaptive_edge_soft_spread_multiplier": softened_edge.spread_multiplier,
+        "trade_permission_state": cycle_plan.edge.permission_state,
     }
 
 
@@ -1280,12 +1714,22 @@ def apply_intelligence_overrides(runtime, intelligence, cycle_plan: AdaptiveCycl
     runtime.current_liquidity_estimate_usd = cycle_plan.snapshot.liquidity_estimate_usd
     runtime.current_quote_decision = cycle_plan.mode.reason
     runtime.current_quote_skew_multiplier = cycle_plan.aggressiveness.skew_multiplier
+    runtime.current_activity_state = cycle_plan.activity_floor.state
+    runtime.current_inactivity_cycles = cycle_plan.activity_floor.inactivity_cycles
+    runtime.current_activity_floor_state = cycle_plan.activity_floor.state
+    runtime.current_paper_activity_override = cycle_plan.activity_floor.override_applied
+    runtime.current_defensive_stage = cycle_plan.risk.stage
+    runtime.current_inventory_pressure_score = cycle_plan.inventory_band.inventory_pressure_score
+    runtime.current_inventory_recovery_mode = cycle_plan.inventory_band.recovery_mode
+    runtime.current_trade_permission_state = cycle_plan.edge.permission_state
+    runtime.current_regime_reason = "|".join(cycle_plan.regime.reason)
+    runtime.current_edge_components = cycle_plan.edge.breakdown
 
     intelligence.mm_mode = cycle_plan.mode.mode
     intelligence.strategy_mode = cycle_plan.mode.strategy_mode
     intelligence.quote_enabled = cycle_plan.mode.quote_enabled and cycle_plan.risk.quote_enabled
-    intelligence.buy_enabled = bool(getattr(intelligence, "buy_enabled", True)) and cycle_plan.mode.buy_enabled
-    intelligence.sell_enabled = bool(getattr(intelligence, "sell_enabled", True)) and cycle_plan.mode.sell_enabled
+    intelligence.buy_enabled = bool(getattr(intelligence, "buy_enabled", True)) and cycle_plan.mode.buy_enabled and cycle_plan.risk.buy_enabled
+    intelligence.sell_enabled = bool(getattr(intelligence, "sell_enabled", True)) and cycle_plan.mode.sell_enabled and cycle_plan.risk.sell_enabled
     intelligence.target_inventory_pct = cycle_plan.mode.target_inventory_pct
     intelligence.directional_bias = _clamp(cycle_plan.mode.directional_bias, -1.0, 1.0)
     intelligence.spread_multiplier *= cycle_plan.aggressiveness.spread_multiplier
@@ -1293,7 +1737,7 @@ def apply_intelligence_overrides(runtime, intelligence, cycle_plan: AdaptiveCycl
     intelligence.cooldown_multiplier *= cycle_plan.aggressiveness.cooldown_multiplier
     intelligence.inventory_skew_multiplier *= cycle_plan.aggressiveness.skew_multiplier
     intelligence.max_inventory_multiplier *= cycle_plan.risk.inventory_cap_multiplier
-    intelligence.min_edge_multiplier *= cycle_plan.performance.edge_threshold_multiplier
+    intelligence.min_edge_multiplier *= cycle_plan.performance.edge_threshold_multiplier * cycle_plan.activity_floor.edge_threshold_multiplier
 
 
 def quote_decision_filter_values(runtime, cycle_plan: AdaptiveCyclePlan | None) -> dict[str, object]:
@@ -1303,10 +1747,16 @@ def quote_decision_filter_values(runtime, cycle_plan: AdaptiveCyclePlan | None) 
         "adaptive_profile": cycle_plan.config.profile,
         "adaptive_regime": cycle_plan.regime.regime,
         "adaptive_regime_confidence": _safe_round(cycle_plan.regime.confidence),
+        "regime_label": cycle_plan.regime.regime,
+        "regime_confidence": _safe_round(cycle_plan.regime.confidence),
+        "regime_reason": cycle_plan.regime.reason,
         "adaptive_regime_sub_scores": cycle_plan.regime.sub_scores,
         "adaptive_edge_score": _safe_round(cycle_plan.edge.total_score),
+        "edge_score": _safe_round(cycle_plan.edge.total_score),
         "adaptive_edge_breakdown": cycle_plan.edge.breakdown,
         "adaptive_edge_penalties": cycle_plan.edge.penalties,
+        "edge_components": cycle_plan.edge.breakdown,
+        "trade_permission_state": cycle_plan.edge.permission_state,
         "adaptive_mode": cycle_plan.mode.mode,
         "adaptive_mode_reason": cycle_plan.mode.reason,
         "adaptive_strategy_mode": cycle_plan.mode.strategy_mode,
@@ -1315,6 +1765,8 @@ def quote_decision_filter_values(runtime, cycle_plan: AdaptiveCyclePlan | None) 
         "adaptive_sell_enabled": cycle_plan.mode.sell_enabled,
         "adaptive_inventory_zone": cycle_plan.inventory_band.zone,
         "adaptive_rebalance_side": cycle_plan.inventory_band.rebalance_side,
+        "inventory_pressure_score": _safe_round(cycle_plan.inventory_band.inventory_pressure_score),
+        "inventory_recovery_mode": cycle_plan.inventory_band.recovery_mode,
         "adaptive_target_inventory_pct": _safe_round(cycle_plan.mode.target_inventory_pct),
         "adaptive_directional_bias": _safe_round(cycle_plan.mode.directional_bias),
         "adaptive_aggressiveness": _safe_round(cycle_plan.aggressiveness.level),
@@ -1323,6 +1775,7 @@ def quote_decision_filter_values(runtime, cycle_plan: AdaptiveCyclePlan | None) 
         "adaptive_cooldown_multiplier": _safe_round(cycle_plan.aggressiveness.cooldown_multiplier),
         "adaptive_skew_multiplier": _safe_round(cycle_plan.aggressiveness.skew_multiplier),
         "adaptive_risk_state": cycle_plan.risk.state,
+        "defensive_stage": cycle_plan.risk.stage,
         "adaptive_risk_reasons": cycle_plan.risk.reasons,
         "adaptive_liquidity_estimate_usd": _safe_round(cycle_plan.snapshot.liquidity_estimate_usd),
         "adaptive_short_return_bps": _safe_round(cycle_plan.snapshot.short_return_bps),
@@ -1341,6 +1794,9 @@ def quote_decision_filter_values(runtime, cycle_plan: AdaptiveCyclePlan | None) 
         "adaptive_perf_size_cap_multiplier": _safe_round(cycle_plan.performance.size_cap_multiplier),
         "adaptive_perf_edge_threshold_multiplier": _safe_round(cycle_plan.performance.edge_threshold_multiplier),
         "adaptive_perf_skew_multiplier": _safe_round(cycle_plan.performance.skew_strength_multiplier),
+        "activity_floor_state": cycle_plan.activity_floor.state,
+        "inactivity_cycles": cycle_plan.activity_floor.inactivity_cycles,
+        "paper_activity_override": cycle_plan.activity_floor.override_applied,
     }
 
 
@@ -1348,15 +1804,17 @@ def update_quote_decision_runtime(runtime, *, spread_bps: float, size_usd: float
     runtime.current_quote_spread_bps = _safe_round(spread_bps)
     runtime.current_quote_size_usd = _safe_round(size_usd)
     cycle_plan = getattr(runtime, "current_adaptive_plan", None)
-    profile = getattr(getattr(runtime, "adaptive_config", None), "profile", "")
     spread_multiplier = 1.0 if cycle_plan is None else cycle_plan.aggressiveness.spread_multiplier
     size_multiplier = 1.0 if cycle_plan is None else cycle_plan.aggressiveness.size_multiplier
     skew_multiplier = 1.0 if cycle_plan is None else cycle_plan.aggressiveness.skew_multiplier
+    defensive_stage = 0 if cycle_plan is None else cycle_plan.risk.stage
+    edge_score = 0.0 if cycle_plan is None else cycle_plan.edge.total_score
+    permission_state = "-" if cycle_plan is None else cycle_plan.edge.permission_state
+    regime_label = "-" if cycle_plan is None else cycle_plan.regime.regime
     runtime.current_quote_decision = (
-        f"spread={spread_bps:.2f}bps|size={size_usd:.2f}|bid={bid:.2f}|ask={ask:.2f}|"
-        f"mode={runtime.current_mm_mode}|risk={runtime.current_risk_governor_state}|"
-        f"profile={profile or '-'}|spread_mult={spread_multiplier:.2f}|"
-        f"size_mult={size_multiplier:.2f}|skew={skew_multiplier:.2f}"
+        f"regime={regime_label}|edge={edge_score:.1f}|stage={defensive_stage}|"
+        f"spread_mult={spread_multiplier:.2f}|size_mult={size_multiplier:.2f}|"
+        f"skew={skew_multiplier:.2f}|perm={permission_state}"
     )
 
 

@@ -337,10 +337,19 @@ class BotRuntime:
     current_aggressiveness_score: float = 0.0
     current_risk_governor_state: str = "normal"
     current_risk_governor_reasons: str = ""
+    current_defensive_stage: int = 0
     current_toxic_fill_ratio: float = 0.0
     current_adverse_fill_ratio: float = 0.0
     current_expected_vs_realized_edge_bps: float = 0.0
     current_liquidity_estimate_usd: float = 0.0
+    current_regime_reason: str = ""
+    current_edge_components: dict[str, float] = field(default_factory=dict)
+    current_activity_floor_state: str = "disabled"
+    current_inactivity_cycles: int = 0
+    current_paper_activity_override: bool = False
+    current_inventory_pressure_score: float = 0.0
+    current_inventory_recovery_mode: bool = False
+    current_trade_permission_state: str = ""
     current_quote_decision: str = ""
     current_quote_spread_bps: float = 0.0
     current_quote_size_usd: float = 0.0
@@ -1756,13 +1765,21 @@ def _record_adaptive_cycle_history(runtime: BotRuntime, cycle_index: int, block_
     runtime.adaptive_cycle_history.append(
         {
             "cycle": cycle_index,
+            "regime": runtime.current_adaptive_regime,
             "mm_mode": runtime.current_mm_mode,
             "strategy_mode": runtime.current_strategy_mode,
             "allow_trade": runtime.last_allow_trade,
             "block_reason": block_reason or runtime.last_decision_block_reason,
             "drawdown_pct": runtime.current_drawdown_pct,
             "quote_enabled": runtime.current_quote_enabled,
+            "quote_spread_bps": runtime.current_quote_spread_bps,
+            "quote_size_usd": runtime.current_quote_size_usd,
             "edge_score": runtime.current_adaptive_edge_score or (runtime.current_edge_assessment.edge_score if runtime.current_edge_assessment else 0.0),
+            "toxic_fill_ratio": runtime.current_toxic_fill_ratio,
+            "defensive_stage": runtime.current_defensive_stage,
+            "trade_permission_state": runtime.current_trade_permission_state,
+            "activity_floor_state": runtime.current_activity_floor_state,
+            "realized_pnl_delta": runtime.last_cycle_realized_pnl_delta,
         }
     )
 
@@ -2114,11 +2131,12 @@ def _apply_runtime_regime_context(
         inventory_profile=inventory_profile,
         cycle_index=cycle_index,
     )
-    runtime.current_activity_state = "inactivity_fallback" if runtime.current_inactivity_fallback_active else getattr(
+    adaptive_activity_state = getattr(runtime, "current_activity_floor_state", "") or getattr(runtime, "current_activity_state", "")
+    runtime.current_activity_state = "inactivity_fallback" if runtime.current_inactivity_fallback_active else (adaptive_activity_state if adaptive_activity_state not in {"", "disabled"} else getattr(
         intelligence,
         "activity_state",
         "normal",
-    )
+    ))
     runtime.current_entry_threshold_bps = resolve_effective_entry_threshold_bps(
         runtime.current_active_regime,
         runtime.current_volatility_bucket,
@@ -6587,6 +6605,15 @@ def build_summary(runtime: BotRuntime) -> dict:
         "aggressiveness_score": runtime.current_aggressiveness_score,
         "risk_governor_state": runtime.current_risk_governor_state,
         "risk_governor_reasons": runtime.current_risk_governor_reasons,
+        "defensive_stage": runtime.current_defensive_stage,
+        "regime_reason": runtime.current_regime_reason,
+        "edge_components": dict(runtime.current_edge_components),
+        "activity_floor_state": runtime.current_activity_floor_state,
+        "inactivity_cycles": runtime.current_inactivity_cycles,
+        "paper_activity_override": runtime.current_paper_activity_override,
+        "inventory_pressure_score": runtime.current_inventory_pressure_score,
+        "inventory_recovery_mode": runtime.current_inventory_recovery_mode,
+        "trade_permission_state": runtime.current_trade_permission_state,
         "quote_decision": runtime.current_quote_decision,
         "quote_spread_bps": runtime.current_quote_spread_bps,
         "quote_size_usd": runtime.current_quote_size_usd,
@@ -6692,7 +6719,8 @@ def log_summary(summary: dict) -> None:
     )
     log(
         f"Adaptive state: regime {summary['adaptive_regime'] or '-'} ({summary['adaptive_regime_confidence']:.1f}) | "
-        f"edge {summary['adaptive_edge_score']:.1f} | mode {summary['adaptive_mode'] or summary['mm_mode']} | "
+        f"edge {summary['adaptive_edge_score']:.1f} | perm {summary['trade_permission_state'] or '-'} | "
+        f"mode {summary['adaptive_mode'] or summary['mm_mode']} | stage {summary['defensive_stage']} | "
         f"aggr {summary['aggressiveness_score']:.1f} | risk {summary['risk_governor_state']} | "
         f"quote {summary['quote_decision'] or '-'}"
     )
