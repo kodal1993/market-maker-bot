@@ -9,6 +9,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from adaptive_market_maker import (
+    _normalize_v6_profile,
+    _profile_settings,
     ActivityFloorState,
     AdaptiveCyclePlan,
     AdaptiveEdgeAssessment,
@@ -117,6 +119,12 @@ def make_cycle_plan() -> AdaptiveCyclePlan:
 
 
 class AdaptiveRegimeAwareTests(unittest.TestCase):
+    def test_ultra_profile_alias_maps_to_runtime_preset(self) -> None:
+        self.assertEqual(_normalize_v6_profile("ULTRA_AGGRESSIVE_PAPER"), "ultra_aggressive_paper")
+        settings = _profile_settings("ULTRA_AGGRESSIVE_PAPER")
+        self.assertGreater(settings["paper_min_quotes_per_hour"], _profile_settings("v6_aggressive_paper")["paper_min_quotes_per_hour"])
+        self.assertLess(settings["hard_block_edge"], _profile_settings("v6_aggressive_paper")["hard_block_edge"])
+
     def test_regime_classification_outputs_range_with_confidence_and_reason(self) -> None:
         snapshot = make_snapshot(
             short_return_bps=2.0,
@@ -366,6 +374,69 @@ class AdaptiveRegimeAwareTests(unittest.TestCase):
 
         self.assertEqual(band.zone, "hard_breach")
         self.assertEqual(band.rebalance_side, "sell")
+
+    def test_ultra_profile_keeps_low_edge_range_in_defensive_trading_instead_of_standby(self) -> None:
+        snapshot = make_snapshot(
+            short_return_bps=1.0,
+            medium_return_bps=1.5,
+            spread_bps=8.0,
+            spread_instability=0.12,
+            liquidity_estimate_usd=520.0,
+            quote_pressure_score=16.0,
+        )
+        regime = AdaptiveRegimeAssessment("RANGE", 0.46, {"RANGE": 46.0, "TREND_UP": 22.0, "TREND_DOWN": 18.0, "CHAOS": 12.0}, reason=["volatility_contained"], trend_bias=0.02)
+        edge = AdaptiveEdgeAssessment(-72.0, {}, {"drawdown_penalty": 2.0}, "bad", "BLOCKED", [])
+        inventory_band = classify_inventory_band(snapshot, regime)
+        performance = PerformanceAdaptationState(0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
+        risk = RiskGovernorState("normal", 0, 1.0, 1.0, 1.0, True, True, True, [])
+
+        mode = select_mode(
+            snapshot,
+            regime,
+            edge,
+            inventory_band,
+            performance,
+            risk,
+            ActivityFloorState("disabled", 0, 0.0, 0.0),
+            SimpleNamespace(buy_enabled=True, sell_enabled=True),
+            profile="ULTRA_AGGRESSIVE_PAPER",
+        )
+
+        self.assertEqual(mode.mode, "defensive_mm")
+        self.assertNotEqual(mode.reason, "hard_pause")
+
+    def test_ultra_profile_uses_standby_for_extreme_chaos_only(self) -> None:
+        snapshot = make_snapshot(
+            short_return_bps=48.0,
+            medium_return_bps=24.0,
+            spread_bps=42.0,
+            spread_instability=0.88,
+            liquidity_estimate_usd=52.0,
+            price_jump_frequency=0.72,
+            quote_pressure_score=88.0,
+            toxic_fill_ratio=0.42,
+            adverse_fill_ratio=0.28,
+        )
+        regime = AdaptiveRegimeAssessment("CHAOS", 0.88, {"RANGE": 8.0, "TREND_UP": 32.0, "TREND_DOWN": 10.0, "CHAOS": 96.0}, reason=["spread_instability_high"], trend_bias=0.12)
+        edge = AdaptiveEdgeAssessment(-72.0, {}, {"drawdown_penalty": 2.0}, "bad", "BLOCKED", [])
+        inventory_band = classify_inventory_band(snapshot, regime)
+        performance = PerformanceAdaptationState(0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
+        risk = RiskGovernorState("normal", 0, 1.0, 1.0, 1.0, True, True, True, [])
+
+        mode = select_mode(
+            snapshot,
+            regime,
+            edge,
+            inventory_band,
+            performance,
+            risk,
+            ActivityFloorState("disabled", 0, 0.0, 0.0),
+            SimpleNamespace(buy_enabled=True, sell_enabled=True),
+            profile="ULTRA_AGGRESSIVE_PAPER",
+        )
+
+        self.assertEqual(mode.mode, "standby")
+        self.assertIn(mode.reason, {"extreme_event_risk", "severe_illiquidity"})
 
 
 if __name__ == "__main__":

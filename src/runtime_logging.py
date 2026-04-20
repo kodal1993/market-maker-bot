@@ -369,6 +369,7 @@ def log_cycle(
     edge_bucket = getattr(runtime, "current_edge_bucket", "bad")
     adaptive_regime = getattr(runtime, "current_adaptive_regime", "")
     adaptive_edge_score = getattr(runtime, "current_adaptive_edge_score", 0.0)
+    adaptive_edge_posture = getattr(runtime, "current_adaptive_edge_posture", "")
     adaptive_mode = getattr(runtime, "current_adaptive_mode", "")
     aggressiveness_score = getattr(runtime, "current_aggressiveness_score", 0.0)
     risk_governor_state = getattr(runtime, "current_risk_governor_state", "normal")
@@ -421,7 +422,7 @@ def log_cycle(
         f"upper_tf {upper_tf_bias} | confirm {confirmation_text} | "
         f"edge {edge_score:.1f} | exp_edge {expected_edge_usd:.4f} | "
         f"adaptive_regime {adaptive_regime or '-'} | adaptive_edge {adaptive_edge_score:.1f} | "
-        f"adaptive_mode {adaptive_mode or '-'} | adaptive_profile {adaptive_profile} | aggr {aggressiveness_score:.1f} | "
+        f"adaptive_mode {adaptive_mode or '-'} | edge_posture {adaptive_edge_posture or '-'} | adaptive_profile {adaptive_profile} | aggr {aggressiveness_score:.1f} | "
         f"perm {trade_permission_state or '-'} | stage {defensive_stage} | "
         f"adaptive_penalties {adaptive_penalties} | "
         f"adaptive_mult size={adaptive_size_multiplier:.2f}/spread={adaptive_spread_multiplier:.2f}/skew={adaptive_skew_multiplier:.2f} | "
@@ -429,6 +430,7 @@ def log_cycle(
         f"inventory_pressure_score {inventory_pressure_score:.1f} | regime_reason {regime_reason or '-'} | "
         f"risk_governor {risk_governor_state} | toxic_fill_ratio {toxic_fill_ratio:.2f} | "
         f"gate {gate_text} | gate_reason {gate_reason} | trade_blocked_reason {trade_blocked_reason} | "
+        f"final_action {runtime.last_final_action or '-'} | "
         f"loss_streak {getattr(runtime, 'loss_streak', 0)} | "
         f"drawdown {getattr(runtime, 'current_drawdown_pct', 0.0):.2%} | dd_stage {getattr(runtime, 'drawdown_guard_stage', 'normal')} | "
         f"inv_limit {getattr(runtime, 'current_inventory_limit_state', 'normal')} | "
