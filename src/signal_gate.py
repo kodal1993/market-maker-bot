@@ -66,6 +66,9 @@ class SignalGate:
         action = signal.action.upper()
         reason = signal.reason or ""
         protective_exit = is_protective_exit(action, reason)
+        inventory_emergency_override = bool(getattr(signal, "filter_values", {}).get("inventory_emergency_override")) or (
+            edge_assessment.edge_override_reason == "inventory_emergency_override"
+        )
         inventory_state = inventory_state_label(inventory_ratio, target_base_pct)
         ema_trend_gap_bps = ema_gap_bps(short_ma, long_ma)
         ema_range_band_bps = max(EMA_RANGE_BAND_BPS, 0.5)
@@ -83,6 +86,8 @@ class SignalGate:
             "edge_bucket": edge_assessment.edge_bucket,
             "edge_size_multiplier": round(edge_assessment.size_multiplier, 6),
             "edge_spread_multiplier": round(edge_assessment.spread_multiplier, 6),
+            "edge_penalty_reason": edge_assessment.edge_penalty_reason,
+            "edge_override_reason": edge_assessment.edge_override_reason,
             "aggressive_enabled": edge_assessment.aggressive_enabled,
             "mev_risk_score": round(edge_assessment.mev_risk_score, 6),
             "slippage_estimate_bps": round(edge_assessment.slippage_estimate_bps, 6),
@@ -94,6 +99,7 @@ class SignalGate:
             "confirmation_enabled": confirmation_enabled,
             "confirmation_momentum_bps": round(confirmation_momentum_bps, 6),
             "confirmation_slowing": confirmation_slowing,
+            "inventory_emergency_override": inventory_emergency_override,
         }
         if ema_trend_gap_bps > ema_range_band_bps:
             gate_details["upper_tf_bias"] = "buy_only"
@@ -108,6 +114,7 @@ class SignalGate:
         if (
             loss_pause_remaining_minutes > 0
             and not protective_exit
+            and not inventory_emergency_override
             and edge_assessment.edge_score < HIGH_EDGE_OVERRIDE_SCORE
         ):
             gate_details["loss_pause_soft_degrade"] = True
@@ -115,13 +122,19 @@ class SignalGate:
             gate_spread_multiplier *= 1.08
             soft_guard_reasons.append("loss_pause_soft_degrade")
 
-        if CHOP_DISABLE_NEW_TRADES and regime_assessment.market_regime == "CHOP" and not protective_exit:
+        if (
+            CHOP_DISABLE_NEW_TRADES
+            and regime_assessment.market_regime == "CHOP"
+            and not protective_exit
+            and not inventory_emergency_override
+        ):
             gate_size_multiplier *= 0.82
             gate_spread_multiplier *= 1.08
             soft_guard_reasons.append("chop_market_soft")
 
         if (
             not protective_exit
+            and not inventory_emergency_override
             and action == "BUY"
             and ema_trend_gap_bps < -ema_range_band_bps
         ):
@@ -131,6 +144,7 @@ class SignalGate:
 
         if (
             not protective_exit
+            and not inventory_emergency_override
             and action == "SELL"
             and ema_trend_gap_bps > ema_range_band_bps
         ):
@@ -140,6 +154,7 @@ class SignalGate:
 
         if (
             not protective_exit
+            and not inventory_emergency_override
             and action == "BUY"
             and momentum_bps <= -max(TREND_MOMENTUM_BLOCK_BPS, 0.0)
         ):
@@ -149,6 +164,7 @@ class SignalGate:
 
         if (
             not protective_exit
+            and not inventory_emergency_override
             and action == "SELL"
             and momentum_bps >= max(TREND_MOMENTUM_BLOCK_BPS, 0.0)
         ):
@@ -160,6 +176,7 @@ class SignalGate:
         if (
             confirmation_enabled
             and not protective_exit
+            and not inventory_emergency_override
             and action == "BUY"
             and confirmation_momentum_bps <= -confirmation_threshold_bps
             and not confirmation_slowing
@@ -171,6 +188,7 @@ class SignalGate:
         if (
             confirmation_enabled
             and not protective_exit
+            and not inventory_emergency_override
             and action == "SELL"
             and confirmation_momentum_bps >= confirmation_threshold_bps
             and not confirmation_slowing
@@ -184,6 +202,7 @@ class SignalGate:
             and action == "BUY"
             and regime_assessment.market_regime == "TREND_DOWN"
             and not protective_exit
+            and not inventory_emergency_override
         ):
             gate_size_multiplier *= 0.76
             gate_spread_multiplier *= 1.08
@@ -194,6 +213,7 @@ class SignalGate:
             and action == "SELL"
             and regime_assessment.market_regime == "TREND_UP"
             and not protective_exit
+            and not inventory_emergency_override
             and reason == "quoted_sell"
         ):
             gate_size_multiplier *= 0.78

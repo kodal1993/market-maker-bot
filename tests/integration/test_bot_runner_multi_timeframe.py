@@ -41,6 +41,8 @@ def build_snapshot() -> SimpleNamespace:
         inventory_skew_multiplier=1.0,
         directional_bias=0.0,
         max_chase_bps_multiplier=1.0,
+        cooldown_multiplier=1.0,
+        min_edge_multiplier=1.0,
     )
 
 
@@ -92,6 +94,7 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
             confirmation_timeframe_seconds=60.0,
             enable_trend_timeframe_filter=trend_filter,
             enable_confirmation_filter=confirmation_filter,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.regime_detector.assess = lambda prices: build_regime()
@@ -130,7 +133,7 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
 
         filter_values = json.loads(runtime.last_filter_values)
 
-        self.assertEqual(runtime.engine.trade_count, 0)
+        self.assertGreaterEqual(runtime.engine.trade_count, 1)
         self.assertTrue(runtime.last_allow_trade)
         self.assertEqual(runtime.last_decision_block_reason, "")
         self.assertEqual(runtime.current_trend_bias, "sell_only")
@@ -208,7 +211,7 @@ class BotRunnerMultiTimeframeTests(unittest.TestCase):
 
         filter_values = json.loads(runtime.last_filter_values)
 
-        self.assertEqual(runtime.engine.trade_count, 0)
+        self.assertGreaterEqual(runtime.engine.trade_count, 1)
         self.assertTrue(runtime.last_allow_trade)
         self.assertEqual(runtime.last_decision_block_reason, "")
         self.assertIn("confirmation_blocks_buy_soft", filter_values["soft_guard_reasons"])

@@ -10,6 +10,7 @@ from config import (
     EDGE_WEAK_POS,
     ENABLE_EDGE_FILTER,
     ESTIMATED_SWAP_GAS_UNITS,
+    EXECUTION_MAKER_SLIPPAGE_BPS,
     EXPECTED_EDGE_MIN_BPS,
     EXPECTED_EDGE_MIN_USD,
     HIGH_EDGE_OVERRIDE_SCORE,
@@ -37,6 +38,22 @@ PROTECTIVE_SELL_REASONS = {
     "profit_exit_sell",
     "profit_lock_level_1",
     "profit_lock_level_2",
+}
+
+TAKER_LIKE_REASONS = {
+    "failsafe_sell",
+    "time_exit_sell",
+    "stop_loss_sell",
+    "profit_exit_sell",
+    "force_trade_buy",
+    "force_trade_sell",
+    "partial_reset",
+    "profit_lock_level_1",
+    "profit_lock_level_2",
+    "reentry_pullback",
+    "reentry_max_miss",
+    "reentry_runaway",
+    "reentry_timeout",
 }
 
 
@@ -110,6 +127,15 @@ class EdgeFilter:
         return max(MAKER_FEE_BPS, 0.5)
 
     @staticmethod
+    def _slippage_cost_bps(reason: str, expected_slippage_bps: float) -> float:
+        effective_slippage_bps = max(expected_slippage_bps, 0.0)
+        if effective_slippage_bps <= 0:
+            return 0.0
+        if reason in TAKER_LIKE_REASONS or reason.startswith("force_trade_") or is_reentry_reason(reason):
+            return effective_slippage_bps
+        return max(EXECUTION_MAKER_SLIPPAGE_BPS, effective_slippage_bps * 0.35)
+
+    @staticmethod
     def _gas_estimate_usd(context: ExecutionContext) -> float:
         return max(
             (context.gas_price_gwei * ESTIMATED_SWAP_GAS_UNITS * max(context.mid_price, 0.0)) / 1_000_000_000.0,
@@ -177,6 +203,9 @@ class EdgeFilter:
         current_profit_pct: float | None,
         inventory_profile: InventoryProfile | None = None,
         min_edge_multiplier: float = 1.0,
+        min_edge_bps: float | None = None,
+        force_trade_active: bool = False,
+        inventory_emergency_override: bool = False,
     ) -> EdgeAssessment:
         if signal.action not in {"BUY", "SELL"} or signal.size_usd <= 0:
             return EdgeAssessment(0.0, 0.0, 0.0, 0.0, False, "no_signal")
@@ -220,7 +249,8 @@ class EdgeFilter:
         expected_capture_usd = signal.size_usd * max(expected_capture_pct, 0.0) / 100.0
 
         fee_estimate_usd = signal.size_usd * (self._fee_bps(signal.reason) / 10_000.0)
-        slippage_estimate_usd = signal.size_usd * max(slippage.expected_slippage_bps, 0.0) / 10_000.0
+        slippage_cost_bps = self._slippage_cost_bps(signal.reason, slippage.expected_slippage_bps)
+        slippage_estimate_usd = signal.size_usd * slippage_cost_bps / 10_000.0
         gas_estimate_usd = self._gas_estimate_usd(context)
         mev_penalty_usd = signal.size_usd * max(mev_risk.mev_risk_score, 0.0) / 100_000.0
 
@@ -232,7 +262,7 @@ class EdgeFilter:
         elif regime_assessment.market_regime == "TREND_UP" and side == "sell" and not is_protective_exit(side, signal.reason):
             regime_penalty_usd += signal.size_usd * 0.0010
 
-        loss_penalty_usd = signal.size_usd * max(consecutive_losses, 0) * 0.0008
+        loss_penalty_usd = signal.size_usd * max(consecutive_losses, 0) * 0.0005
         reentry_penalty_usd = 0.0
         if is_reentry_reason(signal.reason):
             if regime_assessment.market_regime == "TREND_UP" and regime_assessment.regime_confidence > 70.0:
@@ -272,6 +302,11 @@ class EdgeFilter:
         threshold_multiplier = clamp(min_edge_multiplier, 0.70, 2.00)
         required_edge_usd = EXPECTED_EDGE_MIN_USD * threshold_multiplier
         required_edge_bps = EXPECTED_EDGE_MIN_BPS * threshold_multiplier
+        if min_edge_bps is not None:
+            required_edge_bps = min_edge_bps
+            required_edge_usd = signal.size_usd * (required_edge_bps / 10_000.0)
+            if required_edge_bps >= 0:
+                required_edge_usd = max(required_edge_usd, EXPECTED_EDGE_MIN_USD * threshold_multiplier)
         required_edge_score = EDGE_SCORE_MIN * threshold_multiplier
         required_reentry_score = max(EDGE_SCORE_MIN_REENTRY, REENTRY_EDGE_SCORE_MIN) * threshold_multiplier
 
@@ -301,6 +336,9 @@ class EdgeFilter:
         inventory_skew_multiplier = 1.0
         cooldown_multiplier = 1.0
         aggressive_enabled = False
+        edge_override_reason = "inventory_emergency_override" if inventory_emergency_override else (
+            "force_trade_active" if force_trade_active else ""
+        )
         if edge_bucket == "strong_positive":
             size_multiplier = max(AGGRESSIVE_SIZE_MULT, 1.0)
             spread_multiplier = 0.82
@@ -313,23 +351,40 @@ class EdgeFilter:
             inventory_skew_multiplier = 1.18
             cooldown_multiplier = 0.82
             aggressive_enabled = True
-        elif edge_bucket == "slightly_negative":
+        elif edge_bucket == "slightly_negative" and not edge_override_reason:
             size_multiplier = max((1.0 + max(min(DEFENSIVE_SIZE_MULT, 1.0), 0.10)) / 2.0, 0.65)
             spread_multiplier = 1.12
             inventory_skew_multiplier = 0.92
             cooldown_multiplier = 1.15
+        elif edge_bucket == "bad" and not edge_override_reason:
+            size_multiplier = 0.55
+            spread_multiplier = 1.16
+            inventory_skew_multiplier = 0.88
+            cooldown_multiplier = 1.18
 
         edge_reject_reason = ""
+        edge_penalty_reason = ""
         if is_protective_exit(side, signal.reason):
             edge_score = max(edge_score, HIGH_EDGE_OVERRIDE_SCORE)
         elif not quote_validation.is_valid:
             edge_reject_reason = quote_validation.block_reason
         elif not slippage.is_valid:
             edge_reject_reason = slippage.block_reason
-        elif edge_bucket == "bad" and expected_edge_usd < 0:
-            edge_reject_reason = "expected_edge_bad"
-        elif edge_bucket == "bad" and (expected_edge_bps < required_edge_bps or expected_edge_usd < required_edge_usd):
-            edge_reject_reason = "expected_edge_below_min"
+        elif not edge_override_reason and edge_bucket == "bad" and expected_edge_usd < 0:
+            deficit_bps = abs(min(expected_edge_bps - required_edge_bps, 0.0))
+            size_multiplier = min(size_multiplier, max(0.28, 0.48 - min(deficit_bps / 200.0, 0.16)))
+            spread_multiplier = max(spread_multiplier, 1.18 + min(deficit_bps / 120.0, 0.18))
+            inventory_skew_multiplier = min(inventory_skew_multiplier, 0.88)
+            cooldown_multiplier = max(cooldown_multiplier, 1.18 + min(deficit_bps / 160.0, 0.20))
+            edge_penalty_reason = "expected_edge_bad"
+        elif not edge_override_reason and edge_bucket == "bad" and (
+            expected_edge_bps < required_edge_bps or expected_edge_usd < required_edge_usd
+        ):
+            size_multiplier = min(size_multiplier, 0.60)
+            spread_multiplier = max(spread_multiplier, 1.12)
+            inventory_skew_multiplier = min(inventory_skew_multiplier, 0.90)
+            cooldown_multiplier = max(cooldown_multiplier, 1.12)
+            edge_penalty_reason = "expected_edge_below_min"
         elif is_reentry_reason(signal.reason) and pullback_depth_pct < REENTRY_MIN_PULLBACK_PCT:
             edge_reject_reason = "reentry_low_pullback"
         elif is_reentry_reason(signal.reason) and regime_assessment.market_regime not in {"RANGE", "TREND_UP"}:
@@ -340,8 +395,11 @@ class EdgeFilter:
             edge_reject_reason = "reentry_high_volatility_shock"
         elif is_reentry_reason(signal.reason) and edge_score < required_reentry_score:
             edge_reject_reason = "reentry_rejected_low_edge"
-        elif edge_bucket == "bad" and edge_score < required_edge_score:
-            edge_reject_reason = "edge_score_too_low"
+        elif not edge_override_reason and edge_bucket == "bad" and edge_score < required_edge_score:
+            size_multiplier = min(size_multiplier, 0.72)
+            spread_multiplier = max(spread_multiplier, 1.08)
+            cooldown_multiplier = max(cooldown_multiplier, 1.08)
+            edge_penalty_reason = edge_penalty_reason or "edge_score_too_low"
 
         if (
             is_reentry_reason(signal.reason)
@@ -363,7 +421,7 @@ class EdgeFilter:
             expected_capture_usd=round(expected_capture_usd, 6),
             expected_capture_bps=round(expected_capture_bps, 6),
             fee_estimate_usd=round(fee_estimate_usd, 6),
-            slippage_estimate_bps=round(slippage.expected_slippage_bps, 6),
+            slippage_estimate_bps=round(slippage_cost_bps, 6),
             slippage_estimate_usd=round(slippage_estimate_usd, 6),
             gas_estimate_usd=round(gas_estimate_usd, 6),
             mev_risk_score=round(mev_risk.mev_risk_score, 6),
@@ -380,4 +438,6 @@ class EdgeFilter:
             inventory_skew_multiplier=round(inventory_skew_multiplier, 6),
             cooldown_multiplier=round(cooldown_multiplier, 6),
             aggressive_enabled=aggressive_enabled,
+            edge_penalty_reason=edge_penalty_reason,
+            edge_override_reason=edge_override_reason,
         )

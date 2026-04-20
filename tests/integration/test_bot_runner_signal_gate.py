@@ -42,6 +42,8 @@ def build_snapshot(*, mode: str = "RANGE_MAKER", short_ma: float = 100.0, long_m
         inventory_skew_multiplier=1.0,
         directional_bias=0.0,
         max_chase_bps_multiplier=1.0,
+        cooldown_multiplier=1.0,
+        min_edge_multiplier=1.0,
     )
 
 
@@ -92,10 +94,13 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
         runtime = create_runtime(
             bootstrap_prices=[100.0] * 30,
             reference_price=100.0,
+            start_usdc=125.0,
+            start_eth=1.25,
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=False,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -133,10 +138,13 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
         runtime = create_runtime(
             bootstrap_prices=[110.0 - (index * 0.3) for index in range(30)],
             reference_price=100.0,
+            start_usdc=125.0,
+            start_eth=1.25,
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=False,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot(short_ma=99.2, long_ma=100.0)
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -173,10 +181,13 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
         runtime = create_runtime(
             bootstrap_prices=[100.0] * 30,
             reference_price=100.0,
+            start_usdc=125.0,
+            start_eth=1.25,
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=False,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -219,6 +230,7 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
             enable_trade_filter=False,
             enable_execution_engine=False,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -251,7 +263,7 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
             filter_values["entry_threshold_bps"],
             resolve_entry_threshold_bps("RANGE", "NORMAL"),
         )
-        self.assertGreater(filter_values["min_edge_bps"], 0.0)
+        self.assertAlmostEqual(filter_values["min_edge_bps"], resolve_min_edge_bps("RANGE"))
         self.assertAlmostEqual(filter_values["inventory_drift_pct"], 0.0, delta=1e-6)
         self.assertEqual(filter_values["trade_blocked_reason"], "")
 
@@ -267,6 +279,7 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
             enable_execution_engine=False,
             enable_state_machine=False,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.regime_detector.assess = lambda prices: build_regime(
@@ -317,6 +330,7 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
             enable_execution_engine=False,
             enable_state_machine=False,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.regime_detector.assess = lambda prices: build_regime("RANGE")
@@ -373,12 +387,13 @@ class BotRunnerSignalGateIntegrationTests(unittest.TestCase):
         runtime = create_runtime(
             bootstrap_prices=[100.0 + (index * 0.3) for index in range(30)],
             reference_price=100.0,
-            start_usdc=0.0,
+            start_usdc=100.0,
             start_eth=1.0,
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=False,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot(
             mode="TREND_UP",

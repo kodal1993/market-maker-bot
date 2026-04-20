@@ -1891,12 +1891,14 @@ def apply_intelligence_overrides(runtime, intelligence, cycle_plan: AdaptiveCycl
     intelligence.sell_enabled = bool(getattr(intelligence, "sell_enabled", True)) and cycle_plan.mode.sell_enabled and cycle_plan.risk.sell_enabled
     intelligence.target_inventory_pct = cycle_plan.mode.target_inventory_pct
     intelligence.directional_bias = _clamp(cycle_plan.mode.directional_bias, -1.0, 1.0)
-    intelligence.spread_multiplier *= cycle_plan.aggressiveness.spread_multiplier
-    intelligence.trade_size_multiplier *= cycle_plan.aggressiveness.size_multiplier
-    intelligence.cooldown_multiplier *= cycle_plan.aggressiveness.cooldown_multiplier
-    intelligence.inventory_skew_multiplier *= cycle_plan.aggressiveness.skew_multiplier
-    intelligence.max_inventory_multiplier *= cycle_plan.risk.inventory_cap_multiplier
-    intelligence.min_edge_multiplier *= cycle_plan.performance.edge_threshold_multiplier * cycle_plan.activity_floor.edge_threshold_multiplier
+    intelligence.spread_multiplier = float(getattr(intelligence, "spread_multiplier", 1.0)) * cycle_plan.aggressiveness.spread_multiplier
+    intelligence.trade_size_multiplier = float(getattr(intelligence, "trade_size_multiplier", 1.0)) * cycle_plan.aggressiveness.size_multiplier
+    intelligence.cooldown_multiplier = float(getattr(intelligence, "cooldown_multiplier", 1.0)) * cycle_plan.aggressiveness.cooldown_multiplier
+    intelligence.inventory_skew_multiplier = float(getattr(intelligence, "inventory_skew_multiplier", 1.0)) * cycle_plan.aggressiveness.skew_multiplier
+    intelligence.max_inventory_multiplier = float(getattr(intelligence, "max_inventory_multiplier", 1.0)) * cycle_plan.risk.inventory_cap_multiplier
+    intelligence.min_edge_multiplier = float(getattr(intelligence, "min_edge_multiplier", 1.0)) * (
+        cycle_plan.performance.edge_threshold_multiplier * cycle_plan.activity_floor.edge_threshold_multiplier
+    )
 
 
 def quote_decision_filter_values(runtime, cycle_plan: AdaptiveCyclePlan | None) -> dict[str, object]:

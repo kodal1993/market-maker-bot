@@ -42,13 +42,15 @@ def build_snapshot() -> SimpleNamespace:
         buy_enabled=True,
         sell_enabled=True,
         max_inventory_multiplier=5.0,
-        target_inventory_pct=0.7,
+        target_inventory_pct=0.02,
         trade_size_multiplier=1.0,
         market_score=0.35,
         trend_strength=1.15,
         inventory_skew_multiplier=1.0,
         directional_bias=0.0,
         max_chase_bps_multiplier=1.0,
+        cooldown_multiplier=1.0,
+        min_edge_multiplier=1.0,
     )
 
 
@@ -64,6 +66,7 @@ def build_no_trade_snapshot() -> SimpleNamespace:
     snapshot.news_score = -0.2881
     snapshot.macro_score = -0.8220
     snapshot.risk_score = 0.16
+    snapshot.target_inventory_pct = 0.80
     snapshot.mm_mode = "base_mm"
     snapshot.activity_boost = 1.0
     snapshot.freeze_recovery_mode = False
@@ -83,6 +86,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=True,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -147,6 +151,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=True,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -186,6 +191,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=True,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -231,6 +237,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=True,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -277,6 +284,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             enable_execution_engine=False,
             execution_timeframe_seconds=60.0,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_no_trade_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -354,6 +362,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             enable_execution_engine=False,
             execution_timeframe_seconds=60.0,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_no_trade_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -393,10 +402,12 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             expected_edge_bps=-39.95,
             cost_estimate_usd=0.16,
             edge_score=30.8,
-            edge_pass=False,
-            edge_reject_reason="expected_edge_bad",
+            edge_pass=True,
             slippage_estimate_bps=3.6,
             mev_risk_score=14.2,
+            size_multiplier=0.42,
+            spread_multiplier=1.22,
+            edge_penalty_reason="expected_edge_bad",
         )
         runtime.portfolio.eth_cost_basis = 100.0
 
@@ -415,11 +426,12 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
         filter_values = json.loads(runtime.last_filter_values)
 
         self.assertIn("NO_TRADE_OVERRIDE", messages)
-        self.assertEqual(runtime.last_decision_block_reason, "expected_edge_bad")
-        self.assertEqual(filter_values["trade_blocked_reason"], "expected_edge_bad")
+        self.assertEqual(runtime.last_decision_block_reason, "no_trade")
+        self.assertEqual(filter_values["trade_blocked_reason"], "no_trade")
         self.assertTrue(filter_values["no_trade_override"])
         self.assertEqual(filter_values["no_trade_override_reason"], "no_trade")
-        self.assertEqual(filter_values["upstream_block_reason"], "expected_edge_bad")
+        self.assertEqual(filter_values["upstream_block_reason"], "no_trade")
+        self.assertEqual(filter_values["edge_penalty_reason"], "expected_edge_bad")
         self.assertEqual(runtime.engine.trade_count, 0)
 
     def test_profitable_open_position_triggers_profit_exit_sell(self) -> None:
@@ -434,6 +446,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             enable_execution_engine=False,
             execution_timeframe_seconds=60.0,
             trend_timeframe_seconds=60.0,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: SimpleNamespace(
             regime="RANGE",
@@ -469,6 +482,7 @@ class BotRunnerExecutionBridgeTests(unittest.TestCase):
             fill_quality_score=1.0,
             fill_quality_tier="normal",
             cooldown_multiplier=1.0,
+            min_edge_multiplier=1.0,
         )
         runtime.regime_detector.assess = lambda prices: MarketRegimeAssessment(
             market_regime="RANGE",

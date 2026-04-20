@@ -6,7 +6,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from bot_runner import _build_open_profit_exit_plan, _build_profit_lock_sell_plan, _record_fill, create_runtime
+from bot_runner import (
+    _build_inventory_emergency_candidate,
+    _build_open_profit_exit_plan,
+    _build_profit_lock_sell_plan,
+    _record_fill,
+    _reset_stale_loss_streak_if_idle,
+    create_runtime,
+)
 from edge_filter import EdgeFilter
 from regime_detector import RegimeDetector
 from signal_gate import SignalGate
@@ -53,9 +60,13 @@ def build_edge(
     *,
     edge_pass: bool = True,
     reject_reason: str = "",
+    penalty_reason: str = "",
+    override_reason: str = "",
     edge_score: float = 78.0,
     expected_edge_usd: float = 0.18,
     expected_edge_bps: float = 70.0,
+    size_multiplier: float = 1.0,
+    spread_multiplier: float = 1.0,
 ) -> EdgeAssessment:
     return EdgeAssessment(
         expected_edge_usd=expected_edge_usd,
@@ -66,6 +77,10 @@ def build_edge(
         edge_reject_reason=reject_reason,
         slippage_estimate_bps=4.0,
         mev_risk_score=18.0,
+        size_multiplier=size_multiplier,
+        spread_multiplier=spread_multiplier,
+        edge_penalty_reason=penalty_reason,
+        edge_override_reason=override_reason,
     )
 
 
@@ -181,6 +196,33 @@ class RegimeEdgeGateTests(unittest.TestCase):
         self.assertIn("ema_uptrend_sell_soft", decision.gate_details["soft_guard_reasons"])
         self.assertLess(decision.gate_details["gate_size_multiplier"], 1.0)
 
+    def test_signal_gate_skips_soft_guards_for_inventory_emergency_override(self) -> None:
+        gate = SignalGate()
+        decision = gate.evaluate(
+            signal=DecisionOutcome(
+                action="SELL",
+                size_usd=20.0,
+                reason="inventory_force_reduce",
+                source="inventory",
+                filter_values={"inventory_emergency_override": True},
+            ),
+            strategy_mode="TREND_UP",
+            regime_assessment=build_regime("TREND_UP", net_move_pct=1.2, direction_consistency=0.85),
+            edge_assessment=build_edge(override_reason="inventory_emergency_override"),
+            inventory_ratio=0.85,
+            target_base_pct=0.50,
+            consecutive_losses=0,
+            loss_pause_remaining_minutes=0.0,
+            short_ma=100.8,
+            long_ma=100.0,
+            momentum_bps=20.0,
+        )
+
+        self.assertTrue(decision.allow_trade)
+        self.assertTrue(decision.gate_details["inventory_emergency_override"])
+        self.assertEqual(decision.gate_details["soft_guard_reasons"], [])
+        self.assertEqual(decision.gate_details["gate_size_multiplier"], 1.0)
+
     def test_signal_gate_allows_range_signal_with_positive_edge(self) -> None:
         gate = SignalGate()
         decision = gate.evaluate(
@@ -200,7 +242,7 @@ class RegimeEdgeGateTests(unittest.TestCase):
         self.assertTrue(decision.allow_trade)
         self.assertEqual(decision.approved_mode, "range_entry")
 
-    def test_signal_gate_blocks_negative_expected_edge(self) -> None:
+    def test_signal_gate_blocks_hard_edge_reject(self) -> None:
         gate = SignalGate()
         decision = gate.evaluate(
             signal=DecisionOutcome(action="BUY", size_usd=20.0, reason="quoted_buy", source="test"),
@@ -208,7 +250,7 @@ class RegimeEdgeGateTests(unittest.TestCase):
             regime_assessment=build_regime("RANGE"),
             edge_assessment=build_edge(
                 edge_pass=False,
-                reject_reason="expected_edge_negative",
+                reject_reason="price_impact_too_high",
                 edge_score=34.0,
                 expected_edge_usd=-0.03,
                 expected_edge_bps=-15.0,
@@ -223,7 +265,34 @@ class RegimeEdgeGateTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.allow_trade)
-        self.assertEqual(decision.blocked_reason, "expected_edge_negative")
+        self.assertEqual(decision.blocked_reason, "price_impact_too_high")
+
+    def test_signal_gate_allows_negative_expected_edge_when_softened(self) -> None:
+        gate = SignalGate()
+        decision = gate.evaluate(
+            signal=DecisionOutcome(action="BUY", size_usd=20.0, reason="quoted_buy", source="test"),
+            strategy_mode="RANGE_MAKER",
+            regime_assessment=build_regime("RANGE"),
+            edge_assessment=build_edge(
+                edge_pass=True,
+                penalty_reason="expected_edge_bad",
+                edge_score=34.0,
+                expected_edge_usd=-0.03,
+                expected_edge_bps=-15.0,
+                size_multiplier=0.42,
+                spread_multiplier=1.22,
+            ),
+            inventory_ratio=0.45,
+            target_base_pct=0.50,
+            consecutive_losses=0,
+            loss_pause_remaining_minutes=0.0,
+            short_ma=100.01,
+            long_ma=100.0,
+            momentum_bps=4.0,
+        )
+
+        self.assertTrue(decision.allow_trade)
+        self.assertEqual(decision.gate_details["edge_penalty_reason"], "expected_edge_bad")
 
     def test_signal_gate_softens_buy_on_strong_negative_momentum(self) -> None:
         gate = SignalGate()
@@ -404,7 +473,142 @@ class RegimeEdgeGateTests(unittest.TestCase):
         self.assertLess(penalized_buy.expected_edge_usd, baseline_buy.expected_edge_usd)
         self.assertGreater(boosted_sell.expected_edge_usd, baseline_sell.expected_edge_usd)
 
-    def test_three_consecutive_losses_activate_loss_pause(self) -> None:
+    def test_edge_filter_softens_negative_edge_into_penalty(self) -> None:
+        edge_filter = EdgeFilter()
+        assessment = edge_filter.assess(
+            signal=DecisionOutcome(
+                action="BUY",
+                size_usd=30.0,
+                reason="trend_buy",
+                source="test",
+                order_price=100.0,
+            ),
+            context=ExecutionContext(
+                pair="WETH/USDC",
+                router="uniswap_v3",
+                mid_price=100.0,
+                quote_bid=99.91,
+                quote_ask=100.09,
+                router_price=100.0,
+                backup_price=100.0,
+                onchain_ref_price=100.0,
+                twap_price=100.0,
+                spread_bps=18.0,
+                volatility=0.002,
+                liquidity_usd=10_000.0,
+                gas_price_gwei=8.0,
+                market_mode="TREND",
+            ),
+            regime_assessment=build_regime("TREND_UP", net_move_pct=0.12, price_position_pct=0.70),
+            inventory_usd=40.0,
+            target_base_usd=50.0,
+            consecutive_losses=4,
+            last_loss_cycle=None,
+            last_loss_reason="",
+            cycle_index=10,
+            cycle_seconds=60.0,
+            last_sell_price=None,
+            current_profit_pct=None,
+            min_edge_bps=-5.0,
+        )
+
+        self.assertTrue(assessment.edge_pass)
+        self.assertEqual(assessment.edge_penalty_reason, "expected_edge_bad")
+        self.assertLess(assessment.size_multiplier, 1.0)
+        self.assertGreater(assessment.spread_multiplier, 1.0)
+
+    def test_force_trade_active_bypasses_edge_filter(self) -> None:
+        edge_filter = EdgeFilter()
+        assessment = edge_filter.assess(
+            signal=DecisionOutcome(
+                action="BUY",
+                size_usd=30.0,
+                reason="trend_buy",
+                source="test",
+                order_price=100.0,
+            ),
+            context=ExecutionContext(
+                pair="WETH/USDC",
+                router="uniswap_v3",
+                mid_price=100.0,
+                quote_bid=99.91,
+                quote_ask=100.09,
+                router_price=100.0,
+                backup_price=100.0,
+                onchain_ref_price=100.0,
+                twap_price=100.0,
+                spread_bps=18.0,
+                volatility=0.002,
+                liquidity_usd=10_000.0,
+                gas_price_gwei=8.0,
+                market_mode="TREND",
+            ),
+            regime_assessment=build_regime("TREND_UP", net_move_pct=0.12, price_position_pct=0.70),
+            inventory_usd=40.0,
+            target_base_usd=50.0,
+            consecutive_losses=4,
+            last_loss_cycle=None,
+            last_loss_reason="",
+            cycle_index=10,
+            cycle_seconds=60.0,
+            last_sell_price=None,
+            current_profit_pct=None,
+            min_edge_bps=-5.0,
+            force_trade_active=True,
+        )
+
+        self.assertTrue(assessment.edge_pass)
+        self.assertEqual(assessment.edge_override_reason, "force_trade_active")
+        self.assertEqual(assessment.edge_penalty_reason, "")
+
+    def test_inventory_emergency_override_builds_forced_rebalance_candidate(self) -> None:
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            start_usdc=20.0,
+            start_eth=1.2,
+            start_eth_usd=0.0,
+            enable_trade_filter=False,
+            enable_execution_engine=False,
+        )
+        runtime.current_inventory_drift_pct = 40.0
+        inventory_profile = InventoryProfile(
+            regime_label="normal",
+            lower_bound=0.42,
+            upper_bound=0.58,
+            inventory_ratio=0.90,
+            inventory_usd=120.0,
+            equity_usd=140.0,
+            allow_buy=True,
+            allow_sell=True,
+            max_buy_usd=0.0,
+            max_sell_usd=60.0,
+            soft_limit_usd=100.0,
+        )
+
+        candidate = _build_inventory_emergency_candidate(
+            runtime,
+            strategy_mid=100.0,
+            strategy_sell_price=100.2,
+            trade_size_usd=15.0,
+            base_trade_size_usd=20.0,
+            available_quote_usd=20.0,
+            inventory_profile=inventory_profile,
+            sell_state_allowed=True,
+            buy_state_allowed=True,
+            in_cooldown=False,
+            min_notional_usd=10.0,
+            default_buy_inventory_cap=200.0,
+            reentry_buy_inventory_cap=200.0,
+            min_sell_price=None,
+        )
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.action, "SELL")
+        self.assertEqual(candidate.reason, "inventory_force_reduce")
+        self.assertTrue(candidate.filter_values["inventory_emergency_override"])
+
+    def test_eight_consecutive_losses_activate_loss_pause(self) -> None:
         runtime = create_runtime(
             bootstrap_prices=[100.0] * 30,
             reference_price=100.0,
@@ -428,7 +632,7 @@ class RegimeEdgeGateTests(unittest.TestCase):
             trade_reason="quoted_sell",
         )
 
-        for cycle_index in range(1, 4):
+        for cycle_index in range(1, 9):
             _record_fill(
                 runtime=runtime,
                 cycle_index=cycle_index,
@@ -437,10 +641,31 @@ class RegimeEdgeGateTests(unittest.TestCase):
                 realized_pnl_delta=-1.0,
             )
 
-        self.assertEqual(runtime.loss_streak, 3)
+        self.assertEqual(runtime.loss_streak, 8)
         self.assertIsNotNone(runtime.loss_pause_until_cycle)
-        self.assertGreater(runtime.loss_pause_until_cycle or 0, 3)
-        self.assertEqual(runtime.last_loss_cycle, 3)
+        self.assertGreater(runtime.loss_pause_until_cycle or 0, 8)
+        self.assertEqual(runtime.last_loss_cycle, 8)
+
+    def test_loss_streak_resets_after_thirty_minutes_without_trades(self) -> None:
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            enable_trade_filter=False,
+            enable_execution_engine=False,
+            cycle_seconds=60.0,
+        )
+        runtime.loss_streak = 5
+        runtime.loss_pause_until_cycle = 120
+        runtime.last_loss_cycle = 1
+        runtime.last_loss_trade_reason = "quoted_sell"
+        runtime.last_trade_cycle_any = 0
+
+        _reset_stale_loss_streak_if_idle(runtime, cycle_index=31)
+
+        self.assertEqual(runtime.loss_streak, 0)
+        self.assertIsNone(runtime.loss_pause_until_cycle)
+        self.assertIsNone(runtime.last_loss_cycle)
+        self.assertEqual(runtime.last_loss_trade_reason, "")
 
     def test_time_exit_sell_plan_triggers_for_stale_position(self) -> None:
         runtime = create_runtime(

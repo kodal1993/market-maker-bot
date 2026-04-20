@@ -212,6 +212,8 @@ class EdgeAssessment:
     inventory_skew_multiplier: float = 1.0
     cooldown_multiplier: float = 1.0
     aggressive_enabled: bool = False
+    edge_penalty_reason: str = ""
+    edge_override_reason: str = ""
 
 
 @dataclass(frozen=True)

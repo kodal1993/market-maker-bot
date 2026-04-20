@@ -128,12 +128,15 @@ def resolve_min_edge_bps(active_regime: str) -> float:
 
 
 def resolve_min_edge_multiplier(active_regime: str) -> float:
-    required_edge_bps = resolve_min_edge_bps(active_regime)
-    return max(required_edge_bps / max(RANGE_MIN_EDGE_BPS, 0.5), 0.35)
+    required_edge_bps = abs(resolve_min_edge_bps(active_regime))
+    baseline_edge_bps = max(abs(RANGE_MIN_EDGE_BPS), 0.5)
+    return max(required_edge_bps / baseline_edge_bps, 0.35)
 
 
 def resolve_low_activity_edge_factor(active_regime: str) -> float:
     required_edge_bps = resolve_min_edge_bps(active_regime)
+    if required_edge_bps <= 0:
+        return 1.0
     loosen_bps = min(ACTIVITY_AUTO_LOOSEN_MIN_EDGE_BPS, required_edge_bps * 0.50)
     return _clamp((required_edge_bps - loosen_bps) / max(required_edge_bps, 1.0), 0.50, 1.0)
 
@@ -142,12 +145,12 @@ def resolve_effective_min_edge_bps(active_regime: str, activity_state: str = "no
     required_edge_bps = resolve_min_edge_bps(active_regime)
     normalized_activity_state = _normalized_activity_state(activity_state)
     if normalized_activity_state == "inactivity_fallback" and _normalized_regime(active_regime) == "RANGE":
-        required_edge_bps = min(required_edge_bps, max(INACTIVITY_FORCE_MIN_EDGE_BPS, 0.0))
-    elif normalized_activity_state == "low_activity_relax":
+        required_edge_bps = min(required_edge_bps, INACTIVITY_FORCE_MIN_EDGE_BPS)
+    elif normalized_activity_state == "low_activity_relax" and required_edge_bps > 0:
         required_edge_bps *= resolve_low_activity_edge_factor(active_regime)
-    if _normalized_regime(active_regime) == "RANGE" and ALLOW_MICRO_EDGE_ENTRIES:
+    if _normalized_regime(active_regime) == "RANGE" and ALLOW_MICRO_EDGE_ENTRIES and required_edge_bps > 0:
         required_edge_bps = min(required_edge_bps, max(MICRO_EDGE_MIN_BPS, 0.0))
-    return max(required_edge_bps, 0.0)
+    return required_edge_bps
 
 
 def resolve_take_profit_targets_bps(active_regime: str, volatility_bucket: str) -> tuple[float, float]:

@@ -194,6 +194,8 @@ PRIORITY_SELL_REASONS = {
     "profit_lock_level_2",
 }
 INVENTORY_DRIFT_GUARD_EXEMPT_REASONS = FORCED_SELL_REASONS | {"inventory_correction"}
+INVENTORY_EMERGENCY_OVERRIDE_PCT = 35.0
+LOSS_STREAK_RESET_AFTER_MINUTES = 30.0
 
 
 def trade_log_headers() -> list[str]:
@@ -1689,12 +1691,18 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
                 "expected_edge_usd": round(edge.expected_edge_usd, 6),
                 "expected_edge_bps": round(edge.expected_edge_bps, 6),
                 "cost_estimate_usd": round(edge.cost_estimate_usd, 6),
+                "fee_estimate_usd": round(edge.fee_estimate_usd, 6),
                 "slippage_estimate_bps": round(edge.slippage_estimate_bps, 6),
+                "slippage_estimate_usd": round(edge.slippage_estimate_usd, 6),
+                "gas_estimate_usd": round(edge.gas_estimate_usd, 6),
                 "mev_risk_score": round(edge.mev_risk_score, 6),
                 "edge_bucket": edge.edge_bucket,
                 "edge_size_multiplier": round(edge.size_multiplier, 6),
                 "edge_spread_multiplier": round(edge.spread_multiplier, 6),
                 "edge_cooldown_multiplier": round(edge.cooldown_multiplier, 6),
+                "edge_reject_reason": edge.edge_reject_reason,
+                "edge_penalty_reason": edge.edge_penalty_reason,
+                "edge_override_reason": edge.edge_override_reason,
                 "entry_edge_bps": round(edge.expected_edge_bps, 6),
                 "entry_edge_usd": round(edge.expected_edge_usd, 6),
             }
@@ -2069,6 +2077,82 @@ def _apply_inventory_drift_guard(
     return candidate, ""
 
 
+def _inventory_emergency_override_active(runtime: BotRuntime) -> bool:
+    return abs(runtime.current_inventory_drift_pct) > INVENTORY_EMERGENCY_OVERRIDE_PCT
+
+
+def _build_inventory_emergency_candidate(
+    runtime: BotRuntime,
+    *,
+    strategy_mid: float,
+    strategy_sell_price: float,
+    trade_size_usd: float,
+    base_trade_size_usd: float,
+    available_quote_usd: float,
+    inventory_profile,
+    sell_state_allowed: bool,
+    buy_state_allowed: bool,
+    in_cooldown: bool,
+    min_notional_usd: float,
+    default_buy_inventory_cap: float,
+    reentry_buy_inventory_cap: float,
+    min_sell_price: float | None,
+) -> DecisionOutcome | None:
+    if in_cooldown or inventory_profile is None or not _inventory_emergency_override_active(runtime):
+        return None
+
+    emergency_size_usd = max(
+        trade_size_usd,
+        base_trade_size_usd,
+        _force_trade_size_usd(runtime, max(trade_size_usd, base_trade_size_usd)),
+        min_notional_usd,
+    )
+    emergency_filter_values = {
+        "inventory_emergency_override": True,
+        "inventory_emergency_drift_pct": round(runtime.current_inventory_drift_pct, 6),
+    }
+
+    if runtime.current_inventory_drift_pct > 0 and sell_state_allowed:
+        emergency_sell_size = min(emergency_size_usd, max(getattr(inventory_profile, "max_sell_usd", 0.0), 0.0))
+        if emergency_sell_size >= min_notional_usd:
+            return DecisionOutcome(
+                action="SELL",
+                size_usd=emergency_sell_size,
+                reason="inventory_force_reduce",
+                source="inventory",
+                order_price=_forced_inventory_reduce_sell_price(
+                    strategy_mid=strategy_mid,
+                    strategy_sell_price=strategy_sell_price,
+                    min_sell_price=min_sell_price,
+                ),
+                inventory_cap_usd=default_buy_inventory_cap,
+                filter_values=emergency_filter_values,
+            )
+
+    if (
+        runtime.current_inventory_drift_pct < 0
+        and buy_state_allowed
+        and not getattr(inventory_profile, "reduction_only", False)
+    ):
+        emergency_buy_size = min(
+            emergency_size_usd,
+            max(getattr(inventory_profile, "max_buy_usd", 0.0), 0.0),
+            available_quote_usd,
+        )
+        if emergency_buy_size >= min_notional_usd:
+            return DecisionOutcome(
+                action="BUY",
+                size_usd=emergency_buy_size,
+                reason="inventory_rebalance",
+                source="inventory",
+                order_price=strategy_mid,
+                inventory_cap_usd=reentry_buy_inventory_cap,
+                filter_values=emergency_filter_values,
+            )
+
+    return None
+
+
 def _forced_inventory_reduce_sell_price(
     *,
     strategy_mid: float,
@@ -2303,6 +2387,18 @@ def _refresh_loss_pause_state(runtime: BotRuntime, cycle_index: int) -> None:
         runtime.loss_pause_remaining_minutes = 0.0
 
 
+def _reset_stale_loss_streak_if_idle(runtime: BotRuntime, cycle_index: int) -> None:
+    if runtime.loss_streak <= 0 and runtime.loss_pause_until_cycle is None:
+        return
+    if risk_helpers.minutes_since_last_trade(runtime, cycle_index) < LOSS_STREAK_RESET_AFTER_MINUTES:
+        return
+    runtime.loss_streak = 0
+    runtime.loss_pause_until_cycle = None
+    runtime.loss_pause_remaining_minutes = 0.0
+    runtime.last_loss_cycle = None
+    runtime.last_loss_trade_reason = ""
+
+
 def _raw_signal_label(decision: DecisionOutcome) -> str:
     action = decision.action or "NONE"
     source = decision.source or "-"
@@ -2372,6 +2468,7 @@ def _apply_signal_pipeline(
     inventory_usd: float,
 ) -> DecisionOutcome:
     runtime.last_raw_signal = _raw_signal_label(decision)
+    _reset_stale_loss_streak_if_idle(runtime, cycle_index)
     _refresh_loss_pause_state(runtime, cycle_index)
     regime_assessment = runtime.current_regime_assessment or runtime.regime_detector.assess(_regime_prices(runtime))
     runtime.current_regime_assessment = regime_assessment
@@ -2436,6 +2533,16 @@ def _apply_signal_pipeline(
         effective_max_inventory_usd=effective_max_inventory_usd,
         size_usd=decision.size_usd,
     )
+    force_trade_active = bool(decision.filter_values.get("force_trade_active")) or _force_trade_due(runtime, cycle_index)
+    inventory_emergency_override = bool(decision.filter_values.get("inventory_emergency_override")) or (
+        _inventory_emergency_override_active(runtime)
+        and decision.reason in {"inventory_rebalance", "inventory_correction", "inventory_force_reduce"}
+    )
+    decision.filter_values = _merge_filter_values(
+        decision.filter_values,
+        force_trade_active=force_trade_active,
+        inventory_emergency_override=inventory_emergency_override,
+    )
     edge_assessment = runtime.edge_filter.assess(
         signal=decision,
         context=execution_context,
@@ -2450,7 +2557,10 @@ def _apply_signal_pipeline(
         cycle_seconds=runtime.cycle_seconds,
         last_sell_price=runtime.reentry_state.last_sell_price,
         current_profit_pct=runtime.last_profit_pct,
-        min_edge_multiplier=max(runtime.current_min_edge_bps / max(RANGE_MIN_EDGE_BPS, 0.5), 0.35),
+        min_edge_bps=runtime.current_min_edge_bps,
+        min_edge_multiplier=max(abs(runtime.current_min_edge_bps) / max(abs(RANGE_MIN_EDGE_BPS), 0.5), 0.35),
+        force_trade_active=force_trade_active,
+        inventory_emergency_override=inventory_emergency_override,
     )
     edge_assessment, adaptive_edge_filter_values = soften_edge_assessment(edge_assessment, runtime.current_adaptive_plan)
     runtime.current_edge_assessment = edge_assessment
@@ -4448,6 +4558,25 @@ def _process_price_tick_with_decision_engine(
             sell_drift_block_reason = sell_drift_block_reason or blocked_reason
         inventory_drift_guard_reasons.append(blocked_reason)
 
+    inventory_emergency_candidate = _build_inventory_emergency_candidate(
+        runtime,
+        strategy_mid=strategy_mid,
+        strategy_sell_price=strategy_sell_price,
+        trade_size_usd=trade_size_usd,
+        base_trade_size_usd=base_trade_size_usd,
+        available_quote_usd=available_quote_usd,
+        inventory_profile=inventory_profile,
+        sell_state_allowed=sell_state_allowed,
+        buy_state_allowed=buy_state_allowed,
+        in_cooldown=in_cooldown,
+        min_notional_usd=min_notional_usd,
+        default_buy_inventory_cap=default_buy_inventory_cap,
+        reentry_buy_inventory_cap=reentry_buy_inventory_cap,
+        min_sell_price=min_sell_price,
+    )
+    if inventory_emergency_candidate is not None:
+        inventory_candidate = inventory_emergency_candidate
+
     force_trade_candidate = None
     if (
         _intelligence_active_regime(intelligence) != "NO_TRADE"
@@ -4515,6 +4644,8 @@ def _process_price_tick_with_decision_engine(
             block_reason=blocked_reason,
             filter_values={"inventory_drift_guard_active": True},
         )
+    elif inventory_candidate is not None and bool(inventory_candidate.filter_values.get("inventory_emergency_override")):
+        decision = inventory_candidate
     else:
         decision = runtime.decision_engine.decide(
             cycle_index=cycle_index,
