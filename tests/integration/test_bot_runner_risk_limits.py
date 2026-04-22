@@ -95,7 +95,9 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
             start_eth_usd=0.0,
             enable_trade_filter=False,
             enable_execution_engine=False,
+            enable_inventory_manager=False,
             telegram_notifier=notifier,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -115,6 +117,7 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
             patch("sizing_engine.MAX_TRADE_SIZE_PCT", 0.04),
             patch("runtime_risk.MAX_DAILY_LOSS_USD", 500.0),
             patch("runtime_risk.MAX_EXPOSURE_USD", 500.0),
+            patch("bot_runner.INVENTORY_EMERGENCY_OVERRIDE_PCT", 1000.0),
         ):
             should_continue = process_price_tick(
                 runtime=runtime,
@@ -148,6 +151,7 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
             enable_trade_filter=False,
             enable_execution_engine=False,
             telegram_notifier=notifier,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.decision_engine.decide = lambda **kwargs: DecisionOutcome(
@@ -203,6 +207,7 @@ class BotRunnerRiskLimitTests(unittest.TestCase):
             enable_trade_filter=False,
             enable_execution_engine=False,
             telegram_notifier=notifier,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         trade_logger, equity_logger, temp_dir = self._make_loggers("risk_limit_exposure_case")

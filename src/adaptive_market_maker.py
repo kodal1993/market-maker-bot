@@ -99,6 +99,15 @@ def _safe_round(value: float, digits: int = 6) -> float:
     return round(float(value), digits)
 
 
+def _configured_band_half_width(lower: float, upper: float, fallback: float) -> float:
+    low = _clamp(lower, 0.0, 1.0)
+    high = _clamp(upper, 0.0, 1.0)
+    if high < low:
+        low, high = high, low
+    half_width = (high - low) / 2.0
+    return half_width if half_width > 0 else fallback
+
+
 def _mean(values: list[float]) -> float:
     if not values:
         return 0.0
@@ -1123,33 +1132,53 @@ def classify_inventory_band(
     inventory_pct = snapshot.inventory_pct
     regime_label = "RANGE" if regime is None else regime.regime
     trend_shift = 0.0 if regime is None else regime.trend_bias
+    base_center = _clamp((ADAPTIVE_INVENTORY_NEUTRAL_MIN + ADAPTIVE_INVENTORY_NEUTRAL_MAX) / 2.0, 0.0, 1.0)
+    neutral_half = _configured_band_half_width(
+        ADAPTIVE_INVENTORY_NEUTRAL_MIN,
+        ADAPTIVE_INVENTORY_NEUTRAL_MAX,
+        0.04,
+    )
+    soft_half = max(
+        _configured_band_half_width(
+            ADAPTIVE_INVENTORY_SOFT_MIN,
+            ADAPTIVE_INVENTORY_SOFT_MAX,
+            0.08,
+        ),
+        neutral_half + 0.01,
+    )
+    strong_half = max(
+        _configured_band_half_width(
+            ADAPTIVE_INVENTORY_STRONG_MIN,
+            ADAPTIVE_INVENTORY_STRONG_MAX,
+            0.12,
+        ),
+        soft_half + 0.01,
+    )
+    hard_half = max(
+        _configured_band_half_width(
+            ADAPTIVE_INVENTORY_HARD_MIN,
+            ADAPTIVE_INVENTORY_HARD_MAX,
+            0.17,
+        ),
+        strong_half + 0.01,
+    )
+    trend_shift_budget = min(strong_half * 0.75, 0.12)
+
     if regime_label == "RANGE":
-        center = 0.50
-        neutral_half = 0.04
-        soft_half = 0.08
-        strong_half = 0.12
-        hard_half = 0.17
+        center = base_center
         recovery_mode = abs(inventory_pct - center) >= neutral_half
     elif regime_label == "TREND_UP":
-        center = _clamp(0.50 + max(trend_shift, 0.0) * 0.08, 0.50, 0.62)
-        neutral_half = 0.06
-        soft_half = 0.11
-        strong_half = 0.16
-        hard_half = 0.21
+        center = _clamp(base_center + max(trend_shift, 0.0) * trend_shift_budget, base_center, 0.68)
         recovery_mode = inventory_pct > center + neutral_half
     elif regime_label == "TREND_DOWN":
-        center = _clamp(0.50 + min(trend_shift, 0.0) * 0.08, 0.38, 0.50)
-        neutral_half = 0.06
-        soft_half = 0.11
-        strong_half = 0.16
-        hard_half = 0.21
+        center = _clamp(base_center + min(trend_shift, 0.0) * trend_shift_budget, 0.32, base_center)
         recovery_mode = inventory_pct < center - neutral_half or inventory_pct > center + neutral_half
     else:
-        center = 0.50
-        neutral_half = 0.03
-        soft_half = 0.06
-        strong_half = 0.10
-        hard_half = 0.14
+        center = base_center
+        neutral_half *= 0.80
+        soft_half *= 0.80
+        strong_half *= 0.80
+        hard_half *= 0.80
         recovery_mode = True
 
     lower_neutral = _clamp(center - neutral_half, 0.0, 1.0)
@@ -1380,6 +1409,7 @@ def govern_risk(
         or (snapshot.source_health_score < 0.85 and snapshot.queue_latency_quality < 0.45)
     )
     pnl_deterioration = _recent_negative_pnl_deterioration(runtime, cycle_index)
+    inventory_hard_breach = inventory_band.zone == "hard_breach"
     severe_illiquidity = (
         snapshot.spread_bps >= ADAPTIVE_REGIME_ILLIQUID_SPREAD_BPS * 2.0
         or snapshot.liquidity_estimate_usd <= ADAPTIVE_RISK_KILL_LIQUIDITY_USD
@@ -1393,8 +1423,6 @@ def govern_risk(
         reasons.append("invalid_market_data")
     if extreme_toxic_cluster:
         reasons.append("toxic_cluster_extreme")
-    if inventory_band.zone == "hard_breach":
-        reasons.append("inventory_hard_cap_breach")
     if severe_illiquidity and snapshot.spread_instability >= 0.40:
         reasons.append("spread_quality_collapsed")
     if snapshot.rolling_drawdown_pct >= ADAPTIVE_RISK_KILL_DRAWDOWN_PCT:
@@ -1411,6 +1439,13 @@ def govern_risk(
         quote_enabled = False
         buy_enabled = False
         sell_enabled = False
+    elif inventory_hard_breach:
+        stage = 3
+        state = "inventory_rebalance"
+        size_multiplier = 0.58
+        spread_multiplier = 1.16
+        inventory_cap_multiplier = 0.72
+        reasons.append("inventory_hard_cap_breach")
     elif (
         toxic_clustered
         or drawdown_acceleration >= ADAPTIVE_RISK_HARD_DRAWDOWN_ACCEL_PCT

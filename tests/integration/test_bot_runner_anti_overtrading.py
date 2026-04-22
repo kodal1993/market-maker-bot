@@ -73,6 +73,8 @@ class BotRunnerAntiOvertradingTests(unittest.TestCase):
             reference_price=100.0,
             start_eth_usd=0.0,
             enable_execution_engine=False,
+            enable_inventory_manager=False,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.last_trade_cycle_any = 29
@@ -86,6 +88,7 @@ class BotRunnerAntiOvertradingTests(unittest.TestCase):
             patch("trade_filter.MIN_TIME_BETWEEN_TRADES_MINUTES", 10.0),
             patch("trade_filter.MAX_TRADES_PER_DAY", 20),
             patch("runtime_risk.MAX_TRADES_PER_DAY", 20),
+            patch("bot_runner.INVENTORY_EMERGENCY_OVERRIDE_PCT", 1000.0),
             patch("bot_runner.should_place_trend_buy", return_value=True),
         ):
             self.assertTrue(
@@ -118,6 +121,8 @@ class BotRunnerAntiOvertradingTests(unittest.TestCase):
             reference_price=100.0,
             start_eth_usd=0.0,
             enable_execution_engine=False,
+            enable_inventory_manager=False,
+            adaptive_flags={"enabled": False},
         )
         runtime.intelligence.build_snapshot = lambda **kwargs: build_snapshot()
         runtime.last_trade_cycle_any = 1
@@ -131,6 +136,7 @@ class BotRunnerAntiOvertradingTests(unittest.TestCase):
             patch("trade_filter.MIN_TIME_BETWEEN_TRADES_MINUTES", 0.0),
             patch("trade_filter.MAX_TRADES_PER_DAY", 1),
             patch("runtime_risk.MAX_TRADES_PER_DAY", 1),
+            patch("bot_runner.INVENTORY_EMERGENCY_OVERRIDE_PCT", 1000.0),
             patch("bot_runner.should_place_trend_buy", return_value=True),
         ):
             self.assertTrue(

@@ -375,6 +375,72 @@ class AdaptiveRegimeAwareTests(unittest.TestCase):
         self.assertEqual(band.zone, "hard_breach")
         self.assertEqual(band.rebalance_side, "sell")
 
+    def test_inventory_band_respects_configured_band_widths(self) -> None:
+        snapshot = make_snapshot(inventory_pct=0.61, inventory_deviation_pct=11.0)
+        regime = AdaptiveRegimeAssessment("RANGE", 0.66, {"RANGE": 66.0, "TREND_UP": 18.0, "TREND_DOWN": 10.0, "CHAOS": 6.0}, reason=["volatility_contained"], trend_bias=0.0)
+
+        with (
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_NEUTRAL_MIN", 0.49),
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_NEUTRAL_MAX", 0.51),
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_SOFT_MIN", 0.46),
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_SOFT_MAX", 0.54),
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_STRONG_MIN", 0.43),
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_STRONG_MAX", 0.57),
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_HARD_MIN", 0.41),
+            patch("adaptive_market_maker.ADAPTIVE_INVENTORY_HARD_MAX", 0.59),
+        ):
+            band = classify_inventory_band(snapshot, regime)
+
+        self.assertEqual(band.zone, "hard_breach")
+        self.assertEqual(band.rebalance_side, "sell")
+
+    def test_hard_inventory_breach_switches_to_rebalance_only_instead_of_hard_pause(self) -> None:
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 40,
+            reference_price=100.0,
+            start_usdc=40.0,
+            start_eth=0.8,
+            start_eth_usd=0.0,
+            adaptive_flags=adaptive_flags("ULTRA_AGGRESSIVE_PAPER"),
+        )
+        snapshot = make_snapshot(
+            inventory_pct=0.71,
+            inventory_deviation_pct=21.0,
+            rolling_drawdown_pct=0.01,
+            toxic_fill_ratio=0.10,
+            adverse_fill_ratio=0.08,
+        )
+        regime = AdaptiveRegimeAssessment("RANGE", 0.74, {"RANGE": 74.0, "TREND_UP": 12.0, "TREND_DOWN": 8.0, "CHAOS": 6.0}, reason=["sign_flips_support_range"], trend_bias=0.0)
+        edge = AdaptiveEdgeAssessment(18.0, {"expected_spread_capture": 14.0}, {}, "weak_positive", "CAUTIOUS", [])
+        inventory_band = classify_inventory_band(snapshot, regime)
+
+        risk = govern_risk(
+            runtime,
+            cycle_index=40,
+            snapshot=snapshot,
+            fill_quality=FillQualitySnapshot(fill_count=4, adverse_fill_ratio=0.08, toxic_fill_ratio=0.10),
+            regime=regime,
+            edge=edge,
+            inventory_band=inventory_band,
+        )
+        mode = select_mode(
+            snapshot,
+            regime,
+            edge,
+            inventory_band,
+            PerformanceAdaptationState(0, 0.0, 0.01, 0.10, 0.0, 1.0, 1.0, 1.0, 1.0),
+            risk,
+            ActivityFloorState("disabled", 0, 0.0, 0.0),
+            SimpleNamespace(buy_enabled=True, sell_enabled=True),
+            profile="ULTRA_AGGRESSIVE_PAPER",
+        )
+
+        self.assertEqual(inventory_band.zone, "hard_breach")
+        self.assertEqual(risk.state, "inventory_rebalance")
+        self.assertEqual(risk.stage, 3)
+        self.assertEqual(mode.mode, "rebalance_only")
+        self.assertEqual(mode.reason, "inventory_hard_breach")
+
     def test_ultra_profile_keeps_low_edge_range_in_defensive_trading_instead_of_standby(self) -> None:
         snapshot = make_snapshot(
             short_return_bps=1.0,
