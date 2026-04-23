@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
@@ -377,6 +378,48 @@ class RegimeEdgeGateTests(unittest.TestCase):
 
         self.assertFalse(assessment.edge_pass)
         self.assertEqual(assessment.edge_reject_reason, "reentry_low_pullback")
+
+    def test_range_sell_with_zero_window_mean_does_not_create_huge_edge(self) -> None:
+        edge_filter = EdgeFilter()
+        regime = replace(build_regime("RANGE"), window_mean=0.0)
+
+        assessment = edge_filter.assess(
+            signal=DecisionOutcome(
+                action="SELL",
+                size_usd=10.0,
+                reason="force_trade_sell",
+                source="activity_floor",
+                order_price=2334.0,
+            ),
+            context=ExecutionContext(
+                pair="WETH/USDC",
+                router="uniswap_v3",
+                mid_price=2334.0,
+                quote_bid=2333.5,
+                quote_ask=2334.5,
+                router_price=2334.0,
+                backup_price=2334.0,
+                onchain_ref_price=2334.0,
+                twap_price=2334.0,
+                spread_bps=4.0,
+                volatility=0.001,
+                liquidity_usd=1_000_000.0,
+                gas_price_gwei=3.0,
+                market_mode="RANGE",
+            ),
+            regime_assessment=regime,
+            inventory_usd=250.0,
+            target_base_usd=250.0,
+            consecutive_losses=0,
+            last_loss_cycle=None,
+            last_loss_reason="",
+            cycle_index=10,
+            cycle_seconds=60.0,
+            last_sell_price=None,
+            current_profit_pct=None,
+        )
+
+        self.assertLess(abs(assessment.expected_edge_bps), 1_000.0)
 
     def test_edge_filter_applies_inventory_soft_limit_penalty_and_bonus(self) -> None:
         edge_filter = EdgeFilter()

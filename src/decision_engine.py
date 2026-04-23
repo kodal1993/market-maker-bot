@@ -14,6 +14,7 @@ class _DecisionCandidate:
     source: str
     order_price: float
     inventory_cap_usd: float
+    filter_values: dict[str, object]
 
 
 class DecisionEngine:
@@ -43,6 +44,7 @@ class DecisionEngine:
             source=candidate.source,
             order_price=candidate.order_price,
             inventory_cap_usd=candidate.inventory_cap_usd,
+            filter_values=dict(candidate.filter_values),
         )
 
     def _candidate_tag(self, candidate: _DecisionCandidate | None) -> str:
@@ -84,6 +86,7 @@ class DecisionEngine:
             source=candidate.source,
             order_price=candidate.order_price,
             inventory_cap_usd=candidate.inventory_cap_usd,
+            filter_values=dict(candidate.filter_values),
         )
 
     def _evaluate_trade_filter(
@@ -308,7 +311,13 @@ class DecisionEngine:
             fill_quality_tier=fill_quality_tier,
             cooldown_multiplier=cooldown_multiplier,
         )
-        filter_values = {} if filter_result is None else dict(filter_result.filter_values)
+        filter_values = dict(selected.filter_values)
+        if filter_result is not None:
+            filter_values.update(dict(filter_result.filter_values))
+        if selected.filter_values.get("force_trade_active"):
+            filter_values["force_trade_active"] = True
+        if selected.filter_values.get("activity_floor_force"):
+            filter_values["activity_floor_force"] = True
         if filter_result is not None and filter_result.size_multiplier > 0:
             adjusted_size_usd = selected.size_usd * filter_result.size_multiplier
             filter_values["pre_filter_size_usd"] = round(selected.size_usd, 6)
@@ -320,6 +329,7 @@ class DecisionEngine:
                 source=selected.source,
                 order_price=selected.order_price,
                 inventory_cap_usd=selected.inventory_cap_usd,
+                filter_values=dict(selected.filter_values),
             )
         if 0.0 < selected.size_usd < MIN_ORDER_SIZE_USD and filter_result is not None and filter_result.allow_trade:
             filter_values["size_clamped_to_min"] = True
@@ -331,6 +341,7 @@ class DecisionEngine:
                 source=selected.source,
                 order_price=selected.order_price,
                 inventory_cap_usd=selected.inventory_cap_usd,
+                filter_values=dict(selected.filter_values),
             )
         if selected.size_usd < MIN_ORDER_SIZE_USD:
             return DecisionOutcome(

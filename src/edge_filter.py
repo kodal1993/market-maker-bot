@@ -180,7 +180,7 @@ class EdgeFilter:
             return 0.0
 
         if regime_assessment.execution_regime == "RANGE":
-            target = max(regime_assessment.window_mean, 1e-9)
+            target = regime_assessment.window_mean if regime_assessment.window_mean > 0 else current_price
             return max(((current_price / target) - 1.0) * 100.0, 0.0)
         if regime_assessment.execution_regime == "TREND" and regime_assessment.trend_direction == "down":
             return max(abs(regime_assessment.net_move_pct) * 0.35, 0.10)

@@ -13,6 +13,14 @@ from trade_simulator import TradeSimulator
 from types_bot import ExecutionContext, ExecutionResult, ExecutionSignal
 
 
+PAPER_ACTIVITY_GAS_EXEMPT_KEYS = (
+    "paper_activity_override",
+    "activity_floor_force",
+    "force_trade_active",
+    "inventory_emergency_override",
+)
+
+
 class ExecutionRouter:
     def __init__(
         self,
@@ -44,6 +52,22 @@ class ExecutionRouter:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _metadata_bool(metadata: dict[str, object], key: str) -> bool:
+        raw_value = metadata.get(key)
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)):
+            return raw_value != 0
+        if isinstance(raw_value, str):
+            return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
+
+    def _paper_activity_gas_exempt(self, metadata: dict[str, object]) -> bool:
+        if not self._metadata_bool(metadata, "paper_mode"):
+            return False
+        return any(self._metadata_bool(metadata, key) for key in PAPER_ACTIVITY_GAS_EXEMPT_KEYS)
+
     def _gas_guard_metrics(
         self,
         signal: ExecutionSignal,
@@ -73,6 +97,8 @@ class ExecutionRouter:
             metrics["expected_profit_usd"] = round(expected_profit_usd, 6)
         if gas_to_profit_ratio is not None:
             metrics["gas_to_profit_ratio"] = round(gas_to_profit_ratio, 6)
+        if self._paper_activity_gas_exempt(metadata):
+            metrics["paper_activity_gas_exempt"] = True
         return metrics
 
     def _gas_guard_block_reason(
@@ -83,6 +109,10 @@ class ExecutionRouter:
     ) -> str:
         if context.gas_price_gwei > policy.max_gas_spike_gwei:
             return "gas_spike_skip"
+
+        if bool(metrics.get("paper_activity_gas_exempt")):
+            metrics["gas_profit_guard_bypassed"] = True
+            return ""
 
         expected_profit_usd = self._metadata_float(metrics, "expected_profit_usd")
         gas_to_profit_ratio = self._metadata_float(metrics, "gas_to_profit_ratio")
@@ -257,6 +287,7 @@ class ExecutionRouter:
             )
 
         gas_guard_block_reason = self._gas_guard_block_reason(enriched_context, policy, gas_guard_metrics)
+        base_metadata = {"policy_profile": policy.profile, **gas_guard_metrics}
         if gas_guard_block_reason:
             return self._skip_result(
                 signal,

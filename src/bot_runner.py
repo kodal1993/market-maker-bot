@@ -2446,8 +2446,12 @@ def _apply_price_multiplier(action: str, order_price: float, mid: float, spread_
     distance = abs(order_price - mid)
     adjusted_distance = distance * max(spread_multiplier, 0.20)
     if action == "BUY":
+        if order_price >= mid:
+            return mid
         return min(mid, max(mid - adjusted_distance, 0.0))
     if action == "SELL":
+        if order_price <= mid:
+            return mid
         return max(mid, mid + adjusted_distance)
     return order_price
 
@@ -2597,6 +2601,7 @@ def _apply_signal_pipeline(
         and runtime.current_execution_bucket_count > 0
         and runtime.last_trade_execution_bucket == runtime.current_execution_bucket_count
         and decision.reason not in FORCED_SELL_REASONS
+        and not decision.reason.startswith("force_trade_")
     ):
         gate_decision = SignalGateDecision(
             allow_trade=False,
@@ -2843,6 +2848,18 @@ def _build_execution_signal_metadata(
     extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
     metadata = dict(extra or {})
+    metadata["paper_mode"] = _paper_mode_enabled()
+    metadata["paper_activity_override"] = bool(getattr(runtime, "current_paper_activity_override", False))
+    metadata["activity_floor_state"] = str(getattr(runtime, "current_activity_floor_state", "") or "")
+    metadata["activity_floor_force"] = (
+        bool(metadata["paper_activity_override"])
+        and trade_reason.startswith("force_trade_")
+    )
+    metadata["force_trade_active"] = trade_reason.startswith("force_trade_")
+    metadata["inventory_emergency_override"] = (
+        _inventory_emergency_override_active(runtime)
+        and trade_reason in {"inventory_rebalance", "inventory_correction", "inventory_force_reduce"}
+    )
     if size_usd <= 0:
         return metadata
 
@@ -3232,7 +3249,7 @@ def _execute_sell_chunks(
         last_fill = fill
         realized_pnl_before = runtime.portfolio.realized_pnl_usd
 
-        if len(chunk_sizes) > 1:
+        if len(chunk_sizes) > 1 and fill.filled and chunk_index < len(chunk_sizes):
             _notify_chunk_exit(
                 runtime,
                 event="chunk_exit_progress",
@@ -3369,6 +3386,170 @@ def _build_force_trade_candidate(
         in_cooldown,
         base_trade_size_usd,
     )
+
+
+def _build_activity_floor_candidate(
+    runtime: BotRuntime,
+    *,
+    cycle_index: int,
+    mid: float,
+    inventory_usd: float,
+    effective_max_inventory_usd: float,
+    available_quote_usd: float,
+    buy_state_allowed: bool,
+    sell_state_allowed: bool,
+    state_requires_reentry_only: bool,
+    in_cooldown: bool,
+    min_notional_usd: float,
+    default_buy_inventory_cap: float,
+    reentry_buy_inventory_cap: float,
+) -> DecisionOutcome | None:
+    if (
+        not _paper_mode_enabled()
+        or mid <= 0
+        or in_cooldown
+        or min_notional_usd <= 0
+        or not bool(getattr(runtime, "current_quote_enabled", True))
+        or str(getattr(runtime, "current_strategy_mode", "")).upper() == "NO_TRADE"
+        or int(getattr(runtime, "current_defensive_stage", 0) or 0) >= 4
+    ):
+        return None
+
+    activity_state = str(
+        getattr(runtime, "current_activity_floor_state", "")
+        or getattr(runtime, "current_activity_state", "")
+    ).strip().lower()
+    activity_override = bool(getattr(runtime, "current_paper_activity_override", False))
+    inactivity_fallback = bool(getattr(runtime, "current_inactivity_fallback_active", False))
+    if not (
+        activity_state in {"tighten_quotes", "filters_relaxed", "inactivity_fallback", "freeze_recovery"}
+        or inactivity_fallback
+        or _force_trade_due(runtime, cycle_index)
+    ):
+        return None
+    if not (activity_override or inactivity_fallback or _force_trade_due(runtime, cycle_index)):
+        return None
+
+    sizing = _current_sizing(runtime)
+    base_size_usd = max(sizing.force_trade_size_usd, min_notional_usd)
+    force_size_usd = min(base_size_usd, max(sizing.max_trade_size_usd, base_size_usd))
+    if force_size_usd < min_notional_usd:
+        return None
+
+    target_base_usd = max(sizing.target_base_usd, 0.0)
+    target_tolerance_usd = max(min_notional_usd * 0.50, sizing.reference_equity_usd * 0.006)
+    inventory_delta_usd = inventory_usd - target_base_usd
+    tradable_eth_usd = max(runtime.portfolio.eth - runtime.engine.min_eth_reserve, 0.0) * mid
+    sellable_eth_usd = max(tradable_eth_usd - sizing.base_reserve_usd, 0.0)
+    paper_activity_buy_cap_usd = max(
+        effective_max_inventory_usd,
+        target_base_usd,
+        inventory_usd + force_size_usd,
+    )
+    buy_room_usd = min(
+        max(paper_activity_buy_cap_usd - inventory_usd, 0.0),
+        max(available_quote_usd, 0.0),
+    )
+
+    can_buy = (
+        (buy_state_allowed or state_requires_reentry_only or runtime.state_context.current_state == StrategyState.ACCUMULATING)
+        and buy_room_usd >= min_notional_usd
+        and not getattr(runtime, "risk_stop_active", False)
+    )
+    can_sell = sell_state_allowed and sellable_eth_usd >= min_notional_usd
+
+    preferred_side = "buy"
+    if inventory_delta_usd > target_tolerance_usd:
+        preferred_side = "sell"
+    elif inventory_delta_usd < -target_tolerance_usd:
+        preferred_side = "buy"
+    elif runtime.last_fill_side == "sell":
+        preferred_side = "buy"
+    elif runtime.last_fill_side == "buy":
+        preferred_side = "sell"
+    elif runtime.state_context.current_state == StrategyState.ACCUMULATING:
+        preferred_side = "sell"
+    elif cycle_index % 2:
+        preferred_side = "sell"
+
+    filter_values = {
+        "force_trade_active": True,
+        "activity_floor_force": True,
+        "activity_floor_state": activity_state,
+        "inventory_delta_usd": round(inventory_delta_usd, 6),
+    }
+
+    if preferred_side == "sell" and can_sell:
+        sell_size_usd = min(force_size_usd, sellable_eth_usd)
+        if sell_size_usd >= min_notional_usd:
+            return DecisionOutcome(
+                action="SELL",
+                size_usd=sell_size_usd,
+                reason="force_trade_sell",
+                source="activity_floor",
+                order_price=mid,
+                inventory_cap_usd=default_buy_inventory_cap,
+                filter_values=filter_values,
+            )
+
+    if preferred_side == "sell" and not can_sell:
+        return None
+
+    if preferred_side == "buy" and not can_buy:
+        return None
+
+    if can_buy:
+        buy_size_usd = min(force_size_usd, buy_room_usd)
+        if buy_size_usd >= min_notional_usd:
+            return DecisionOutcome(
+                action="BUY",
+                size_usd=buy_size_usd,
+                reason="force_trade_buy",
+                source="activity_floor",
+                order_price=mid,
+                inventory_cap_usd=max(reentry_buy_inventory_cap, paper_activity_buy_cap_usd),
+                filter_values=filter_values,
+            )
+
+    if can_sell:
+        sell_size_usd = min(force_size_usd, sellable_eth_usd)
+        if sell_size_usd >= min_notional_usd:
+            return DecisionOutcome(
+                action="SELL",
+                size_usd=sell_size_usd,
+                reason="force_trade_sell",
+                source="activity_floor",
+                order_price=mid,
+                inventory_cap_usd=default_buy_inventory_cap,
+                filter_values=filter_values,
+            )
+
+    return None
+
+
+def _cap_paper_activity_exit_sell_size(
+    runtime: BotRuntime,
+    *,
+    reason: str | None,
+    size_usd: float,
+    inventory_usd: float,
+    min_notional_usd: float,
+) -> float:
+    adaptive_enabled = bool(getattr(getattr(runtime, "adaptive_config", None), "enabled", False))
+    if not _paper_mode_enabled() or not adaptive_enabled or reason not in {
+        PROFIT_EXIT_SELL_REASON,
+        "profit_lock_level_1",
+        "profit_lock_level_2",
+    }:
+        return size_usd
+    sizing = _current_sizing(runtime)
+    if sizing is None:
+        return size_usd
+    target_base_usd = max(sizing.target_base_usd, 0.0)
+    excess_inventory_usd = max(inventory_usd - target_base_usd, 0.0)
+    cap_usd = max(sizing.force_trade_size_usd, min_notional_usd)
+    capped_size_usd = min(max(size_usd, 0.0), cap_usd, excess_inventory_usd)
+    return capped_size_usd if capped_size_usd >= min_notional_usd else 0.0
 
 
 def _build_profit_lock_sell_plan(
@@ -4030,6 +4211,15 @@ def _allows_opposite_side_trade(
     return risk_helpers.allows_opposite_side_trade(runtime, cycle_index, side, order_price)
 
 
+def _side_flip_exempt(decision: DecisionOutcome) -> bool:
+    if decision.action == "SELL" and decision.reason in FORCED_SELL_REASONS:
+        return True
+    if not _paper_mode_enabled() or decision.action not in {"BUY", "SELL"}:
+        return False
+    filter_values = decision.filter_values or {}
+    return decision.source == "activity_floor" or bool(filter_values.get("activity_floor_force"))
+
+
 def _cap_trend_sell_order(
     mode: str,
     sell_order,
@@ -4394,6 +4584,20 @@ def _process_price_tick_with_decision_engine(
                 runtime=runtime,
                 mid=strategy_mid,
             )
+            profit_lock_size_usd = _cap_paper_activity_exit_sell_size(
+                runtime,
+                reason=profit_lock_reason,
+                size_usd=profit_lock_size_usd,
+                inventory_usd=inventory_usd,
+                min_notional_usd=min_notional_usd,
+            )
+            profit_exit_size_usd = _cap_paper_activity_exit_sell_size(
+                runtime,
+                reason=profit_exit_reason,
+                size_usd=profit_exit_size_usd,
+                inventory_usd=inventory_usd,
+                min_notional_usd=min_notional_usd,
+            )
         if profit_lock_reason and profit_lock_size_usd >= min_notional_usd:
             strategy_sell_candidate = DecisionOutcome(
                 action="SELL",
@@ -4577,6 +4781,42 @@ def _process_price_tick_with_decision_engine(
     if inventory_emergency_candidate is not None:
         inventory_candidate = inventory_emergency_candidate
 
+    activity_floor_candidate = None
+    if (
+        strategy_buy_candidate is None
+        and strategy_sell_candidate is None
+        and reentry_candidate is None
+        and inventory_candidate is None
+        and not getattr(inventory_profile, "reduction_only", False)
+    ):
+        activity_floor_candidate = _build_activity_floor_candidate(
+            runtime,
+            cycle_index=cycle_index,
+            mid=strategy_mid,
+            inventory_usd=inventory_usd,
+            effective_max_inventory_usd=effective_max_inventory_usd,
+            available_quote_usd=available_quote_usd,
+            buy_state_allowed=buy_state_allowed,
+            sell_state_allowed=sell_state_allowed,
+            state_requires_reentry_only=state_requires_reentry_only,
+            in_cooldown=in_cooldown,
+            min_notional_usd=min_notional_usd,
+            default_buy_inventory_cap=default_buy_inventory_cap,
+            reentry_buy_inventory_cap=reentry_buy_inventory_cap,
+        )
+        if activity_floor_candidate is not None:
+            activity_floor_candidate, blocked_reason = _apply_inventory_drift_guard(runtime, activity_floor_candidate)
+            if blocked_reason:
+                if "buy" in blocked_reason:
+                    buy_drift_block_reason = buy_drift_block_reason or blocked_reason
+                else:
+                    sell_drift_block_reason = sell_drift_block_reason or blocked_reason
+                inventory_drift_guard_reasons.append(blocked_reason)
+            elif activity_floor_candidate.action == "BUY":
+                strategy_buy_candidate = activity_floor_candidate
+            elif activity_floor_candidate.action == "SELL":
+                strategy_sell_candidate = activity_floor_candidate
+
     force_trade_candidate = None
     if (
         _intelligence_active_regime(intelligence) != "NO_TRADE"
@@ -4623,7 +4863,7 @@ def _process_price_tick_with_decision_engine(
         in_cooldown=in_cooldown,
         reentry_plan=reentry_plan,
         partial_reset_reason=partial_reset_reason,
-        force_trade_candidate=force_trade_candidate,
+        force_trade_candidate=force_trade_candidate or activity_floor_candidate,
         trend_signal_allows_buy=trend_signal_allows_buy,
     )
     if buy_drift_block_reason:
@@ -4644,8 +4884,6 @@ def _process_price_tick_with_decision_engine(
             block_reason=blocked_reason,
             filter_values={"inventory_drift_guard_active": True},
         )
-    elif inventory_candidate is not None and bool(inventory_candidate.filter_values.get("inventory_emergency_override")):
-        decision = inventory_candidate
     else:
         decision = runtime.decision_engine.decide(
             cycle_index=cycle_index,
@@ -4986,7 +5224,9 @@ def _process_price_tick_with_decision_engine(
                 mode,
             ):
                 can_execute_reason = "buy_inventory_cap"
-            elif not _allows_opposite_side_trade(runtime, cycle_index, "buy", order.price):
+            elif not _side_flip_exempt(decision) and not _allows_opposite_side_trade(
+                runtime, cycle_index, "buy", order.price
+            ):
                 can_execute_reason = "side_flip_cooldown"
             else:
                 can_execute = True
@@ -4997,7 +5237,9 @@ def _process_price_tick_with_decision_engine(
                 can_execute_reason = "sell_disabled"
             elif not engine.can_place_sell(order, mode):
                 can_execute_reason = "protect_eth"
-            elif not _allows_opposite_side_trade(runtime, cycle_index, "sell", order.price):
+            elif not _side_flip_exempt(decision) and not _allows_opposite_side_trade(
+                runtime, cycle_index, "sell", order.price
+            ):
                 can_execute_reason = "side_flip_cooldown"
             else:
                 can_execute = True
@@ -5741,6 +5983,20 @@ def process_price_tick(
             runtime=runtime,
             mid=strategy_mid,
         )
+        profit_lock_size_usd = _cap_paper_activity_exit_sell_size(
+            runtime,
+            reason=profit_lock_reason,
+            size_usd=profit_lock_size_usd,
+            inventory_usd=inventory_usd,
+            min_notional_usd=min_notional_usd,
+        )
+        profit_exit_size_usd = _cap_paper_activity_exit_sell_size(
+            runtime,
+            reason=profit_exit_reason,
+            size_usd=profit_exit_size_usd,
+            inventory_usd=inventory_usd,
+            min_notional_usd=min_notional_usd,
+        )
     if profit_lock_reason and profit_lock_size_usd >= min_notional_usd:
         sell_reason = profit_lock_reason
         sell_order.price = strategy_mid
@@ -5773,18 +6029,34 @@ def process_price_tick(
 
     force_trade_candidate = None
     if buy_order.size_usd < min_notional_usd and sell_order.size_usd < min_notional_usd:
-        force_trade_candidate = _build_force_trade_candidate(
-            runtime=runtime,
+        force_trade_candidate = _build_activity_floor_candidate(
+            runtime,
             cycle_index=cycle_index,
             mid=strategy_mid,
             inventory_usd=inventory_usd,
             effective_max_inventory_usd=effective_max_inventory_usd,
+            available_quote_usd=available_quote_usd,
             buy_state_allowed=buy_state_allowed,
             sell_state_allowed=sell_state_allowed,
             state_requires_reentry_only=state_requires_reentry_only,
             in_cooldown=in_cooldown,
-            base_trade_size_usd=max(trade_size_usd, base_trade_size_usd),
+            min_notional_usd=min_notional_usd,
+            default_buy_inventory_cap=buy_inventory_cap,
+            reentry_buy_inventory_cap=_reentry_buy_inventory_cap(runtime, inventory_usd, effective_max_inventory_usd),
         )
+        if force_trade_candidate is None:
+            force_trade_candidate = _build_force_trade_candidate(
+                runtime=runtime,
+                cycle_index=cycle_index,
+                mid=strategy_mid,
+                inventory_usd=inventory_usd,
+                effective_max_inventory_usd=effective_max_inventory_usd,
+                buy_state_allowed=buy_state_allowed,
+                sell_state_allowed=sell_state_allowed,
+                state_requires_reentry_only=state_requires_reentry_only,
+                in_cooldown=in_cooldown,
+                base_trade_size_usd=max(trade_size_usd, base_trade_size_usd),
+            )
         blocked_reason = ""
         if force_trade_candidate is not None:
             blocked_reason = _inventory_drift_block_reason(
@@ -5904,6 +6176,8 @@ def process_price_tick(
         "in_cooldown": in_cooldown,
         "reentry_active": runtime.reentry_state.active,
     }
+    if force_trade_candidate is not None and force_trade_candidate.filter_values:
+        legacy_filter_values = _merge_filter_values(legacy_filter_values, **force_trade_candidate.filter_values)
     legacy_block_reason = ""
     if buy_drift_block_reason or sell_drift_block_reason:
         legacy_block_reason = buy_drift_block_reason or sell_drift_block_reason
@@ -6262,7 +6536,9 @@ def process_price_tick(
             )
         elif not engine.can_place_buy(buy_inventory_cap, mid, buy_order.size_usd, mode):
             can_execute_reason = "buy_inventory_cap"
-        elif not _allows_opposite_side_trade(runtime, cycle_index, "buy", buy_order.price):
+        elif not _side_flip_exempt(legacy_decision) and not _allows_opposite_side_trade(
+            runtime, cycle_index, "buy", buy_order.price
+        ):
             can_execute_reason = "side_flip_cooldown"
         else:
             can_execute = True
@@ -6281,7 +6557,9 @@ def process_price_tick(
             )
         elif not engine.can_place_sell(sell_order, mode):
             can_execute_reason = "protect_eth"
-        elif not _allows_opposite_side_trade(runtime, cycle_index, "sell", sell_order.price):
+        elif not _side_flip_exempt(legacy_decision) and not _allows_opposite_side_trade(
+            runtime, cycle_index, "sell", sell_order.price
+        ):
             can_execute_reason = "side_flip_cooldown"
         else:
             can_execute = True

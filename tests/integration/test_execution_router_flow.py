@@ -162,6 +162,23 @@ class ExecutionRouterIntegrationTests(unittest.TestCase):
         self.assertEqual(result.execution_mode, "skip")
         self.assertEqual(result.trade_blocked_reason, "gas_cost_exceeds_expected_profit")
 
+    def test_paper_activity_bypasses_gas_profit_ratio_guard(self) -> None:
+        result = build_router().execute_trade(
+            build_signal(
+                size_usd=100.0,
+                metadata={
+                    "expected_profit_pct": 0.005,
+                    "paper_mode": True,
+                    "paper_activity_override": True,
+                },
+            ),
+            build_context(gas_price_gwei=18.0),
+        )
+
+        self.assertTrue(result.allow_trade)
+        self.assertEqual(result.execution_mode, "guarded_public")
+        self.assertTrue(result.metadata["gas_profit_guard_bypassed"])
+
 
 if __name__ == "__main__":
     unittest.main()

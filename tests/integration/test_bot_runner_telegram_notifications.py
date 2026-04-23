@@ -300,6 +300,7 @@ class BotRunnerTelegramNotificationTests(unittest.TestCase):
 
         with (
             patch("sizing_engine.ACCOUNT_SIZE_OVERRIDE", 250.0),
+            patch("sizing_engine.MAX_POSITION_PCT", 1.0),
             patch("sizing_engine.MAX_TRADE_SIZE_PCT", 0.30),
         ):
             self.assertTrue(
@@ -320,7 +321,6 @@ class BotRunnerTelegramNotificationTests(unittest.TestCase):
             [event["event"] for event in notifier.chunk_events],
             [
                 "chunk_exit_started",
-                "chunk_exit_progress",
                 "chunk_exit_progress",
                 "chunk_exit_progress",
                 "chunk_exit_completed",
