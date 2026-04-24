@@ -20,6 +20,18 @@ Ha azt akarod, hogy a bot folyamatosan fusson, a `.env`-ben hagyd a `MAX_LOOPS=0
 
 Rovid architektura leiras: [ARCHITECTURE.md](ARCHITECTURE.md).
 
+### High-activity paper profil
+
+Ha a cel sok (de kontrollalt) paper trade, hasznalhatsz egy kiindulo profilt:
+
+- `profiles/high_activity_paper.env`
+
+Gyors hasznalat:
+
+1. Masold `profiles/high_activity_paper.env` -> `.env`
+2. Allitsd be a sajat `RPC_URL` (es opcionisan `NEWS_RSS_URLS`, `MACRO_RSS_URLS`, `ONCHAIN_RSS_URLS`) ertekeket
+3. Inditsd a botot paper modban
+
 ## Tobbjelu Intelligence Reteg
 
 A bot most mar egy tobbretegu decision engine-t hasznal a price loop tetejen. Egy ciklusban egyszerre tudja figyelembe venni:
@@ -58,6 +70,8 @@ Hasznos environment valtozok:
 - `EXECUTION_ENGINE_ENABLED`, `EXECUTION_MIN_EXPECTED_PROFIT_PCT`, `EXECUTION_TAKER_SLIPPAGE_BPS`: execution reteg, maker/taker es minimum vart profit kuszob
 - `TRADE_FILTER_ENABLED`, `MIN_TRADE_DISTANCE_PCT`, `TRADE_COOLDOWN_MINUTES`: overtrading csokkentese, trade gate es cooldown
 - `INVENTORY_MANAGER_ENABLED`, `INVENTORY_NORMAL_MIN`, `INVENTORY_UPTREND_MAX`, `INVENTORY_DOWNTREND_MIN`: ETH/USDC arany kontroll
+- `MAX_TRADES_PER_DAY` (vagy `ACTIVITY_DAILY_AGGRESSIVE_TRADE_CAP`): napi aggressziv trade plafon. Az `ACTIVITY_DAILY_MIN_TRADE_TARGET` csak cel, nem hard limit.
+- `ACTIVITY_ALIGNMENT_*`: trend + sentiment + onchain alignment boost. Ha az irany, edge es feed allapot egyszerre eros, a bot enyhen novelheti a meretet es feszesebbre veheti a spreadet.
 - `SIDE_FLIP_COOLDOWN_CYCLES`, `SIDE_FLIP_MIN_BPS`: churn csokkentese ugy, hogy side-valtas elott ido- es ar-elvalasztast kovetel
 - `TREND_BUY_MIN_MARKET_SCORE`, `TREND_BUY_MIN_SIGNAL_SCORE`, `TREND_BUY_MIN_LONG_BUFFER_BPS`, `MAX_TREND_PULLBACK_BPS`: trend-buy minoseg szigoritasa, hogy a bot erosebb pullbackeket vegyen a zajos fordulok helyett
 - `SIGNAL_CACHE_SECONDS`: kulso feedek cache ideje
