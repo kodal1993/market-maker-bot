@@ -116,8 +116,22 @@ def _market_gate_lines(summary: dict[str, object]) -> list[str]:
 def _pnl_lines(summary: dict[str, object]) -> list[str]:
     return [
         *_balance_pnl_trade_count_lines(summary),
+        f"Start equity: {_money(summary.get('starting_equity', summary.get('start_equity', 0.0)))}",
+        f"End equity: {_money(summary.get('ending_equity', summary.get('final_equity', 0.0)))}",
         f"Realizalt: {_money(summary.get('realized_pnl_usd', summary.get('realized_pnl', 0.0)))}",
         f"Nem realizalt: {_money(summary.get('unrealized_pnl', 0.0))}",
+        f"Net PnL: {_money(summary.get('net_pnl_usd', 0.0))} ({_pct(summary.get('net_pnl_pct', 0.0))})",
+        f"Avg trade PnL: {_money(summary.get('average_trade_pnl_usd', 0.0))}",
+        f"Fees: {_money(summary.get('fees_paid_usd', 0.0))} | Gas est: {_money(summary.get('estimated_gas_cost_usd', 0.0))}",
+        f"Slippage est: {_money(summary.get('estimated_slippage_cost_usd', 0.0))}",
+        f"Most common no-trade: {_plain(summary.get('most_common_no_trade_reason', 'n/a'))}",
+        f"Regime: {_plain(summary.get('active_regime', summary.get('market_regime', 'n/a')))}",
+        f"Inventory ratio: {_pct(_as_float(summary.get('inventory_ratio', 0.0)) * 100.0)}",
+        (
+            f"Target tracker: {_plain(summary.get('target_tracker_status', 'n/a'))} | "
+            f"90d proj {_pct(summary.get('projected_90d_return_pct', 0.0))} | "
+            f"annual proj {_pct(summary.get('projected_annualized_return_pct', 0.0))}"
+        ),
     ]
 
 

@@ -22,6 +22,8 @@ from config import (
     EQUITY_CSV,
     PRICE_BOOTSTRAP_ROWS,
     PRICE_HISTORY_MAX_AGE_SECONDS,
+    RUNTIME_STATE_ENABLED,
+    RUNTIME_STATE_PATH,
     SQLITE_LOG_PATH,
 )
 from csv_logger import CsvLogger
@@ -34,6 +36,7 @@ from price_history import load_bootstrap_prices
 from sqlite_logger import SqliteLogger
 from startup_validation import validate_startup_config
 from telegram_notifier import TelegramNotifier
+from state_persistence import apply_state, dump_state, load_state
 
 
 def resolve_report_paths(trades_csv: str) -> tuple[Path, Path]:
@@ -104,6 +107,7 @@ def main():
             )
 
         runtime = None
+        persisted_state = load_state(RUNTIME_STATE_PATH) if RUNTIME_STATE_ENABLED else {}
         dex = DexClient()
         manual_stop_requested = False
         log(
@@ -133,6 +137,21 @@ def main():
                         cycle_seconds=LOOP_SECONDS,
                         telegram_notifier=notifier,
                     )
+                    if persisted_state:
+                        apply_state(runtime, persisted_state)
+                        portfolio_state = persisted_state.get("portfolio", {})
+                        if isinstance(portfolio_state, dict):
+                            runtime.portfolio.usdc = float(portfolio_state.get("usdc", runtime.portfolio.usdc))
+                            runtime.portfolio.eth = float(portfolio_state.get("eth", runtime.portfolio.eth))
+                            runtime.portfolio.fees_paid_usd = float(
+                                portfolio_state.get("fees_paid_usd", runtime.portfolio.fees_paid_usd)
+                            )
+                            runtime.portfolio.realized_pnl_usd = float(
+                                portfolio_state.get("realized_pnl_usd", runtime.portfolio.realized_pnl_usd)
+                            )
+                            eth_cost_basis = portfolio_state.get("eth_cost_basis")
+                            runtime.portfolio.eth_cost_basis = None if eth_cost_basis is None else float(eth_cost_basis)
+                        log(f"Runtime state restored from {RUNTIME_STATE_PATH}")
                     log(
                         f"start portfolio resolved | ref {mid:.2f} | usdc {start_usdc:.2f} | "
                         f"eth {start_eth:.8f}"
@@ -152,6 +171,8 @@ def main():
                     log(f"Telegram daily report failed: {exc}")
                 if not should_continue:
                     break
+                if RUNTIME_STATE_ENABLED:
+                    dump_state(runtime, path=RUNTIME_STATE_PATH)
                 time.sleep(LOOP_SECONDS)
             except KeyboardInterrupt:
                 manual_stop_requested = True
@@ -174,6 +195,8 @@ def main():
             return
 
         summary = build_summary(runtime)
+        if RUNTIME_STATE_ENABLED:
+            dump_state(runtime, path=RUNTIME_STATE_PATH)
         log_summary(summary)
         report = build_report(
             summary,

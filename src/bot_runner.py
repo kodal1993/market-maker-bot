@@ -323,6 +323,7 @@ class BotRuntime:
     current_should_exit: bool = False
     current_execution_attempted: bool = False
     current_execution_success: bool = False
+    current_size_clamped_to_min: bool = False
     pipeline_logging_enabled: bool = True
     current_soft_inventory_limit_usd: float = 0.0
     current_hard_inventory_limit_usd: float = 0.0
@@ -380,6 +381,8 @@ class BotRuntime:
     maker_count: int = 0
     taker_count: int = 0
     total_slippage_bps: float = 0.0
+    total_estimated_gas_cost_usd: float = 0.0
+    total_estimated_slippage_cost_usd: float = 0.0
     loss_streak: int = 0
     last_loss_cycle: int | None = None
     last_loss_trade_reason: str = ""
@@ -496,6 +499,7 @@ class BotRuntime:
         }
     )
     rejection_reason_counts: dict[str, int] = field(default_factory=dict)
+    no_trade_reason_counts: dict[str, int] = field(default_factory=dict)
     state_counts: dict[str, int] = field(
         default_factory=lambda: {
             StrategyState.IDLE.value: 0,
@@ -1246,6 +1250,14 @@ def _record_trade_gate(
         signal_block_reason=signal_block_reason,
         trade_blocked_reason=trade_blocked_reason,
     )
+    if filter_values and bool(filter_values.get("size_clamped_to_min", False)):
+        normalized_filter_values["size_clamped_to_min"] = True
+    adjustment_reasons = normalized_filter_values.get("adjustment_reasons")
+    if isinstance(adjustment_reasons, list) and any(
+        reason in {"max_trades_soft_limit", "min_time_between_trades_soft"} for reason in adjustment_reasons
+    ):
+        normalized_filter_values["size_clamped_to_min"] = True
+    normalized_filter_values["size_clamped_to_min"] = bool(normalized_filter_values.get("size_clamped_to_min", False))
     runtime.last_allow_trade = allow_trade
     runtime.current_signal_block_reason = signal_block_reason
     runtime.last_decision_block_reason = block_reason
@@ -1295,6 +1307,7 @@ def _reset_execution_debug_state(runtime: BotRuntime) -> None:
     runtime.current_should_exit = False
     runtime.current_execution_attempted = False
     runtime.current_execution_success = False
+    runtime.current_size_clamped_to_min = False
 
 
 def _set_execution_debug_state(
@@ -1649,6 +1662,7 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
         "raw_signal": runtime.last_raw_signal,
         "quote_decision": runtime.current_quote_decision,
         "quote_spread_bps": round(runtime.current_quote_spread_bps, 6),
+        "size_clamped_to_min": runtime.current_size_clamped_to_min,
         "quote_size_usd": round(runtime.current_quote_size_usd, 6),
         "quote_skew_multiplier": round(runtime.current_quote_skew_multiplier, 6),
         "trade_blocked_reason": trade_blocked_reason,
@@ -1960,6 +1974,36 @@ def _record_cycle_summary(
     spread_bps: float,
     block_reason: str,
 ) -> None:
+    def _normalize_no_trade_reason(reason: str) -> str:
+        token = (reason or "").strip().lower()
+        if not token:
+            return "no_signal"
+        mapping = {
+            "cooldown": "cooldown_active",
+            "edge": "low_edge",
+            "expected_profit": "negative_expected_profit",
+            "spread": "spread_too_wide",
+            "high_vol": "volatility_too_high",
+            "low_vol": "volatility_too_low",
+            "chop": "chop_range_filter",
+            "trend": "trend_filter",
+            "rsi": "rsi_filter",
+            "inventory": "inventory_limit",
+            "exposure": "max_exposure_reached",
+            "daily_loss": "daily_loss_limit",
+            "drawdown": "drawdown_protection",
+            "macro": "news_macro_onchain_risk_block",
+            "onchain": "news_macro_onchain_risk_block",
+            "execution": "execution_cost_too_high",
+            "min_order": "minimum_order_size_not_met",
+            "state": "state_machine_blocked",
+            "warmup": "warmup_active",
+        }
+        for key, label in mapping.items():
+            if key in token:
+                return label
+        return token.replace(" ", "_")
+
     runtime.summary_window_cycles += 1
     runtime.summary_window_spread_total += max(spread_bps, 0.0)
     if runtime.current_quote_enabled:
@@ -1976,8 +2020,12 @@ def _record_cycle_summary(
         or ""
     )
     if normalized_block_reason:
+        normalized_no_trade_reason = _normalize_no_trade_reason(normalized_block_reason)
         runtime.summary_window_block_reasons[normalized_block_reason] = (
             runtime.summary_window_block_reasons.get(normalized_block_reason, 0) + 1
+        )
+        runtime.no_trade_reason_counts[normalized_no_trade_reason] = (
+            runtime.no_trade_reason_counts.get(normalized_no_trade_reason, 0) + 1
         )
     _record_adaptive_cycle_history(runtime, cycle_index, normalized_block_reason)
 
@@ -4039,6 +4087,9 @@ def _record_fill(
         },
     )
     runtime.total_slippage_bps += fill.slippage_bps
+    execution_metadata = runtime.last_execution_metadata if isinstance(runtime.last_execution_metadata, dict) else {}
+    runtime.total_estimated_gas_cost_usd += float(execution_metadata.get("estimated_gas_cost_usd", 0.0) or 0.0)
+    runtime.total_estimated_slippage_cost_usd += max(fill.size_usd, 0.0) * max(fill.slippage_bps, 0.0) / 10_000.0
     if fill.execution_type == "taker":
         runtime.taker_count += 1
     else:
@@ -6281,6 +6332,7 @@ def process_price_tick(
     ) if runtime.enable_trade_filter else None
     selected_filter_result = None
     selected_filter_values = dict(legacy_decision.filter_values)
+    selected_filter_values["size_clamped_to_min"] = bool(selected_filter_values.get("size_clamped_to_min", False))
     if legacy_decision.action == "BUY":
         selected_filter_result = buy_filter_result
     elif legacy_decision.action == "SELL":
@@ -6288,6 +6340,12 @@ def process_price_tick(
 
     if selected_filter_result is not None:
         selected_filter_values = _merge_filter_values(selected_filter_values, **selected_filter_result.filter_values)
+        selected_filter_values["size_clamped_to_min"] = bool(selected_filter_values.get("size_clamped_to_min", False))
+        adjustment_reasons = selected_filter_result.filter_values.get("adjustment_reasons")
+        if isinstance(adjustment_reasons, list) and any(
+            reason in {"max_trades_soft_limit", "min_time_between_trades_soft"} for reason in adjustment_reasons
+        ):
+            selected_filter_values["size_clamped_to_min"] = True
         if selected_filter_result.filter_values.get("daily_trade_limit_hit"):
             log(
                 "Trade filter daily cap active | "
@@ -6315,6 +6373,7 @@ def process_price_tick(
         and buy_filter_result.allow_trade
         and 0.0 < buy_order.size_usd < min_notional_usd
     ):
+        runtime.current_size_clamped_to_min = True
         selected_filter_values["size_clamped_to_min"] = True
         selected_filter_values["pre_clamp_size_usd"] = round(buy_order.size_usd, 6)
         buy_order.size_usd = min_notional_usd
@@ -6324,6 +6383,7 @@ def process_price_tick(
         and sell_filter_result.allow_trade
         and 0.0 < sell_order.size_usd < min_notional_usd
     ):
+        runtime.current_size_clamped_to_min = True
         selected_filter_values["size_clamped_to_min"] = True
         selected_filter_values["pre_clamp_size_usd"] = round(sell_order.size_usd, 6)
         sell_order.size_usd = min_notional_usd
@@ -6909,6 +6969,24 @@ def build_summary(runtime: BotRuntime) -> dict:
     edge = runtime.current_edge_assessment
     gate = runtime.current_signal_gate_decision
     trade_count = performance_summary["trade_count"]
+    starting_equity = float(performance_summary.get("start_equity", 0.0) or 0.0)
+    final_equity = float(performance_summary.get("final_equity", 0.0) or 0.0)
+    gross_pnl = float(performance_summary.get("final_pnl", performance_summary.get("total_pnl", 0.0)) or 0.0)
+    total_fees = float(runtime.portfolio.fees_paid_usd)
+    total_gas = float(runtime.total_estimated_gas_cost_usd)
+    total_slippage_cost = float(runtime.total_estimated_slippage_cost_usd)
+    net_pnl = gross_pnl - total_fees - total_gas - total_slippage_cost
+    days_running = max(total_cycles * runtime.cycle_seconds / 86400.0, 0.0)
+    current_return_pct = (net_pnl / starting_equity) * 100.0 if starting_equity > 0 else 0.0
+    projected_90d_return_pct = (current_return_pct / days_running) * 90.0 if days_running > 0 else 0.0
+    projected_annualized_return_pct = (current_return_pct / days_running) * 365.0 if days_running > 0 else 0.0
+    target_status = "ON_TRACK"
+    if runtime.current_drawdown_pct >= 0.10 or projected_90d_return_pct < 2.0:
+        target_status = "FAILING"
+    elif runtime.current_drawdown_pct >= 0.05 or projected_90d_return_pct < 1.0:
+        target_status = "CAUTION"
+    most_common_no_trade_reason = max(runtime.no_trade_reason_counts, key=runtime.no_trade_reason_counts.get, default="")
+    average_trade_pnl = (net_pnl / trade_count) if trade_count else 0.0
 
     def _ratio(count: float) -> float:
         if total_cycles <= 0:
@@ -7049,6 +7127,22 @@ def build_summary(runtime: BotRuntime) -> dict:
         "consecutive_losses": runtime.loss_streak,
         "loss_pause_remaining": runtime.loss_pause_remaining_minutes,
         "equity": performance_summary["final_equity"],
+        "starting_equity": starting_equity,
+        "ending_equity": final_equity,
+        "gross_pnl_usd": gross_pnl,
+        "estimated_gas_cost_usd": total_gas,
+        "estimated_slippage_cost_usd": total_slippage_cost,
+        "net_pnl_usd": net_pnl,
+        "net_pnl_pct": (net_pnl / starting_equity * 100.0) if starting_equity else 0.0,
+        "average_trade_pnl_usd": average_trade_pnl,
+        "inventory_ratio": (runtime.portfolio.inventory_usd(final_mid) / final_equity) if final_equity > 0 and final_mid > 0 else 0.0,
+        "most_common_no_trade_reason": most_common_no_trade_reason or "n/a",
+        "no_trade_reason_counts": dict(runtime.no_trade_reason_counts),
+        "days_running": days_running,
+        "current_return_since_start_pct": current_return_pct,
+        "projected_90d_return_pct": projected_90d_return_pct,
+        "projected_annualized_return_pct": projected_annualized_return_pct,
+        "target_tracker_status": target_status,
         "execution_timeframe_seconds": runtime.execution_timeframe_seconds,
         "trend_timeframe_seconds": runtime.trend_timeframe_seconds,
         "confirmation_timeframe_seconds": runtime.confirmation_timeframe_seconds,
@@ -7100,6 +7194,12 @@ def log_summary(summary: dict) -> None:
     log(f"SELL count: {summary['sell_count']}")
     log(f"NO_TRADE ratio: {summary['no_trade_ratio']:.2%}")
     log(f"Fees paid: {summary['fees_paid_usd']:.4f}")
+    log(
+        "Net PnL details: "
+        f"gross {summary.get('gross_pnl_usd', 0.0):.4f} | fees {summary.get('fees_paid_usd', 0.0):.4f} | "
+        f"gas {summary.get('estimated_gas_cost_usd', 0.0):.4f} | slippage {summary.get('estimated_slippage_cost_usd', 0.0):.4f} | "
+        f"net {summary.get('net_pnl_usd', 0.0):.4f} ({summary.get('net_pnl_pct', 0.0):.2f}%)"
+    )
     log_performance_summary(summary, log)
     log(f"Inventory min: {summary['inventory_min']:.2f}")
     log(f"Inventory max: {summary['inventory_max']:.2f}")
@@ -7123,6 +7223,14 @@ def log_summary(summary: dict) -> None:
         f"{summary['inventory_drift_max_pct']:.2f}%"
     )
     log(f"Rejection stats: {summary['rejection_reason_stats']}")
+    log(f"No-trade stats: {summary.get('no_trade_reason_counts', {})}")
+    log(
+        "Target tracker: "
+        f"status {summary.get('target_tracker_status', 'n/a')} | days {summary.get('days_running', 0.0):.2f} | "
+        f"current_return {summary.get('current_return_since_start_pct', 0.0):.2f}% | "
+        f"proj_90d {summary.get('projected_90d_return_pct', 0.0):.2f}% | "
+        f"proj_year {summary.get('projected_annualized_return_pct', 0.0):.2f}%"
+    )
     log(f"Feed states: {summary['feed_state_counts']}")
     log(
         f"Current MM state: mode {summary['mm_mode']} | strategy {summary['strategy_mode']} | "
