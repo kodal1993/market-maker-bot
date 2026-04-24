@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from config import (
+    ACTIVITY_ALIGNMENT_BOOST_ENABLED,
+    ACTIVITY_ALIGNMENT_BOOST_SIZE_MULTIPLIER,
+    ACTIVITY_ALIGNMENT_BOOST_SPREAD_MULTIPLIER,
+    ACTIVITY_ALIGNMENT_MAX_RISK_SCORE,
+    ACTIVITY_ALIGNMENT_MIN_EDGE_SCORE,
+    ACTIVITY_ALIGNMENT_MIN_FEED_SCORE,
+    ACTIVITY_ALIGNMENT_MIN_ONCHAIN_SCORE,
     CHOP_DISABLE_NEW_TRADES,
     CONFIRMATION_MOMENTUM_SHOCK_BPS,
     EMA_RANGE_BAND_BPS,
@@ -69,6 +76,10 @@ class SignalGate:
         inventory_emergency_override = bool(getattr(signal, "filter_values", {}).get("inventory_emergency_override")) or (
             edge_assessment.edge_override_reason == "inventory_emergency_override"
         )
+        signal_filter_values = getattr(signal, "filter_values", {}) or {}
+        feed_score = float(signal_filter_values.get("feed_score", 0.0) or 0.0)
+        risk_score = float(signal_filter_values.get("risk_score", 0.0) or 0.0)
+        onchain_score = float(signal_filter_values.get("onchain_score", 0.0) or 0.0)
         inventory_state = inventory_state_label(inventory_ratio, target_base_pct)
         ema_trend_gap_bps = ema_gap_bps(short_ma, long_ma)
         ema_range_band_bps = max(EMA_RANGE_BAND_BPS, 0.5)
@@ -100,6 +111,9 @@ class SignalGate:
             "confirmation_momentum_bps": round(confirmation_momentum_bps, 6),
             "confirmation_slowing": confirmation_slowing,
             "inventory_emergency_override": inventory_emergency_override,
+            "feed_score": round(feed_score, 6),
+            "risk_score": round(risk_score, 6),
+            "onchain_score": round(onchain_score, 6),
         }
         if ema_trend_gap_bps > ema_range_band_bps:
             gate_details["upper_tf_bias"] = "buy_only"
@@ -222,6 +236,24 @@ class SignalGate:
 
         if not edge_assessment.edge_pass:
             return SignalGateDecision(False, "skip", edge_assessment.edge_reject_reason or "edge_filter_reject", gate_details)
+
+        trend_aligned = (action == "BUY" and ema_trend_gap_bps > ema_range_band_bps and momentum_bps > 0) or (
+            action == "SELL" and ema_trend_gap_bps < -ema_range_band_bps and momentum_bps < 0
+        )
+        high_quality_alignment = (
+            ACTIVITY_ALIGNMENT_BOOST_ENABLED
+            and not protective_exit
+            and not inventory_emergency_override
+            and trend_aligned
+            and edge_assessment.edge_score >= ACTIVITY_ALIGNMENT_MIN_EDGE_SCORE
+            and feed_score >= ACTIVITY_ALIGNMENT_MIN_FEED_SCORE
+            and risk_score <= ACTIVITY_ALIGNMENT_MAX_RISK_SCORE
+            and onchain_score >= ACTIVITY_ALIGNMENT_MIN_ONCHAIN_SCORE
+        )
+        if high_quality_alignment:
+            gate_size_multiplier *= max(ACTIVITY_ALIGNMENT_BOOST_SIZE_MULTIPLIER, 1.0)
+            gate_spread_multiplier *= max(min(ACTIVITY_ALIGNMENT_BOOST_SPREAD_MULTIPLIER, 1.0), 0.5)
+            soft_guard_reasons.append("quality_alignment_boost")
 
         approved_mode = strategy_mode or "execute"
         if regime_assessment.market_regime == "RANGE" and action == "BUY":

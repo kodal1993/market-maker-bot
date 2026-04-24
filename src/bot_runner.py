@@ -6288,6 +6288,14 @@ def process_price_tick(
 
     if selected_filter_result is not None:
         selected_filter_values = _merge_filter_values(selected_filter_values, **selected_filter_result.filter_values)
+        if selected_filter_result.filter_values.get("daily_trade_limit_hit"):
+            log(
+                "Trade filter daily cap active | "
+                f"daily_trade_count {selected_filter_result.filter_values.get('daily_trade_count', '-')}"
+                f" / {selected_filter_result.filter_values.get('max_trades_per_day', '-')} | "
+                f"size_multiplier {selected_filter_result.size_multiplier:.4f} | "
+                f"action {legacy_decision.action or '-'}"
+            )
         if not selected_filter_result.allow_trade and selected_filter_result.block_reason != "loss_streak_pause":
             _record_trade_gate(
                 runtime,

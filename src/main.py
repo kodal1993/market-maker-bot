@@ -12,7 +12,10 @@ from bot_runner import (
     trade_log_headers,
 )
 from config import (
+    ACTIVITY_DAILY_GOOD_TRADE_TARGET,
+    ACTIVITY_DAILY_MIN_TRADE_TARGET,
     BOT_CONFIG_PROFILE,
+    MAX_TRADES_PER_DAY,
     LOOP_SECONDS,
     MAX_LOOPS,
     TRADES_CSV,
@@ -103,6 +106,12 @@ def main():
         runtime = None
         dex = DexClient()
         manual_stop_requested = False
+        log(
+            "Trade activity config | "
+            f"max_trades_per_day {MAX_TRADES_PER_DAY} | "
+            f"daily_min_trade_target {ACTIVITY_DAILY_MIN_TRADE_TARGET} | "
+            f"daily_good_trade_target {ACTIVITY_DAILY_GOOD_TRADE_TARGET}"
+        )
         if MAX_LOOPS > 0:
             log(f"Loop mode | max_loops {MAX_LOOPS}")
         else:
