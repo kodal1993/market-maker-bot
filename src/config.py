@@ -691,6 +691,8 @@ TAKER_FEE_BPS = EXECUTION.taker_fee_bps
 
 TRADES_CSV = EXECUTION.trades_csv
 EQUITY_CSV = EXECUTION.equity_csv
+RUNTIME_STATE_ENABLED = _env_bool("RUNTIME_STATE_ENABLED", True)
+RUNTIME_STATE_PATH = _env_str("RUNTIME_STATE_PATH", r"logs\runtime_state.json")
 
 KILL_SWITCH_USD = EXECUTION.kill_switch_usd
 INVENTORY_SKEW_STRENGTH = PORTFOLIO.inventory_skew_strength
