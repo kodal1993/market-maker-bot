@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from candle_features import build_price_window_features
 from config import (
     ENABLE_REGIME_DETECTOR,
@@ -337,3 +339,72 @@ class RegimeDetector:
             price_position_pct=round(active_features.price_position_pct, 6),
             shock_active=shock_active,
         )
+
+
+@dataclass(frozen=True)
+class AdaptiveRegimeInput:
+    price: float
+    ema20: float
+    ema50: float
+    ema200: float
+    vwap: float
+    rsi: float
+    atr_pct: float
+    volume_change: float
+    btc_trend: float
+    eth_btc_ratio_change: float = 0.0
+
+
+@dataclass(frozen=True)
+class AdaptiveRegimeResult:
+    regime: str
+    confidence: float
+    reason: str
+
+
+class V7AdaptiveRegimeDetector:
+    """V7 regime detector for adaptive strategy routing."""
+
+    def detect(self, snapshot: AdaptiveRegimeInput) -> AdaptiveRegimeResult:
+        if min(snapshot.price, snapshot.ema20, snapshot.ema50, snapshot.ema200, snapshot.vwap) <= 0:
+            return AdaptiveRegimeResult("NO_TRADE", 0.0, "invalid_snapshot")
+
+        if snapshot.atr_pct >= 0.035:
+            return AdaptiveRegimeResult("NO_TRADE", 0.70, "volatility_too_high")
+
+        bullish_alignment = snapshot.ema20 > snapshot.ema50 > snapshot.ema200
+        bearish_alignment = snapshot.ema20 < snapshot.ema50 < snapshot.ema200
+        above_vwap = snapshot.price > snapshot.vwap
+        below_vwap = snapshot.price < snapshot.vwap
+        btc_bullish = snapshot.btc_trend > 0
+        btc_bearish = snapshot.btc_trend < 0
+        ratio_tailwind = snapshot.eth_btc_ratio_change >= 0
+
+        breakout_candidate = (
+            abs(snapshot.price - snapshot.vwap) / snapshot.vwap >= 0.008
+            and snapshot.volume_change >= 0.22
+            and snapshot.atr_pct >= 0.006
+        )
+        if breakout_candidate:
+            direction = "up" if above_vwap else "down"
+            confidence = min(0.95, 0.66 + snapshot.volume_change + snapshot.atr_pct * 5.0)
+            return AdaptiveRegimeResult("BREAKOUT", confidence, f"vwap_dislocation_breakout_{direction}")
+
+        if bullish_alignment and above_vwap and 52.0 <= snapshot.rsi <= 78.0 and btc_bullish and ratio_tailwind:
+            confidence = min(0.95, 0.62 + snapshot.volume_change * 0.30 + snapshot.atr_pct * 2.0)
+            return AdaptiveRegimeResult("TREND_UP", confidence, "ema_bull_trend_with_btc_confirmation")
+
+        if bearish_alignment and below_vwap and 22.0 <= snapshot.rsi <= 48.0 and btc_bearish:
+            confidence = min(0.95, 0.62 + snapshot.volume_change * 0.30 + snapshot.atr_pct * 2.0)
+            return AdaptiveRegimeResult("TREND_DOWN", confidence, "ema_bear_trend_with_btc_confirmation")
+
+        distance_to_vwap = abs(snapshot.price - snapshot.vwap) / snapshot.vwap
+        if (
+            distance_to_vwap <= 0.0035
+            and snapshot.atr_pct <= 0.012
+            and abs(snapshot.rsi - 50.0) <= 12.0
+        ):
+            confidence = max(0.55, 0.82 - (distance_to_vwap * 70.0))
+            return AdaptiveRegimeResult("RANGE", confidence, "vwap_balance_low_volatility")
+
+        return AdaptiveRegimeResult("NO_TRADE", 0.52, "no_clean_regime")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 _LOG_SINKS: list[object] = []
 
@@ -43,3 +44,13 @@ def log_trade_record(**record: object) -> None:
             except Exception as exc:  # noqa: BLE001 - trade sinks must not break runtime logging
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{now}] trade sink error: {exc}", flush=True)
+
+
+def export_last_log_lines(log_path: str | Path, *, max_lines: int = 2000) -> list[str]:
+    path = Path(log_path)
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if max_lines <= 0:
+        return lines
+    return lines[-max_lines:]

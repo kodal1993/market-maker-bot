@@ -80,6 +80,17 @@ def parse_args():
         help="Replay the legacy decision flow without the state machine layer.",
     )
     parser.add_argument("--verbose", action="store_true", help="Print every replayed cycle.")
+    parser.add_argument(
+        "--strategy-mode",
+        default="adaptive",
+        choices=["adaptive", "trend", "market_making", "breakout"],
+        help="Force a single V7 strategy mode for paper comparison.",
+    )
+    parser.add_argument(
+        "--compare-strategies",
+        action="store_true",
+        help="Run trend, market making, breakout and adaptive variants and print PnL comparison.",
+    )
     return parser.parse_args()
 
 
@@ -213,6 +224,13 @@ def main():
             enable_inventory_manager=not args.disable_inventory_manager,
             enable_state_machine=not args.disable_state_machine,
         )
+        forced_mode_map = {
+            "trend": "trend_long_strategy",
+            "market_making": "market_making_strategy",
+            "breakout": "breakout_scalp_strategy",
+            "adaptive": None,
+        }
+        runtime.forced_v7_strategy = forced_mode_map.get(args.strategy_mode)
 
         log(f"Backtest input: {csv_path}")
         log(f"Loaded rows: {len(rows)}")
@@ -262,6 +280,37 @@ def main():
             equity_curve_path=str(equity_path),
             summary_path=summary_path_text,
         )
+        if args.compare_strategies:
+            comparisons: dict[str, float] = {args.strategy_mode: float(summary.get("final_pnl", 0.0))}
+            for mode_name, forced_strategy in forced_mode_map.items():
+                if mode_name == args.strategy_mode:
+                    continue
+                variant_runtime = create_runtime(
+                    reference_price=reference_price,
+                    cycle_seconds=cycle_seconds,
+                    enable_reentry_engine=not args.disable_reentry,
+                    enable_decision_engine=not args.disable_decision_engine,
+                    enable_execution_engine=not args.disable_execution,
+                    enable_trade_filter=not args.disable_trade_filter,
+                    enable_inventory_manager=not args.disable_inventory_manager,
+                    enable_state_machine=not args.disable_state_machine,
+                )
+                variant_runtime.forced_v7_strategy = forced_strategy
+                for cycle_index, (variant_mid, variant_source) in enumerate(rows):
+                    should_continue = process_price_tick(
+                        runtime=variant_runtime,
+                        cycle_index=cycle_index,
+                        mid=variant_mid,
+                        source=variant_source,
+                        trade_logger=None,
+                        equity_logger=None,
+                        log_progress=False,
+                    )
+                    if not should_continue:
+                        break
+                variant_summary = build_summary(variant_runtime)
+                comparisons[mode_name] = float(variant_summary.get("final_pnl", 0.0))
+            log(f"Strategy comparison PnL: {comparisons}")
         write_report_json(report, report_json_path)
         write_report_csv(report, report_csv_path)
         log(f"Backtest report JSON: {report_json_path}")

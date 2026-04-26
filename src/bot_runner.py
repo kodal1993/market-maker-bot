@@ -68,6 +68,7 @@ from config import (
     RANGE_MEAN_REVERSION_EXIT_POSITION_PCT,
     RANGE_MIN_EDGE_BPS,
     REGIME_MAX_WICK_TO_BODY_RATIO,
+    REGIME_CONFIDENCE_MIN,
     REENTRY_ENGINE_ENABLED,
     REENTRY_INVENTORY_BUFFER_PCT,
     REENTRY_MAX_MISS_BUY_FRACTION,
@@ -110,6 +111,14 @@ from config import (
     TREND_SELL_SPREAD_FACTOR,
     VOL_WINDOW,
     WAIT_REENTRY_PULLBACK_PCT,
+    ENABLE_BREAKOUT_MODE,
+    ENABLE_LEVERAGE,
+    ENABLE_MARKET_MAKING,
+    ENABLE_TREND_MODE,
+    MAX_CONSECUTIVE_LOSSES,
+    MAX_DAILY_LOSS,
+    MAX_LEVERAGE,
+    RISK_PER_TRADE,
 )
 from decision_engine import DecisionEngine
 from edge_filter import EdgeFilter
@@ -126,7 +135,9 @@ from multi_timeframe import build_timeframe_snapshot, required_bootstrap_price_r
 from performance import PerformanceTracker, log_performance_summary
 from portfolio import Portfolio
 from regime_detector import RegimeDetector
+from regime_detector import AdaptiveRegimeInput, V7AdaptiveRegimeDetector
 from reentry_engine import ReentryEngine
+from risk_manager import RiskManager, RiskState
 import runtime_execution as execution_helpers
 import runtime_logging as logging_helpers
 import runtime_risk as risk_helpers
@@ -140,6 +151,8 @@ from strategy_profile import (
     resolve_effective_min_edge_bps,
     resolve_logging_zone,
 )
+from strategy_selector import StrategySelector
+from market_maker_strategy import allow_market_making
 from strategy import (
     build_quotes,
     calculate_buy_zones,
@@ -222,6 +235,9 @@ class BotRuntime:
     state_machine: StateMachineEngine
     trade_filter: TradeFilter
     inventory_manager: InventoryManager
+    strategy_selector: StrategySelector
+    adaptive_regime_detector: V7AdaptiveRegimeDetector
+    risk_manager: RiskManager
     raw_prices: list[float]
     prices: list[float]
     trend_prices: list[float]
@@ -332,6 +348,15 @@ class BotRuntime:
     current_inventory_drift_pct: float = 0.0
     current_entry_edge_bps: float = 0.0
     current_entry_edge_usd: float = 0.0
+    current_v7_regime: str = "NO_TRADE"
+    current_v7_strategy: str = "stay_flat"
+    current_v7_confidence: float = 0.0
+    current_v7_reason: str = ""
+    current_v7_risk_allow_trade: bool = True
+    current_v7_risk_reason: str = "risk_ok"
+    last_regime_alert_sent: str = ""
+    risk_state: RiskState = field(default_factory=RiskState)
+    forced_v7_strategy: str | None = None
     current_hold_minutes: float = 0.0
     current_adaptive_regime: str = ""
     current_adaptive_regime_confidence: float = 0.0
@@ -630,6 +655,18 @@ def create_runtime(
     state_machine = StateMachineEngine(resolved_cycle_seconds)
     trade_filter = TradeFilter(resolved_cycle_seconds)
     inventory_manager = InventoryManager()
+    strategy_selector = StrategySelector()
+    adaptive_regime_detector = V7AdaptiveRegimeDetector()
+    risk_manager = RiskManager(
+        max_daily_loss_ratio=MAX_DAILY_LOSS,
+        max_trade_loss_ratio=RISK_PER_TRADE,
+        max_position_size_usd=MAX_TRADE_SIZE_USD,
+        max_consecutive_losses=MAX_CONSECUTIVE_LOSSES,
+        cooldown_cycles_after_loss=2,
+        no_trade_drawdown_ratio=max(MAX_DAILY_LOSS * 1.5, 0.05),
+        max_leverage=MAX_LEVERAGE,
+        enable_leverage=ENABLE_LEVERAGE,
+    )
     decision_engine = DecisionEngine(trade_filter, reentry_engine, inventory_manager)
     raw_prices = list(bootstrap_prices or [])
     timeframe_snapshot = build_timeframe_snapshot(
@@ -660,6 +697,9 @@ def create_runtime(
         state_machine=state_machine,
         trade_filter=trade_filter,
         inventory_manager=inventory_manager,
+        strategy_selector=strategy_selector,
+        adaptive_regime_detector=adaptive_regime_detector,
+        risk_manager=risk_manager,
         raw_prices=raw_prices,
         prices=prices,
         trend_prices=trend_prices,
@@ -753,6 +793,103 @@ def _refresh_timeframe_signals(runtime: BotRuntime) -> None:
 
     runtime.current_confirmation_momentum_bps = calculate_recent_momentum_bps(runtime.confirmation_prices)
     runtime.current_confirmation_slowing = detect_momentum_slowing(runtime.confirmation_prices)
+
+
+def _atr_pct(prices: list[float], window: int = 14) -> float:
+    if len(prices) < 3:
+        return 0.0
+    subset = prices[-max(window, 3):]
+    moves = []
+    for idx in range(1, len(subset)):
+        prev = subset[idx - 1]
+        curr = subset[idx]
+        if prev <= 0:
+            continue
+        moves.append(abs(curr - prev) / prev)
+    if not moves:
+        return 0.0
+    return sum(moves) / len(moves)
+
+
+def _apply_v7_adaptive_selection(runtime: BotRuntime, *, strategy_mid: float, equity_usd: float, pnl_usd: float) -> None:
+    if not runtime.prices:
+        return
+    ema20 = ema(runtime.prices, 20)
+    ema50 = ema(runtime.prices, 50)
+    ema200 = ema(runtime.prices, 200)
+    atr_pct = _atr_pct(runtime.prices)
+    recent_window = runtime.prices[-20:] if len(runtime.prices) >= 20 else runtime.prices
+    vwap = sum(recent_window) / max(len(recent_window), 1)
+    rsi = calculate_rsi(runtime.prices)
+    momentum_proxy_bps = calculate_recent_momentum_bps(runtime.confirmation_prices or runtime.prices)
+    volume_change_proxy = min(max(abs(momentum_proxy_bps) / 30.0, 0.0), 1.0)
+    btc_trend_proxy = momentum_proxy_bps
+    eth_btc_ratio_change = (ema20 / ema50 - 1.0) if ema50 > 0 else 0.0
+    adaptive_result = runtime.adaptive_regime_detector.detect(
+        AdaptiveRegimeInput(
+            price=strategy_mid,
+            ema20=ema20,
+            ema50=ema50,
+            ema200=ema200,
+            vwap=vwap,
+            rsi=rsi,
+            atr_pct=atr_pct,
+            volume_change=volume_change_proxy,
+            btc_trend=btc_trend_proxy,
+            eth_btc_ratio_change=eth_btc_ratio_change,
+        )
+    )
+    selection = runtime.strategy_selector.select(
+        adaptive_result.regime,
+        adaptive_result.confidence,
+        min_confidence=REGIME_CONFIDENCE_MIN,
+    )
+    runtime.current_v7_regime = selection.regime
+    runtime.current_v7_strategy = selection.strategy_name
+    runtime.current_v7_confidence = selection.confidence
+    runtime.current_v7_reason = f"{adaptive_result.reason}|{selection.reason}"
+    if runtime.forced_v7_strategy:
+        runtime.current_v7_strategy = runtime.forced_v7_strategy
+        runtime.current_v7_reason = f"{runtime.current_v7_reason}|forced_strategy:{runtime.forced_v7_strategy}"
+
+    daily_pnl_ratio = (pnl_usd / equity_usd) if equity_usd > 0 else 0.0
+    drawdown_ratio = (runtime.current_drawdown_usd / equity_usd) if equity_usd > 0 else 0.0
+    proposed_position = runtime.current_sizing.max_position_usd if runtime.current_sizing is not None else 0.0
+    risk_decision = runtime.risk_manager.assess(
+        runtime.risk_state,
+        cycle_index=getattr(runtime, "current_cycle_index", 0),
+        daily_pnl_ratio=daily_pnl_ratio,
+        drawdown_ratio=drawdown_ratio,
+        trade_risk_ratio=RISK_PER_TRADE,
+        proposed_position_usd=proposed_position,
+    )
+    runtime.current_v7_risk_allow_trade = risk_decision.allow_trade
+    runtime.current_v7_risk_reason = risk_decision.reason
+    runtime.current_v7_reason = f"{runtime.current_v7_reason}|risk:{risk_decision.reason}"
+    if (not risk_decision.allow_trade) and risk_decision.reason in {"max_daily_loss_reached", "drawdown_lock"}:
+        notifier = runtime.telegram_notifier
+        if notifier is not None:
+            try:
+                notifier.send_message(f"Max loss lock activated: {risk_decision.reason}", markdown=False)
+            except Exception as exc:  # noqa: BLE001
+                log(f"Telegram max loss lock notify failed: {exc}")
+    log(
+        f"V7 selection | regime {runtime.current_v7_regime} | strategy {runtime.current_v7_strategy} | "
+        f"confidence {runtime.current_v7_confidence:.3f} | risk {risk_decision.reason}"
+    )
+    if runtime.telegram_notifier is not None and runtime.last_regime_alert_sent != runtime.current_v7_regime:
+        runtime.last_regime_alert_sent = runtime.current_v7_regime
+        try:
+            runtime.telegram_notifier.send_message(
+                (
+                    f"Regime change: {runtime.current_v7_regime} | "
+                    f"strategy: {runtime.current_v7_strategy} | "
+                    f"confidence: {runtime.current_v7_confidence:.2f}"
+                ),
+                markdown=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"Telegram regime change notify failed: {exc}")
 
 
 def _trend_filter_allows_buy(runtime: BotRuntime) -> bool:
@@ -4020,6 +4157,7 @@ def _record_fill(
     runtime.last_trade_reason = _trade_reason_category(mode, fill.trade_reason)
     runtime.last_trade_reason_detail = fill.trade_reason
     runtime.last_cycle_realized_pnl_delta = realized_pnl_delta
+    runtime.risk_manager.on_trade_closed(runtime.risk_state, pnl_usd=realized_pnl_delta, cycle_index=cycle_index)
     runtime.current_hold_minutes = float(trade_analysis.get("hold_minutes") or 0.0)
     runtime.summary_window_fills += 1
     runtime.fill_cycle_history.append(cycle_index)
@@ -4313,6 +4451,7 @@ def _process_price_tick_with_decision_engine(
     portfolio = runtime.portfolio
     engine = runtime.engine
     runtime.pipeline_logging_enabled = log_progress
+    runtime.current_cycle_index = cycle_index
     runtime.consecutive_invalid_price_cycles = 0
     runtime.last_cycle_realized_pnl_delta = 0.0
 
@@ -4328,6 +4467,7 @@ def _process_price_tick_with_decision_engine(
     runtime.current_minutes_since_last_fill = _minutes_since_last_fill(runtime, cycle_index)
 
     sizing = _update_runtime_sizing(runtime, equity_usd=equity_usd, mid=mid)
+    _apply_v7_adaptive_selection(runtime, strategy_mid=strategy_mid, equity_usd=equity_usd, pnl_usd=pnl_usd)
 
     intelligence = runtime.intelligence.build_snapshot(
         prices=runtime.prices,
@@ -4407,6 +4547,38 @@ def _process_price_tick_with_decision_engine(
     strategy_mode = getattr(intelligence, "strategy_mode", intelligence.mode)
     mm_mode = getattr(intelligence, "mm_mode", "base_mm")
     mode = strategy_mode
+    if runtime.current_v7_strategy == "trend_long_strategy":
+        mode = "TREND_UP"
+    elif runtime.current_v7_strategy == "trend_short_or_hedge_strategy":
+        mode = "TREND_DOWN"
+    elif runtime.current_v7_strategy == "market_making_strategy":
+        mode = "RANGE"
+    elif runtime.current_v7_strategy == "breakout_scalp_strategy":
+        mode = "TREND_UP" if runtime.current_v7_regime == "BREAKOUT" else strategy_mode
+    if runtime.current_v7_strategy == "stay_flat":
+        mode = "NO_TRADE"
+    elif runtime.current_v7_strategy == "market_making_strategy":
+        mm_allowed, mm_reason = allow_market_making(
+            regime=runtime.current_v7_regime,
+            volatility_score=getattr(runtime.current_regime_assessment, "volatility_score", 0.0),
+            shock_active=bool(getattr(runtime.current_regime_assessment, "shock_active", False)),
+            news_risk=float(getattr(intelligence, "news_score", 0.0)),
+        )
+        if not mm_allowed:
+            mode = "NO_TRADE"
+            runtime.current_v7_reason = f"{runtime.current_v7_reason}|{mm_reason}"
+    elif runtime.current_v7_strategy == "breakout_scalp_strategy" and not ENABLE_BREAKOUT_MODE:
+        mode = "NO_TRADE"
+    elif runtime.current_v7_strategy.startswith("trend_") and not ENABLE_TREND_MODE:
+        mode = "NO_TRADE"
+    elif runtime.current_v7_strategy == "market_making_strategy" and not ENABLE_MARKET_MAKING:
+        mode = "NO_TRADE"
+    if not runtime.current_v7_risk_allow_trade:
+        mode = "NO_TRADE"
+        runtime.current_v7_reason = f"{runtime.current_v7_reason}|risk_block:{runtime.current_v7_risk_reason}"
+    if mode == "NO_TRADE":
+        runtime.last_decision_block_reason = runtime.current_v7_reason or "v7_no_trade"
+        log(f"Trade skipped | reason {runtime.last_decision_block_reason}")
     runtime.mode_counts[mode] = runtime.mode_counts.get(mode, 0) + 1
     runtime.mm_mode_counts[mm_mode] = runtime.mm_mode_counts.get(mm_mode, 0) + 1
     runtime.feed_state_counts[intelligence.feed_state] = runtime.feed_state_counts.get(intelligence.feed_state, 0) + 1
@@ -5639,6 +5811,7 @@ def process_price_tick(
     _update_fill_quality_state(runtime, cycle_index)
     runtime.current_minutes_since_last_fill = _minutes_since_last_fill(runtime, cycle_index)
     sizing = _update_runtime_sizing(runtime, equity_usd=equity_usd, mid=mid)
+    _apply_v7_adaptive_selection(runtime, strategy_mid=strategy_mid, equity_usd=equity_usd, pnl_usd=pnl_usd)
 
     intelligence = runtime.intelligence.build_snapshot(
         prices=runtime.prices,
@@ -5718,6 +5891,38 @@ def process_price_tick(
     strategy_mode = getattr(intelligence, "strategy_mode", intelligence.mode)
     mm_mode = getattr(intelligence, "mm_mode", "base_mm")
     mode = strategy_mode
+    if runtime.current_v7_strategy == "trend_long_strategy":
+        mode = "TREND_UP"
+    elif runtime.current_v7_strategy == "trend_short_or_hedge_strategy":
+        mode = "TREND_DOWN"
+    elif runtime.current_v7_strategy == "market_making_strategy":
+        mode = "RANGE"
+    elif runtime.current_v7_strategy == "breakout_scalp_strategy":
+        mode = "TREND_UP" if runtime.current_v7_regime == "BREAKOUT" else strategy_mode
+    if runtime.current_v7_strategy == "stay_flat":
+        mode = "NO_TRADE"
+    elif runtime.current_v7_strategy == "market_making_strategy":
+        mm_allowed, mm_reason = allow_market_making(
+            regime=runtime.current_v7_regime,
+            volatility_score=getattr(runtime.current_regime_assessment, "volatility_score", 0.0),
+            shock_active=bool(getattr(runtime.current_regime_assessment, "shock_active", False)),
+            news_risk=float(getattr(intelligence, "news_score", 0.0)),
+        )
+        if not mm_allowed:
+            mode = "NO_TRADE"
+            runtime.current_v7_reason = f"{runtime.current_v7_reason}|{mm_reason}"
+    elif runtime.current_v7_strategy == "breakout_scalp_strategy" and not ENABLE_BREAKOUT_MODE:
+        mode = "NO_TRADE"
+    elif runtime.current_v7_strategy.startswith("trend_") and not ENABLE_TREND_MODE:
+        mode = "NO_TRADE"
+    elif runtime.current_v7_strategy == "market_making_strategy" and not ENABLE_MARKET_MAKING:
+        mode = "NO_TRADE"
+    if not runtime.current_v7_risk_allow_trade:
+        mode = "NO_TRADE"
+        runtime.current_v7_reason = f"{runtime.current_v7_reason}|risk_block:{runtime.current_v7_risk_reason}"
+    if mode == "NO_TRADE":
+        runtime.last_decision_block_reason = runtime.current_v7_reason or "v7_no_trade"
+        log(f"Trade skipped | reason {runtime.last_decision_block_reason}")
     runtime.mode_counts[mode] = runtime.mode_counts.get(mode, 0) + 1
     runtime.mm_mode_counts[mm_mode] = runtime.mm_mode_counts.get(mm_mode, 0) + 1
     runtime.feed_state_counts[intelligence.feed_state] = runtime.feed_state_counts.get(intelligence.feed_state, 0) + 1
