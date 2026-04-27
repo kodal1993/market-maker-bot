@@ -62,6 +62,9 @@ class SignalGate:
         confirmation_enabled: bool = ENABLE_EXECUTION_CONFIRMATION,
         confirmation_momentum_bps: float = 0.0,
         confirmation_slowing: bool = False,
+        recovery_mode_active: bool = False,
+        recovery_reason: str = "",
+        active_regime: str = "",
     ) -> SignalGateDecision:
         action = signal.action.upper()
         reason = signal.reason or ""
@@ -100,6 +103,11 @@ class SignalGate:
             "confirmation_momentum_bps": round(confirmation_momentum_bps, 6),
             "confirmation_slowing": confirmation_slowing,
             "inventory_emergency_override": inventory_emergency_override,
+            "normal_gate_result": "",
+            "recovery_gate_result": "",
+            "recovery_mode_active": recovery_mode_active,
+            "recovery_reason": recovery_reason,
+            "hard_block_reason": "",
         }
         if ema_trend_gap_bps > ema_range_band_bps:
             gate_details["upper_tf_bias"] = "buy_only"
@@ -109,6 +117,8 @@ class SignalGate:
             gate_details["upper_tf_bias"] = "range"
 
         if action not in {"BUY", "SELL"}:
+            gate_details["normal_gate_result"] = "reject"
+            gate_details["hard_block_reason"] = "no_signal"
             return SignalGateDecision(False, "skip", "no_signal", gate_details)
 
         if (
@@ -117,10 +127,13 @@ class SignalGate:
             and not inventory_emergency_override
             and edge_assessment.edge_score < HIGH_EDGE_OVERRIDE_SCORE
         ):
-            gate_details["loss_pause_soft_degrade"] = True
-            gate_size_multiplier *= 0.76
-            gate_spread_multiplier *= 1.08
-            soft_guard_reasons.append("loss_pause_soft_degrade")
+            if recovery_mode_active:
+                soft_guard_reasons.append("loss_pause_recovery_ignored")
+            else:
+                gate_details["loss_pause_soft_degrade"] = True
+                gate_size_multiplier *= 0.76
+                gate_spread_multiplier *= 1.08
+                soft_guard_reasons.append("loss_pause_soft_degrade")
 
         if (
             CHOP_DISABLE_NEW_TRADES
@@ -128,9 +141,12 @@ class SignalGate:
             and not protective_exit
             and not inventory_emergency_override
         ):
-            gate_size_multiplier *= 0.82
-            gate_spread_multiplier *= 1.08
-            soft_guard_reasons.append("chop_market_soft")
+            if recovery_mode_active and active_regime == "RANGE" and strategy_mode == "RANGE_MAKER":
+                soft_guard_reasons.append("chop_recovery_allowed")
+            else:
+                gate_size_multiplier *= 0.82
+                gate_spread_multiplier *= 1.08
+                soft_guard_reasons.append("chop_market_soft")
 
         if (
             not protective_exit
@@ -138,9 +154,12 @@ class SignalGate:
             and action == "BUY"
             and ema_trend_gap_bps < -ema_range_band_bps
         ):
-            gate_size_multiplier *= 0.72
-            gate_spread_multiplier *= 1.10
-            soft_guard_reasons.append("ema_downtrend_buy_soft")
+            if recovery_mode_active:
+                soft_guard_reasons.append("upper_tf_conflict_recovery_size_reduced")
+            else:
+                gate_size_multiplier *= 0.72
+                gate_spread_multiplier *= 1.10
+                soft_guard_reasons.append("ema_downtrend_buy_soft")
 
         if (
             not protective_exit
@@ -148,9 +167,12 @@ class SignalGate:
             and action == "SELL"
             and ema_trend_gap_bps > ema_range_band_bps
         ):
-            gate_size_multiplier *= 0.74
-            gate_spread_multiplier *= 1.08
-            soft_guard_reasons.append("ema_uptrend_sell_soft")
+            if recovery_mode_active:
+                soft_guard_reasons.append("upper_tf_conflict_recovery_size_reduced")
+            else:
+                gate_size_multiplier *= 0.74
+                gate_spread_multiplier *= 1.08
+                soft_guard_reasons.append("ema_uptrend_sell_soft")
 
         if (
             not protective_exit
@@ -221,9 +243,12 @@ class SignalGate:
             soft_guard_reasons.append("regime_blocks_countertrend_sell_soft")
 
         if not edge_assessment.edge_pass:
+            gate_details["normal_gate_result"] = "reject"
+            gate_details["recovery_gate_result"] = "reject" if recovery_mode_active else ""
+            gate_details["hard_block_reason"] = edge_assessment.edge_reject_reason or "edge_filter_reject"
             return SignalGateDecision(False, "skip", edge_assessment.edge_reject_reason or "edge_filter_reject", gate_details)
 
-        approved_mode = strategy_mode or "execute"
+        approved_mode = "RECOVERY_REENTRY" if recovery_mode_active else (strategy_mode or "execute")
         if regime_assessment.market_regime == "RANGE" and action == "BUY":
             approved_mode = "range_entry"
         elif regime_assessment.market_regime == "TREND_UP" and action == "BUY":
@@ -237,6 +262,8 @@ class SignalGate:
         gate_details["soft_guard_reason"] = "|".join(soft_guard_reasons)
         gate_details["approved_mode"] = approved_mode
         gate_details["gate_decision"] = "allow"
+        gate_details["normal_gate_result"] = "allow"
+        gate_details["recovery_gate_result"] = "allow" if recovery_mode_active else ""
         return SignalGateDecision(True, approved_mode, "", gate_details)
 
 

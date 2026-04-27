@@ -302,6 +302,31 @@ class ExecutionRouter:
                 metadata=base_metadata,
             )
 
+        if self._metadata_bool(signal.metadata or {}, "recovery_passive_only"):
+            maker_price = min(context.quote_bid, quote_validation.router_price) if signal.side == "buy" else max(
+                context.quote_ask,
+                quote_validation.router_price,
+            )
+            return ExecutionResult(
+                allow_trade=True,
+                execution_mode="passive_limit",
+                private_tx_used=False,
+                cow_used=False,
+                quoted_price=quote_validation.router_price,
+                order_price=maker_price,
+                size_usd=signal.size_usd,
+                fee_bps=0.0,
+                execution_type="maker",
+                mev_risk_score=mev_risk.mev_risk_score,
+                sandwich_risk=mev_risk.sandwich_risk,
+                execution_window_score=mev_risk.execution_window_score,
+                expected_slippage_bps=slippage.expected_slippage_bps,
+                realized_slippage_bps=0.0,
+                price_impact_bps=slippage.price_impact_bps,
+                quote_deviation_bps=quote_validation.quote_deviation_bps,
+                metadata={**base_metadata, "recovery_passive_only": True},
+            )
+
         execution_mode, early_result = self._resolve_mode(
             signal,
             enriched_context,

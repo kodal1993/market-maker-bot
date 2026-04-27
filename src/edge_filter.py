@@ -206,6 +206,7 @@ class EdgeFilter:
         min_edge_bps: float | None = None,
         force_trade_active: bool = False,
         inventory_emergency_override: bool = False,
+        recovery_mode_active: bool = False,
     ) -> EdgeAssessment:
         if signal.action not in {"BUY", "SELL"} or signal.size_usd <= 0:
             return EdgeAssessment(0.0, 0.0, 0.0, 0.0, False, "no_signal")
@@ -253,6 +254,14 @@ class EdgeFilter:
         slippage_estimate_usd = signal.size_usd * slippage_cost_bps / 10_000.0
         gas_estimate_usd = self._gas_estimate_usd(context)
         mev_penalty_usd = signal.size_usd * max(mev_risk.mev_risk_score, 0.0) / 100_000.0
+        adverse_selection_bps = 0.0
+        try:
+            adverse_selection_bps = float((context.metadata or {}).get("adverse_selection_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            adverse_selection_bps = 0.0
+        base_qty = signal.size_usd / exec_signal.limit_price if exec_signal.limit_price > 0 else 0.0
+        adverse_price_move_per_eth = exec_signal.limit_price * max(adverse_selection_bps, 0.0) / 10_000.0
+        adverse_selection_usd = adverse_price_move_per_eth * base_qty
 
         regime_penalty_usd = 0.0
         if regime_assessment.market_regime == "CHOP":
@@ -292,6 +301,7 @@ class EdgeFilter:
             + slippage_estimate_usd
             + gas_estimate_usd
             + mev_penalty_usd
+            + adverse_selection_usd
             + regime_penalty_usd
             + loss_penalty_usd
             + reentry_penalty_usd
@@ -337,7 +347,7 @@ class EdgeFilter:
         cooldown_multiplier = 1.0
         aggressive_enabled = False
         edge_override_reason = "inventory_emergency_override" if inventory_emergency_override else (
-            "force_trade_active" if force_trade_active else ""
+            "recovery_reentry" if recovery_mode_active else "force_trade_active" if force_trade_active else ""
         )
         if edge_bucket == "strong_positive":
             size_multiplier = max(AGGRESSIVE_SIZE_MULT, 1.0)
@@ -385,15 +395,24 @@ class EdgeFilter:
             inventory_skew_multiplier = min(inventory_skew_multiplier, 0.90)
             cooldown_multiplier = max(cooldown_multiplier, 1.12)
             edge_penalty_reason = "expected_edge_below_min"
-        elif is_reentry_reason(signal.reason) and pullback_depth_pct < REENTRY_MIN_PULLBACK_PCT:
+        elif is_reentry_reason(signal.reason) and pullback_depth_pct < REENTRY_MIN_PULLBACK_PCT and not recovery_mode_active:
             edge_reject_reason = "reentry_low_pullback"
-        elif is_reentry_reason(signal.reason) and regime_assessment.market_regime not in {"RANGE", "TREND_UP"}:
+        elif (
+            is_reentry_reason(signal.reason)
+            and regime_assessment.market_regime not in {"RANGE", "TREND_UP"}
+            and not recovery_mode_active
+        ):
             edge_reject_reason = "reentry_rejected_bad_regime"
-        elif is_reentry_reason(signal.reason) and regime_assessment.market_regime == "TREND_UP" and regime_assessment.regime_confidence > 70.0:
+        elif (
+            is_reentry_reason(signal.reason)
+            and regime_assessment.market_regime == "TREND_UP"
+            and regime_assessment.regime_confidence > 70.0
+            and not recovery_mode_active
+        ):
             edge_reject_reason = "reentry_rejected_bad_regime"
         elif is_reentry_reason(signal.reason) and regime_assessment.volatility_score >= 75.0:
             edge_reject_reason = "reentry_high_volatility_shock"
-        elif is_reentry_reason(signal.reason) and edge_score < required_reentry_score:
+        elif is_reentry_reason(signal.reason) and edge_score < required_reentry_score and not recovery_mode_active:
             edge_reject_reason = "reentry_rejected_low_edge"
         elif not edge_override_reason and edge_bucket == "bad" and edge_score < required_edge_score:
             size_multiplier = min(size_multiplier, 0.72)
@@ -427,6 +446,7 @@ class EdgeFilter:
             mev_risk_score=round(mev_risk.mev_risk_score, 6),
             sandwich_risk=round(mev_risk.sandwich_risk, 6),
             mev_penalty_usd=round(mev_penalty_usd, 6),
+            adverse_selection_usd=round(adverse_selection_usd, 6),
             regime_penalty_usd=round(regime_penalty_usd, 6),
             loss_penalty_usd=round(loss_penalty_usd, 6),
             reentry_penalty_usd=round(reentry_penalty_usd, 6),

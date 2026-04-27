@@ -64,7 +64,10 @@ def build_execution_context(
         portfolio_usdc=runtime.portfolio.usdc,
         portfolio_eth=runtime.portfolio.eth,
         market_mode=mode,
-        metadata={"source": source},
+        metadata={
+            "source": source,
+            "adverse_selection_bps": getattr(runtime, "current_adverse_selection_bps", 0.0),
+        },
     )
 
 

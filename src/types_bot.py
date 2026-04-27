@@ -201,6 +201,7 @@ class EdgeAssessment:
     mev_risk_score: float = 0.0
     sandwich_risk: float = 0.0
     mev_penalty_usd: float = 0.0
+    adverse_selection_usd: float = 0.0
     regime_penalty_usd: float = 0.0
     loss_penalty_usd: float = 0.0
     reentry_penalty_usd: float = 0.0

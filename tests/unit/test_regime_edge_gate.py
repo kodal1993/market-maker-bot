@@ -4,10 +4,12 @@ import sys
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from bot_runner import (
+    _apply_signal_pipeline,
     _build_inventory_emergency_candidate,
     _build_open_profit_exit_plan,
     _build_profit_lock_sell_plan,
@@ -18,7 +20,8 @@ from bot_runner import (
 from edge_filter import EdgeFilter
 from regime_detector import RegimeDetector
 from signal_gate import SignalGate
-from types_bot import DecisionOutcome, EdgeAssessment, ExecutionContext, FillResult, InventoryProfile, MarketRegimeAssessment
+from sizing_engine import build_sizing_snapshot
+from types_bot import DecisionOutcome, EdgeAssessment, ExecutionContext, FillResult, InventoryProfile, MarketRegimeAssessment, Quote, StrategyState
 
 
 def build_regime(
@@ -86,6 +89,107 @@ def build_edge(
 
 
 class RegimeEdgeGateTests(unittest.TestCase):
+    def _recovery_runtime_and_profile(self):
+        runtime = create_runtime(
+            bootstrap_prices=[100.0] * 30,
+            reference_price=100.0,
+            start_usdc=250.0,
+            start_eth=2.5,
+            start_eth_usd=0.0,
+            enable_trade_filter=False,
+            enable_execution_engine=False,
+            adaptive_flags={"enabled": False},
+        )
+        runtime.state_context.current_state = StrategyState.WAIT_REENTRY
+        runtime.current_minutes_since_last_fill = 180.0
+        runtime.current_recent_trade_count_60m = 0
+        runtime.current_inventory_drift_pct = -45.0
+        runtime.current_freeze_recovery_mode = True
+        runtime.current_inactivity_fallback_active = False
+        runtime.current_risk_governor_state = "normal"
+        runtime.current_active_regime = "RANGE"
+        runtime.current_strategy_mode = "RANGE_MAKER"
+        runtime.current_sizing = replace(
+            build_sizing_snapshot(
+                current_equity_usd=500.0,
+                mid_price=100.0,
+                portfolio_usdc=250.0,
+                portfolio_eth=2.5,
+            ),
+            computed_force_trade_size_usd=25.0,
+            force_trade_size_usd=25.0,
+            max_trade_size_usd=25.0,
+            min_notional_usd=1.0,
+            available_quote_to_trade_usd=250.0,
+        )
+        profile = InventoryProfile(
+            regime_label="normal",
+            lower_bound=0.42,
+            upper_bound=0.58,
+            inventory_ratio=0.05,
+            inventory_usd=25.0,
+            equity_usd=500.0,
+            allow_buy=True,
+            allow_sell=True,
+            max_buy_usd=250.0,
+            max_sell_usd=0.0,
+            soft_limit_usd=350.0,
+        )
+        return runtime, profile
+
+    def test_wait_reentry_freeze_recovery_allows_chop_range_reentry(self) -> None:
+        runtime, profile = self._recovery_runtime_and_profile()
+        runtime.current_regime_assessment = replace(build_regime("CHOP"), execution_regime="RANGE")
+
+        decision = _apply_signal_pipeline(
+            runtime,
+            cycle_index=200,
+            decision=DecisionOutcome(action="BUY", size_usd=25.0, reason="reentry_pullback", source="reentry", order_price=100.0),
+            strategy_mode="RANGE_MAKER",
+            intelligence=SimpleNamespace(target_inventory_pct=0.50, short_ma=100.0, long_ma=100.0, volatility=0.001),
+            quote=Quote(bid=99.95, ask=100.05, mid=100.0, spread_bps=10.0, mode="RANGE_MAKER"),
+            mid=100.0,
+            spread_bps=10.0,
+            source="test",
+            effective_max_inventory_usd=500.0,
+            inventory_profile=profile,
+            inventory_usd=25.0,
+        )
+
+        self.assertEqual(decision.action, "BUY")
+        self.assertTrue(decision.allow_trade)
+        self.assertTrue(decision.filter_values["recovery_mode_active"])
+        self.assertEqual(decision.filter_values["recovery_gate_result"], "allow")
+        self.assertNotEqual(decision.block_reason, "reentry_rejected_bad_regime")
+
+    def test_upper_tf_conflict_reduces_recovery_size_without_rejecting(self) -> None:
+        runtime, profile = self._recovery_runtime_and_profile()
+        runtime.current_regime_assessment = replace(build_regime("RANGE"), execution_regime="RANGE")
+        runtime.current_trend_bias = "sell_only"
+        runtime.current_trend_short_ma = 99.0
+        runtime.current_trend_long_ma = 100.0
+
+        decision = _apply_signal_pipeline(
+            runtime,
+            cycle_index=200,
+            decision=DecisionOutcome(action="BUY", size_usd=25.0, reason="reentry_pullback", source="reentry", order_price=100.0),
+            strategy_mode="RANGE_MAKER",
+            intelligence=SimpleNamespace(target_inventory_pct=0.50, short_ma=99.0, long_ma=100.0, volatility=0.001),
+            quote=Quote(bid=99.95, ask=100.05, mid=100.0, spread_bps=10.0, mode="RANGE_MAKER"),
+            mid=100.0,
+            spread_bps=10.0,
+            source="test",
+            effective_max_inventory_usd=500.0,
+            inventory_profile=profile,
+            inventory_usd=25.0,
+        )
+
+        self.assertEqual(decision.action, "BUY")
+        self.assertTrue(decision.allow_trade)
+        self.assertTrue(decision.filter_values["upper_tf_conflict"])
+        self.assertTrue(decision.filter_values["passive_maker_only"])
+        self.assertAlmostEqual(decision.filter_values["size_after_reduction"], 3.0)
+
     def test_regime_detector_classifies_chop_market(self) -> None:
         detector = RegimeDetector(lookback_candles=14)
         prices = [
@@ -420,6 +524,50 @@ class RegimeEdgeGateTests(unittest.TestCase):
         )
 
         self.assertLess(abs(assessment.expected_edge_bps), 1_000.0)
+
+    def test_expected_edge_cost_units_stay_proportional_to_order_size(self) -> None:
+        edge_filter = EdgeFilter()
+        assessment = edge_filter.assess(
+            signal=DecisionOutcome(
+                action="BUY",
+                size_usd=25.0,
+                reason="reentry_pullback",
+                source="reentry",
+                order_price=2500.0,
+            ),
+            context=ExecutionContext(
+                pair="WETH/USDC",
+                router="uniswap_v3",
+                mid_price=2500.0,
+                quote_bid=2499.0,
+                quote_ask=2501.0,
+                router_price=2500.0,
+                backup_price=2500.0,
+                onchain_ref_price=2500.0,
+                twap_price=2500.0,
+                spread_bps=4.0,
+                volatility=0.001,
+                liquidity_usd=1_000_000.0,
+                gas_price_gwei=3.0,
+                market_mode="RANGE",
+                metadata={"adverse_selection_bps": 20.0},
+            ),
+            regime_assessment=build_regime("RANGE"),
+            inventory_usd=125.0,
+            target_base_usd=250.0,
+            consecutive_losses=0,
+            last_loss_cycle=None,
+            last_loss_reason="",
+            cycle_index=10,
+            cycle_seconds=60.0,
+            last_sell_price=2520.0,
+            current_profit_pct=None,
+            recovery_mode_active=True,
+        )
+
+        self.assertGreater(assessment.expected_edge_usd, -1.0)
+        self.assertAlmostEqual(assessment.fee_estimate_usd, 0.0125)
+        self.assertAlmostEqual(assessment.adverse_selection_usd, 0.05, places=6)
 
     def test_edge_filter_applies_inventory_soft_limit_penalty_and_bonus(self) -> None:
         edge_filter = EdgeFilter()
