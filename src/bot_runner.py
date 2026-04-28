@@ -17,6 +17,7 @@ from adaptive_market_maker import (
 )
 from config import (
     BOT_CONFIG_PROFILE,
+    BOT_GIT_COMMIT,
     BOT_MODE,
     COOLDOWN_AGGRESSIVE_SEC,
     COOLDOWN_BASE_SEC,
@@ -78,6 +79,10 @@ from config import (
     REENTRY_RSI_PERIOD,
     REENTRY_RSI_TURN_MARGIN,
     REENTRY_RUNAWAY_BUY_FRACTION,
+    RECOVERY_CONFLICT_SIZE_MULTIPLIER,
+    RECOVERY_MAX_TRADE_USD,
+    RECOVERY_REENTRY_DRIFT_PCT,
+    RECOVERY_REENTRY_MINUTES,
     REENTRY_TIMEOUT_BUY_FRACTION,
     REENTRY_TIMEOUT_MINUTES,
     REENTRY_ZONE_1_BUY_FRACTION,
@@ -334,6 +339,14 @@ class BotRuntime:
     current_activity_state: str = "normal"
     current_inactivity_fallback_active: bool = False
     current_signal_block_reason: str = ""
+    current_recovery_mode_active: bool = False
+    current_recovery_reason: str = ""
+    current_normal_gate_result: str = ""
+    current_recovery_gate_result: str = ""
+    current_upper_tf_conflict: bool = False
+    current_hard_block_reason: str = ""
+    current_size_before_reduction: float = 0.0
+    current_size_after_reduction: float = 0.0
     current_inventory_limit_state: str = "normal"
     current_should_enter: bool = False
     current_should_exit: bool = False
@@ -390,6 +403,7 @@ class BotRuntime:
     open_position_entry_edge_usd: float = 0.0
     open_position_used_fallback: bool = False
     current_drawdown_pct: float = 0.0
+    current_drawdown_usd: float = 0.0
     drawdown_guard_stage: str = "normal"
     daily_reset_date: str = ""
     daily_start_equity: float | None = None
@@ -1535,7 +1549,8 @@ def _log_execution_failure(
         **_execution_debug_fields(runtime),
     }
     payload.update(fields)
-    _log_pipeline_event(runtime, cycle_index, "EXECUTION_FAILED", **payload)
+    event_name = "EXECUTION_FAILED" if runtime.current_execution_attempted else "EXECUTION_SKIPPED"
+    _log_pipeline_event(runtime, cycle_index, event_name, **payload)
 
 
 def _log_execution_exception(
@@ -1763,6 +1778,9 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
         trade_blocked_reason = runtime.last_decision_block_reason
 
     filter_values: dict[str, object] = {
+        "profile_version": "v7.1",
+        "git_commit": BOT_GIT_COMMIT,
+        "config_profile": BOT_CONFIG_PROFILE,
         "consecutive_losses": runtime.loss_streak,
         "loss_pause_remaining": round(runtime.loss_pause_remaining_minutes, 6),
         "detected_regime": runtime.current_detected_regime,
@@ -1803,6 +1821,8 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
         "quote_size_usd": round(runtime.current_quote_size_usd, 6),
         "quote_skew_multiplier": round(runtime.current_quote_skew_multiplier, 6),
         "trade_blocked_reason": trade_blocked_reason,
+        "final_action": runtime.last_final_action,
+        "final_decision_size_usd": round(runtime.last_decision_size_usd, 6),
         "execution_timeframe_seconds": round(runtime.execution_timeframe_seconds, 6),
         "trend_timeframe_seconds": round(runtime.trend_timeframe_seconds, 6),
         "confirmation_timeframe_seconds": round(runtime.confirmation_timeframe_seconds, 6),
@@ -1811,6 +1831,14 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
         "upper_tf_short_ma": round(runtime.current_trend_short_ma, 6),
         "upper_tf_long_ma": round(runtime.current_trend_long_ma, 6),
         "upper_tf_bias": runtime.current_trend_bias,
+        "normal_gate_result": runtime.current_normal_gate_result,
+        "recovery_gate_result": runtime.current_recovery_gate_result,
+        "recovery_mode_active": runtime.current_recovery_mode_active,
+        "recovery_reason": runtime.current_recovery_reason,
+        "upper_tf_conflict": runtime.current_upper_tf_conflict,
+        "size_before_reduction": round(runtime.current_size_before_reduction, 6),
+        "size_after_reduction": round(runtime.current_size_after_reduction, 6),
+        "hard_block_reason": runtime.current_hard_block_reason,
         "confirmation_momentum_bps": round(runtime.current_confirmation_momentum_bps, 6),
         "confirmation_slowing": runtime.current_confirmation_slowing,
         "execution_bucket_count": runtime.current_execution_bucket_count,
@@ -1845,6 +1873,9 @@ def _signal_filter_values(runtime: BotRuntime) -> dict[str, object]:
                 "fee_estimate_usd": round(edge.fee_estimate_usd, 6),
                 "slippage_estimate_bps": round(edge.slippage_estimate_bps, 6),
                 "slippage_estimate_usd": round(edge.slippage_estimate_usd, 6),
+                "fee_usd": round(edge.fee_estimate_usd, 6),
+                "slippage_usd": round(edge.slippage_estimate_usd, 6),
+                "adverse_selection_usd": round(edge.adverse_selection_usd, 6),
                 "gas_estimate_usd": round(edge.gas_estimate_usd, 6),
                 "mev_risk_score": round(edge.mev_risk_score, 6),
                 "edge_bucket": edge.edge_bucket,
@@ -2657,6 +2688,14 @@ def _apply_signal_pipeline(
     inventory_usd: float,
 ) -> DecisionOutcome:
     runtime.last_raw_signal = _raw_signal_label(decision)
+    runtime.current_recovery_mode_active = False
+    runtime.current_recovery_reason = ""
+    runtime.current_normal_gate_result = ""
+    runtime.current_recovery_gate_result = ""
+    runtime.current_upper_tf_conflict = False
+    runtime.current_hard_block_reason = ""
+    runtime.current_size_before_reduction = 0.0
+    runtime.current_size_after_reduction = 0.0
     _reset_stale_loss_streak_if_idle(runtime, cycle_index)
     _refresh_loss_pause_state(runtime, cycle_index)
     regime_assessment = runtime.current_regime_assessment or runtime.regime_detector.assess(_regime_prices(runtime))
@@ -2723,6 +2762,25 @@ def _apply_signal_pipeline(
         size_usd=decision.size_usd,
     )
     force_trade_active = bool(decision.filter_values.get("force_trade_active")) or _force_trade_due(runtime, cycle_index)
+    recovery_mode_active, recovery_reason = _recovery_reentry_mode_active(runtime, intelligence, decision)
+    size_before_reduction = decision.size_usd
+    if recovery_mode_active and decision.action == "BUY":
+        sizing = _current_sizing(runtime)
+        computed_force_trade_size_usd = 0.0 if sizing is None else sizing.computed_force_trade_size_usd
+        max_allowed_trade_usd = MAX_TRADE_SIZE_USD if sizing is None else sizing.max_trade_size_usd
+        decision.size_usd = min(
+            max(computed_force_trade_size_usd, MIN_ORDER_SIZE_USD),
+            max(RECOVERY_MAX_TRADE_USD, MIN_ORDER_SIZE_USD),
+            max(max_allowed_trade_usd, MIN_ORDER_SIZE_USD),
+            max(decision.size_usd, MIN_ORDER_SIZE_USD),
+        )
+        if runtime.current_trend_bias == "sell_only":
+            decision.size_usd *= RECOVERY_CONFLICT_SIZE_MULTIPLIER
+            runtime.current_upper_tf_conflict = True
+    runtime.current_recovery_mode_active = recovery_mode_active
+    runtime.current_recovery_reason = recovery_reason
+    runtime.current_size_before_reduction = size_before_reduction
+    runtime.current_size_after_reduction = decision.size_usd
     inventory_emergency_override = bool(decision.filter_values.get("inventory_emergency_override")) or (
         _inventory_emergency_override_active(runtime)
         and decision.reason in {"inventory_rebalance", "inventory_correction", "inventory_force_reduce"}
@@ -2731,6 +2789,11 @@ def _apply_signal_pipeline(
         decision.filter_values,
         force_trade_active=force_trade_active,
         inventory_emergency_override=inventory_emergency_override,
+        recovery_mode_active=recovery_mode_active,
+        recovery_reason=recovery_reason,
+        size_before_reduction=round(size_before_reduction, 6),
+        size_after_reduction=round(decision.size_usd, 6),
+        upper_tf_conflict=runtime.current_upper_tf_conflict,
     )
     edge_assessment = runtime.edge_filter.assess(
         signal=decision,
@@ -2775,6 +2838,30 @@ def _apply_signal_pipeline(
         confirmation_momentum_bps=runtime.current_confirmation_momentum_bps,
         confirmation_slowing=runtime.current_confirmation_slowing,
     )
+    runtime.current_normal_gate_result = "allow" if gate_decision.allow_trade else "reject"
+    runtime.current_recovery_gate_result = "n/a"
+    if recovery_mode_active and not gate_decision.allow_trade and gate_decision.blocked_reason in {
+        "reentry_rejected_bad_regime",
+        "reentry_rejected_low_edge",
+    }:
+        gate_details = _merge_filter_values(
+            gate_decision.gate_details,
+            gate_decision="allow",
+            recovery_gate_override=True,
+            recovery_gate_result="allow",
+            normal_gate_result=runtime.current_normal_gate_result,
+            gate_blocked_reason="",
+            blocked_reason="",
+        )
+        gate_decision = SignalGateDecision(
+            allow_trade=True,
+            approved_mode="recovery_reentry_passive" if runtime.current_upper_tf_conflict else "recovery_reentry",
+            blocked_reason="",
+            gate_details=gate_details,
+        )
+        runtime.current_recovery_gate_result = "allow_override"
+    elif recovery_mode_active:
+        runtime.current_recovery_gate_result = "allow" if gate_decision.allow_trade else "reject"
     runtime.current_signal_gate_decision = gate_decision
     merged_filter_values = _merge_filter_values(decision.filter_values, **_signal_filter_values(runtime))
     merged_filter_values = _merge_filter_values(merged_filter_values, **adaptive_edge_filter_values)
@@ -2802,6 +2889,7 @@ def _apply_signal_pipeline(
         merged_filter_values = _merge_filter_values(merged_filter_values, **gate_decision.gate_details)
 
     if not gate_decision.allow_trade:
+        runtime.current_hard_block_reason = gate_decision.blocked_reason or decision.block_reason or "gate_reject"
         _log_should_trade_state(
             runtime,
             cycle_index,
@@ -2813,26 +2901,37 @@ def _apply_signal_pipeline(
             order_price=decision.order_price,
             blocked_reason=gate_decision.blocked_reason or decision.block_reason,
         )
-        _log_execution_failure(
+        _log_pipeline_event(
             runtime,
             cycle_index,
+            "GATE_REJECTED",
             side=decision.action.lower(),
-            reason=gate_decision.blocked_reason or decision.block_reason or "gate_reject",
+            reason=runtime.current_hard_block_reason,
             stage="signal_gate",
             trade_reason=decision.reason,
             size_usd=decision.size_usd,
             order_price=decision.order_price,
+            hard_block_reason=runtime.current_hard_block_reason,
+        )
+        _log_pipeline_event(
+            runtime,
+            cycle_index,
+            "ENTRY_BLOCKED" if decision.action == "BUY" else "EXIT_BLOCKED",
+            side=decision.action.lower(),
+            reason=runtime.current_hard_block_reason,
+            trade_reason=decision.reason,
         )
         _log_pipeline_event(
             runtime,
             cycle_index,
             "EXECUTION_SKIPPED",
             side=decision.action.lower(),
-            reason=gate_decision.blocked_reason or decision.block_reason or "gate_reject",
+            reason=runtime.current_hard_block_reason,
             trade_reason=decision.reason,
             approved_mode=gate_decision.approved_mode,
             reduction_only=getattr(inventory_profile, "reduction_only", False),
             inventory_limit=runtime.current_inventory_limit_state,
+            hard_block_reason=runtime.current_hard_block_reason,
         )
         return DecisionOutcome(
             action="NONE",
@@ -3479,6 +3578,24 @@ def _force_trade_due(runtime: BotRuntime, cycle_index: int) -> bool:
 
 def _force_trade_size_usd(runtime: BotRuntime, base_trade_size_usd: float) -> float:
     return risk_helpers.force_trade_size_usd(runtime, base_trade_size_usd)
+
+
+def _recovery_reentry_mode_active(runtime: BotRuntime, intelligence, decision: DecisionOutcome) -> tuple[bool, str]:
+    if decision.action != "BUY":
+        return False, ""
+    if runtime.state_context.current_state != StrategyState.WAIT_REENTRY:
+        return False, ""
+    if runtime.current_risk_governor_state != "normal":
+        return False, "risk_governor_not_normal"
+    if not (runtime.current_freeze_recovery_mode or runtime.current_inactivity_fallback_active):
+        return False, "recovery_switch_inactive"
+    if runtime.current_minutes_since_last_fill < RECOVERY_REENTRY_MINUTES:
+        return False, "recent_fill"
+    if abs(runtime.current_inventory_drift_pct) < RECOVERY_REENTRY_DRIFT_PCT:
+        return False, "inventory_drift_low"
+    if int(getattr(intelligence, "trades_last_60m", 0) or 0) > 0:
+        return False, "recent_trade_present"
+    return True, "wait_reentry_inventory_drift"
 
 
 def _buy_confirmation(prices: list[float]) -> tuple[bool, float, float, bool]:

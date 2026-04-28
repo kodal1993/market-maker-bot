@@ -604,6 +604,89 @@ class RegimeEdgeGateTests(unittest.TestCase):
         self.assertEqual(assessment.edge_override_reason, "force_trade_active")
         self.assertEqual(assessment.edge_penalty_reason, "")
 
+    def test_recovery_reentry_in_chop_range_does_not_hard_reject(self) -> None:
+        edge_filter = EdgeFilter()
+        assessment = edge_filter.assess(
+            signal=DecisionOutcome(
+                action="BUY",
+                size_usd=25.0,
+                reason="reentry_pullback",
+                source="reentry",
+                order_price=100.0,
+                filter_values={
+                    "recovery_mode_active": True,
+                    "active_regime": "RANGE",
+                    "strategy_mode": "RANGE_MAKER",
+                },
+            ),
+            context=ExecutionContext(
+                pair="WETH/USDC",
+                router="uniswap_v3",
+                mid_price=100.0,
+                quote_bid=99.95,
+                quote_ask=100.05,
+                router_price=100.0,
+                backup_price=100.0,
+                onchain_ref_price=100.0,
+                twap_price=100.0,
+                spread_bps=8.0,
+                volatility=0.002,
+                liquidity_usd=25_000.0,
+                gas_price_gwei=2.0,
+                market_mode="RANGE_MAKER",
+            ),
+            regime_assessment=build_regime("CHOP", confidence=78.0),
+            inventory_usd=210.0,
+            target_base_usd=260.0,
+            consecutive_losses=0,
+            last_loss_cycle=None,
+            last_loss_reason="",
+            cycle_index=100,
+            cycle_seconds=60.0,
+            last_sell_price=100.8,
+            current_profit_pct=None,
+        )
+        self.assertNotEqual(assessment.edge_reject_reason, "reentry_rejected_bad_regime")
+
+    def test_expected_edge_costs_stay_reasonable_for_25_usd_order(self) -> None:
+        edge_filter = EdgeFilter()
+        assessment = edge_filter.assess(
+            signal=DecisionOutcome(
+                action="BUY",
+                size_usd=25.0,
+                reason="quoted_buy",
+                source="strategy",
+                order_price=100.0,
+            ),
+            context=ExecutionContext(
+                pair="WETH/USDC",
+                router="uniswap_v3",
+                mid_price=100.01,
+                quote_bid=99.99,
+                quote_ask=100.01,
+                router_price=100.0,
+                backup_price=100.0,
+                onchain_ref_price=100.0,
+                twap_price=100.0,
+                spread_bps=2.0,
+                volatility=0.001,
+                liquidity_usd=500_000.0,
+                gas_price_gwei=0.2,
+                market_mode="RANGE",
+            ),
+            regime_assessment=build_regime("RANGE", confidence=70.0),
+            inventory_usd=45.0,
+            target_base_usd=50.0,
+            consecutive_losses=0,
+            last_loss_cycle=None,
+            last_loss_reason="",
+            cycle_index=120,
+            cycle_seconds=60.0,
+            last_sell_price=None,
+            current_profit_pct=None,
+        )
+        self.assertGreater(assessment.expected_edge_usd, -2.0)
+
     def test_inventory_emergency_override_builds_forced_rebalance_candidate(self) -> None:
         runtime = create_runtime(
             bootstrap_prices=[100.0] * 30,

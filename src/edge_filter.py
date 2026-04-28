@@ -211,6 +211,10 @@ class EdgeFilter:
             return EdgeAssessment(0.0, 0.0, 0.0, 0.0, False, "no_signal")
 
         side = signal.action.lower()
+        signal_filter_values = getattr(signal, "filter_values", {}) or {}
+        recovery_mode_active = bool(signal_filter_values.get("recovery_mode_active", False))
+        active_regime = str(signal_filter_values.get("active_regime", "") or "")
+        strategy_mode = str(signal_filter_values.get("strategy_mode", "") or "")
         if not self.enabled:
             return EdgeAssessment(
                 expected_edge_usd=max(EXPECTED_EDGE_MIN_USD, signal.size_usd * 0.0005),
@@ -251,6 +255,12 @@ class EdgeFilter:
         fee_estimate_usd = signal.size_usd * (self._fee_bps(signal.reason) / 10_000.0)
         slippage_cost_bps = self._slippage_cost_bps(signal.reason, slippage.expected_slippage_bps)
         slippage_estimate_usd = signal.size_usd * slippage_cost_bps / 10_000.0
+        base_qty = signal.size_usd / max(exec_signal.limit_price, 1e-9)
+        if side == "buy":
+            adverse_price_move_per_eth = max(context.mid_price - exec_signal.limit_price, 0.0)
+        else:
+            adverse_price_move_per_eth = max(exec_signal.limit_price - context.mid_price, 0.0)
+        adverse_selection_usd = adverse_price_move_per_eth * base_qty
         gas_estimate_usd = self._gas_estimate_usd(context)
         mev_penalty_usd = signal.size_usd * max(mev_risk.mev_risk_score, 0.0) / 100_000.0
 
@@ -290,6 +300,7 @@ class EdgeFilter:
         total_cost_usd = (
             fee_estimate_usd
             + slippage_estimate_usd
+            + adverse_selection_usd
             + gas_estimate_usd
             + mev_penalty_usd
             + regime_penalty_usd
@@ -387,13 +398,27 @@ class EdgeFilter:
             edge_penalty_reason = "expected_edge_below_min"
         elif is_reentry_reason(signal.reason) and pullback_depth_pct < REENTRY_MIN_PULLBACK_PCT:
             edge_reject_reason = "reentry_low_pullback"
-        elif is_reentry_reason(signal.reason) and regime_assessment.market_regime not in {"RANGE", "TREND_UP"}:
+        elif (
+            is_reentry_reason(signal.reason)
+            and regime_assessment.market_regime not in {"RANGE", "TREND_UP"}
+            and not (
+                recovery_mode_active
+                and regime_assessment.market_regime == "CHOP"
+                and active_regime == "RANGE"
+                and strategy_mode == "RANGE_MAKER"
+            )
+        ):
             edge_reject_reason = "reentry_rejected_bad_regime"
-        elif is_reentry_reason(signal.reason) and regime_assessment.market_regime == "TREND_UP" and regime_assessment.regime_confidence > 70.0:
+        elif (
+            is_reentry_reason(signal.reason)
+            and regime_assessment.market_regime == "TREND_UP"
+            and regime_assessment.regime_confidence > 70.0
+            and not recovery_mode_active
+        ):
             edge_reject_reason = "reentry_rejected_bad_regime"
         elif is_reentry_reason(signal.reason) and regime_assessment.volatility_score >= 75.0:
             edge_reject_reason = "reentry_high_volatility_shock"
-        elif is_reentry_reason(signal.reason) and edge_score < required_reentry_score:
+        elif is_reentry_reason(signal.reason) and edge_score < required_reentry_score and not recovery_mode_active:
             edge_reject_reason = "reentry_rejected_low_edge"
         elif not edge_override_reason and edge_bucket == "bad" and edge_score < required_edge_score:
             size_multiplier = min(size_multiplier, 0.72)
@@ -431,6 +456,7 @@ class EdgeFilter:
             loss_penalty_usd=round(loss_penalty_usd, 6),
             reentry_penalty_usd=round(reentry_penalty_usd, 6),
             inventory_adjustment_usd=round(inventory_adjustment_usd, 6),
+            adverse_selection_usd=round(adverse_selection_usd, 6),
             pullback_depth_pct=round(pullback_depth_pct, 6),
             edge_bucket=edge_bucket,
             size_multiplier=round(size_multiplier, 6),

@@ -205,6 +205,7 @@ class EdgeAssessment:
     loss_penalty_usd: float = 0.0
     reentry_penalty_usd: float = 0.0
     inventory_adjustment_usd: float = 0.0
+    adverse_selection_usd: float = 0.0
     pullback_depth_pct: float = 0.0
     edge_bucket: str = "bad"
     size_multiplier: float = 1.0
