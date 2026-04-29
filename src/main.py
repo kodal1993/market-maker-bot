@@ -146,13 +146,13 @@ def main():
                 if pool_monitor is not None:
                     pool_info = asyncio.run(get_uniswap_price_and_info(pool_monitor))
                     if pool_info and pool_info.get("price") is not None:
+                        current_price = float(pool_info["price"])
                         log(
-                            "Uniswap V3 Pool Info - "
-                            f"Price: {float(pool_info.get('price') or 0.0):.2f} USDC | "
-                            f"Liquidity: {float(pool_info.get('liquidity') or 0.0):.2f} | "
-                            f"Vol: {float(pool_info.get('volatility') or 0.0):.2f}%"
+                            f"[Uniswap V3] Price: {current_price:.2f} USDC | "
+                            f"Liquidity: {float(pool_info.get('liquidity', 0) or 0):.2f} | "
+                            f"Volatility: {float(pool_info.get('volatility', 0) or 0):.2f}%"
                         )
-                        mid = float(pool_info["price"])
+                        mid = current_price
                         source = "uniswap_v3_pool_monitor"
                     else:
                         mid, source = dex.get_price()
