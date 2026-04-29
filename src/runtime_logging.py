@@ -499,10 +499,20 @@ def log_trade_intent(runtime, cycle_index: int) -> None:
     )
 
 
-def kill_switch_allows_continue(pnl_usd: float, log_progress: bool) -> bool:
+def kill_switch_allows_continue(runtime, pnl_usd: float, log_progress: bool) -> bool:
     if pnl_usd < KILL_SWITCH_USD:
         if log_progress:
-            log(f"KILL SWITCH ACTIVE | pnl={pnl_usd:.2f}")
+            mid = getattr(runtime, "last_mid", 0.0) or 0.0
+            final_equity = runtime.portfolio.total_equity_usd(mid) if mid > 0 else runtime.portfolio.usdc
+            starting_equity = getattr(runtime, "start_eq", None)
+            realized_pnl = float(getattr(runtime.portfolio, "realized_pnl_usd", 0.0) or 0.0)
+            unrealized_pnl = final_equity - (starting_equity or final_equity) - realized_pnl
+            log(
+                "KILL SWITCH ACTIVE | "
+                f"pnl={pnl_usd:.2f} | source=runtime.start_eq | "
+                f"starting_equity={float(starting_equity or 0.0):.2f} | final_equity={final_equity:.2f} | "
+                f"realized_pnl={realized_pnl:.2f} | unrealized_pnl={unrealized_pnl:.2f}"
+            )
         return False
     return True
 
