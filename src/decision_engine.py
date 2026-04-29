@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 from config import MIN_ORDER_SIZE_USD
 from types_bot import DecisionOutcome
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -172,6 +176,19 @@ class DecisionEngine:
             return strategy_buy, overrides
         return strategy_sell, overrides
 
+    def _log_trade_skipped(self, reason: str, candidate: _DecisionCandidate | None = None, extra: dict[str, object] | None = None) -> None:
+        details: dict[str, object] = {"block_reason": reason}
+        if candidate is not None:
+            details.update({
+                "candidate_action": candidate.action,
+                "candidate_reason": candidate.reason,
+                "candidate_source": candidate.source,
+                "candidate_size_usd": round(candidate.size_usd, 6),
+            })
+        if extra:
+            details.update(extra)
+        logger.info("Trade skipped because: %s", details)
+
     def decide(
         self,
         cycle_index: int,
@@ -243,6 +260,7 @@ class DecisionEngine:
                     selected = strategy_candidate
 
             if selected is None:
+                self._log_trade_skipped("reentry_wait", extra={"cycle_index": cycle_index})
                 return DecisionOutcome(
                     action="NONE",
                     reason="reentry_wait",
@@ -267,6 +285,7 @@ class DecisionEngine:
             )
             overridden_signals.extend(strategy_overrides)
             if selected is None:
+                self._log_trade_skipped("no_signal", extra={"cycle_index": cycle_index})
                 return DecisionOutcome(
                     action="NONE",
                     block_reason="no_signal",
@@ -280,6 +299,7 @@ class DecisionEngine:
             inventory_manager_enabled=inventory_manager_enabled,
         )
         if selected.size_usd < MIN_ORDER_SIZE_USD:
+            self._log_trade_skipped("inventory_cap", candidate=selected)
             return DecisionOutcome(
                 action="NONE",
                 reason=selected.reason,
@@ -344,6 +364,7 @@ class DecisionEngine:
                 filter_values=dict(selected.filter_values),
             )
         if selected.size_usd < MIN_ORDER_SIZE_USD:
+            self._log_trade_skipped("size_below_min_after_filter", candidate=selected, extra={"filter_values": filter_values})
             return DecisionOutcome(
                 action="NONE",
                 reason=selected.reason,
@@ -358,6 +379,7 @@ class DecisionEngine:
             if filter_result.block_reason == "loss_streak_pause":
                 filter_values["loss_streak_pause_soft_gate"] = True
             else:
+                self._log_trade_skipped(filter_result.block_reason, candidate=selected, extra={"filter_values": filter_values})
                 return DecisionOutcome(
                     action="NONE",
                     reason=selected.reason,
