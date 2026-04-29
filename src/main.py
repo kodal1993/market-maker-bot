@@ -1,5 +1,4 @@
 import asyncio
-import time
 from itertools import count
 from pathlib import Path
 
@@ -59,11 +58,7 @@ def cycle_indices(max_loops: int):
     return count()
 
 
-async def get_uniswap_price_and_info(pool_monitor: PoolMonitor):
-    return await pool_monitor.get_pool_info()
-
-
-def main():
+async def main():
     close_log_sinks()
     register_log_sink(SqliteLogger(SQLITE_LOG_PATH))
     try:
@@ -145,17 +140,18 @@ def main():
 
                 current_price = None
                 if pool_monitor is not None:
-                    pool_info = asyncio.run(get_uniswap_price_and_info(pool_monitor))
-                    if pool_info and pool_info.get("price") is not None:
-                        current_price = float(pool_info["price"])
+                    try:
+                        pool_info = await pool_monitor.get_pool_info()
+                        current_price = float(pool_info.get("price"))
                         log(
-                            f"[Uniswap V3] ETH/USDC Price: {current_price:.4f} | "
-                            f"Liquidity: {float(pool_info.get('liquidity', 0) or 0):.2f} | "
-                            f"Volatility: {float(pool_info.get('volatility', 0) or 0):.2f}%"
+                            f"[Uniswap V3] ETH/USDC Price: {current_price:.4f} USDC | "
+                            f"Liquidity: {float(pool_info.get('liquidity', 0) or 0):,.0f} | "
+                            f"Volatility(30m): {float(pool_info.get('volatility', 0) or 0):.2f}%"
                         )
                         mid = current_price
                         source = "uniswap_v3_pool_monitor"
-                    else:
+                    except Exception as exc:
+                        log(f"Failed to get Uniswap V3 pool info: {exc}")
                         mid, source = dex.get_price()
                 else:
                     mid, source = dex.get_price()
@@ -203,7 +199,7 @@ def main():
                     break
                 if RUNTIME_STATE_ENABLED:
                     dump_state(runtime, path=RUNTIME_STATE_PATH)
-                time.sleep(LOOP_SECONDS)
+                await asyncio.sleep(LOOP_SECONDS)
             except KeyboardInterrupt:
                 manual_stop_requested = True
                 log("Manual stop requested | graceful shutdown")
@@ -218,7 +214,7 @@ def main():
                     notifier.handle_commands(runtime, build_summary)
                 except Exception as command_exc:  # noqa: BLE001 - notifications must not break the bot
                     log(f"Telegram command handling failed during recovery: {command_exc}")
-                time.sleep(LOOP_SECONDS)
+                await asyncio.sleep(LOOP_SECONDS)
 
         if runtime is None:
             log("No runtime initialized.")
@@ -246,4 +242,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
