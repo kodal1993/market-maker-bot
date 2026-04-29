@@ -1,3 +1,4 @@
+import asyncio
 import time
 from itertools import count
 from pathlib import Path
@@ -27,7 +28,9 @@ from config import (
     SQLITE_LOG_PATH,
 )
 from csv_logger import CsvLogger
+from dex.pool_monitor import PoolMonitor
 from dex_client import DexClient
+from execution.dex_executor import DexExecutor
 from logger import close_log_sinks, log, register_log_sink
 from log_cleanup import cleanup_logs_for_run, format_cleanup_result
 from multi_timeframe import required_bootstrap_price_rows
@@ -54,6 +57,10 @@ def cycle_indices(max_loops: int):
     if max_loops > 0:
         return range(max_loops)
     return count()
+
+
+async def get_uniswap_price_and_info(pool_monitor: PoolMonitor):
+    return await pool_monitor.get_pool_info()
 
 
 def main():
@@ -109,6 +116,14 @@ def main():
         runtime = None
         persisted_state = load_state(RUNTIME_STATE_PATH) if RUNTIME_STATE_ENABLED else {}
         dex = DexClient()
+        pool_monitor = None
+        dex_executor = None
+        try:
+            pool_monitor = PoolMonitor()
+            dex_executor = DexExecutor()
+            log("Uniswap V3 modules initialized for paper mode integration")
+        except Exception as exc:
+            log(f"Uniswap V3 modules unavailable, falling back to DexClient price feed: {exc}")
         manual_stop_requested = False
         log(
             "Trade activity config | "
@@ -128,7 +143,21 @@ def main():
                 except Exception as exc:  # noqa: BLE001 - notifications must not break the bot
                     log(f"Telegram command handling failed: {exc}")
 
-                mid, source = dex.get_price()
+                if pool_monitor is not None:
+                    pool_info = asyncio.run(get_uniswap_price_and_info(pool_monitor))
+                    if pool_info and pool_info.get("price") is not None:
+                        log(
+                            "Uniswap V3 Pool Info - "
+                            f"Price: {float(pool_info.get('price') or 0.0):.2f} USDC | "
+                            f"Liquidity: {float(pool_info.get('liquidity') or 0.0):.2f} | "
+                            f"Vol: {float(pool_info.get('volatility') or 0.0):.2f}%"
+                        )
+                        mid = float(pool_info["price"])
+                        source = "uniswap_v3_pool_monitor"
+                    else:
+                        mid, source = dex.get_price()
+                else:
+                    mid, source = dex.get_price()
                 if runtime is None:
                     start_usdc, start_eth = resolve_start_balances(reference_price=mid)
                     runtime = create_runtime(
