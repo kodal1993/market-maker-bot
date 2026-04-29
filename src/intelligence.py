@@ -11,6 +11,7 @@ from config import (
     EMA_RANGE_BAND_BPS,
     FREEZE_RECOVERY_MINUTES,
     INVENTORY_DOWNTREND_MAX,
+    INTELLIGENCE_SIGNAL_ALIGNMENT_THRESHOLD,
     INVENTORY_NORMAL_MAX,
     INVENTORY_UPTREND_MAX,
     LOW_ACTIVITY_GUARD_ENABLED,
@@ -452,9 +453,9 @@ class IntelligenceEngine:
 
         range_maker_aggression_factor = 1.0
         if active_regime == "RANGE":
-            range_maker_aggression_factor = 0.82
+            range_maker_aggression_factor = 0.70
             entry_trigger_multiplier *= range_maker_aggression_factor
-            min_edge_multiplier *= 0.82
+            min_edge_multiplier *= 0.72
 
         trend_threshold_multiplier = clamp(
             adaptive.threshold_multiplier
@@ -506,10 +507,10 @@ class IntelligenceEngine:
             quote_enabled = False
             blockers.append("warmup")
         elif drawdown_stage == "pause":
-            strategy_mode = "NO_TRADE" if inventory_usd <= 0 else "OVERWEIGHT_EXIT"
-            quote_enabled = strategy_mode != "NO_TRADE"
+            strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
+            quote_enabled = True
             mm_mode = "defensive_mm"
-            blockers.append("drawdown_pause_hard_stop")
+            blockers.append("drawdown_pause_softened")
         elif market.volatility_state == "EXTREME":
             strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
             quote_enabled = True
@@ -537,24 +538,24 @@ class IntelligenceEngine:
         elif active_regime == "RANGE":
             directional_bias = clamp(directional_bias * 0.72, -0.45, 0.45)
 
-        if drawdown_stage in {"size_reduce", "aggression_reduce", "pause"}:
+        if drawdown_stage in {"size_reduce", "aggression_reduce"}:
             blockers.append("drawdown_size_reduce")
-            max_inventory_multiplier = min(max_inventory_multiplier, 0.88)
-            trade_size_multiplier = min(trade_size_multiplier, 0.82)
-            spread_multiplier = max(spread_multiplier, 1.04)
-            target_inventory_pct = min(target_inventory_pct, 0.52)
+            max_inventory_multiplier = min(max_inventory_multiplier, 0.94)
+            trade_size_multiplier = min(trade_size_multiplier, 0.92)
+            spread_multiplier = max(spread_multiplier, 1.01)
+            target_inventory_pct = min(target_inventory_pct, 0.58)
             if strategy_mode == "TREND_UP":
                 strategy_mode = "RANGE_MAKER"
             if mm_mode == "aggressive":
                 mm_mode = "base_mm"
 
-        if drawdown_stage in {"aggression_reduce", "pause"}:
+        if drawdown_stage in {"aggression_reduce"}:
             blockers.append("drawdown_aggression_reduce")
-            confidence = clamp(confidence * 0.88, 0.0, 1.0)
-            spread_multiplier = max(spread_multiplier, 1.08)
-            max_chase_bps_multiplier = clamp(max_chase_bps_multiplier * 0.82, 0.35, 1.02)
-            directional_bias *= 0.72
-            target_inventory_pct = min(target_inventory_pct, 0.44)
+            confidence = clamp(confidence * 0.94, 0.0, 1.0)
+            spread_multiplier = max(spread_multiplier, 1.03)
+            max_chase_bps_multiplier = clamp(max_chase_bps_multiplier * 0.92, 0.45, 1.02)
+            directional_bias *= 0.86
+            target_inventory_pct = min(target_inventory_pct, 0.52)
             mm_mode = "defensive_mm"
             if strategy_mode == "TREND_UP":
                 strategy_mode = "RANGE_MAKER"
@@ -614,9 +615,13 @@ class IntelligenceEngine:
                 buy_enabled = False
                 blockers.append("inventory_buy_cap")
 
+        alignment_strength = max(abs(signal_score), abs(directional_bias))
         if feed_state == "BLOCK" and buy_enabled:
-            buy_enabled = False
-            blockers.append("feed_block")
+            if alignment_strength < max(INTELLIGENCE_SIGNAL_ALIGNMENT_THRESHOLD, 0.0):
+                buy_enabled = False
+                blockers.append("feed_block")
+            else:
+                blockers.append("feed_block_relaxed_on_alignment")
         elif feed_state == "CAUTION":
             blockers.append("feed_caution")
 

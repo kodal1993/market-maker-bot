@@ -209,7 +209,24 @@ class DecisionEngine:
 
         if extra:
             details.update(extra)
-        reason_message = f"Trade skipped: reason={reason}"
+        current_price = float(
+            details.get("order_price")
+            or details.get("current_price")
+            or (candidate.order_price if candidate is not None else 0.0)
+            or 0.0
+        )
+        expected_profit = float(details.get("expected_profit_pct", 0.0) or 0.0)
+        inventory_skew = float(
+            details.get("inventory_skew")
+            or details.get("inventory_ratio")
+            or details.get("inventory_pressure")
+            or 0.0
+        )
+
+        reason_message = (
+            f"Trade skipped | Reason: {reason} | Price: {current_price:.6f} | "
+            f"Expected Profit: {expected_profit:.3f}% | Inventory Skew: {inventory_skew:.3f}"
+        )
         if reason == "expected_profit_below_threshold":
             expected_profit = float(details.get("expected_profit_pct", 0.0))
             min_required = float(details.get("min_expected_profit_pct", 0.0))
@@ -416,7 +433,18 @@ class DecisionEngine:
             if filter_result.block_reason == "loss_streak_pause":
                 filter_values["loss_streak_pause_soft_gate"] = True
             else:
-                self._log_trade_skipped(filter_result.block_reason, candidate=selected, extra={"filter_values": filter_values})
+                skip_extra: dict[str, object] = {"filter_values": filter_values}
+                for key in (
+                    "expected_profit_pct",
+                    "min_expected_profit_pct",
+                    "inventory_skew",
+                    "inventory_ratio",
+                    "current_price",
+                    "order_price",
+                ):
+                    if key in filter_values:
+                        skip_extra[key] = filter_values[key]
+                self._log_trade_skipped(filter_result.block_reason, candidate=selected, extra=skip_extra)
                 return DecisionOutcome(
                     action="NONE",
                     reason=selected.reason,
