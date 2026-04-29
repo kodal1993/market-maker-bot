@@ -288,7 +288,7 @@ REENTRY = ReentryConfig(
 
 EXECUTION_POLICY = ExecutionPolicyConfig(
     enabled=_env_bool("EXECUTION_ENGINE_ENABLED", True),
-    min_expected_profit_pct=_env_float("EXECUTION_MIN_EXPECTED_PROFIT_PCT", 0.40),
+    min_expected_profit_pct=_env_float("EXECUTION_MIN_EXPECTED_PROFIT_PCT", 0.12),
     maker_slippage_bps=_env_float("EXECUTION_MAKER_SLIPPAGE_BPS", 0.5),
     taker_slippage_bps=_env_float("EXECUTION_TAKER_SLIPPAGE_BPS", 4.0),
     slippage_size_factor=_env_float("EXECUTION_SLIPPAGE_SIZE_FACTOR", 1.25),
@@ -328,7 +328,7 @@ TRADE_FILTER = TradeFilterConfig(
     buy_rsi_max=_env_float("TRADE_FILTER_BUY_RSI_MAX", 70.0),
     sell_rsi_min=_env_float("TRADE_FILTER_SELL_RSI_MIN", 30.0),
     loss_streak_limit=_env_int("TRADE_FILTER_LOSS_STREAK_LIMIT", 2),
-    min_trade_distance_pct=_env_float("MIN_TRADE_DISTANCE_PCT", 0.12),
+    min_trade_distance_pct=_env_float("MIN_TRADE_DISTANCE_PCT", 0.04),
     cooldown_minutes=_env_float("TRADE_COOLDOWN_MINUTES", 2.0),
     min_time_between_trades_minutes=_env_float("MIN_TIME_BETWEEN_TRADES_MINUTES", 3.0),
     max_trades_per_day=_env_int("MAX_TRADES_PER_DAY", 40),
@@ -842,6 +842,7 @@ MAX_DAILY_LOSS = _env_float("MAX_DAILY_LOSS", 0.03)
 MAX_CONSECUTIVE_LOSSES = _env_int("MAX_CONSECUTIVE_LOSSES", 3)
 REGIME_CONFIDENCE_MIN = _env_float("REGIME_CONFIDENCE_MIN", 0.65)
 TRADE_FILTER_DEBUG_MODE = TRADE_FILTER.debug_mode
+INTELLIGENCE_SIGNAL_ALIGNMENT_THRESHOLD = _env_float("INTELLIGENCE_SIGNAL_ALIGNMENT_THRESHOLD", 0.38)
 
 RECOVERY_REENTRY_MINUTES = max(_env_float("RECOVERY_REENTRY_MINUTES", 120.0), 0.0)
 RECOVERY_REENTRY_DRIFT_PCT = max(_env_float("RECOVERY_REENTRY_DRIFT_PCT", 25.0), 0.0)
