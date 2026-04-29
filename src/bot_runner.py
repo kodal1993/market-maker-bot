@@ -1997,8 +1997,8 @@ def _maybe_log_hourly_report(runtime: BotRuntime, cycle_index: int) -> None:
         if runtime.total_attempted_trade_count > 0
         else 0.0
     )
-    inventory_ratio = runtime.portfolio.inventory_value_usd(runtime.last_mid) / max(
-        runtime.portfolio.equity(runtime.last_mid),
+    inventory_ratio = runtime.portfolio.inventory_usd(runtime.last_mid) / max(
+        runtime.portfolio.total_equity_usd(runtime.last_mid),
         1e-9,
     )
 
