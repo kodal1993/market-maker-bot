@@ -295,6 +295,16 @@ class TradeFilter:
             size_multiplier *= max(min(TRADE_FILTER_STRONG_TREND_SIZE_MULTIPLIER, 1.0), 0.10)
             adjustment_reasons.append("strong_trend_size_reduction")
 
+        if (
+            side == "buy"
+            and trade_reason == "trend_buy"
+            and regime == "TREND"
+            and not strong_trend_buy_active
+            and market_score < TRADE_FILTER_STRONG_TREND_SCORE
+        ):
+            size_multiplier *= 0.80
+            adjustment_reasons.append("borderline_trend_size_reduction")
+
         if force_trade_active:
             filter_values["adjustment_reasons"] = adjustment_reasons + ["force_trade_override"]
             filter_values["size_multiplier"] = round(size_multiplier, 4)

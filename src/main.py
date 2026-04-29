@@ -1,4 +1,5 @@
 import asyncio
+import time
 from itertools import count
 from pathlib import Path
 
@@ -58,7 +59,7 @@ def cycle_indices(max_loops: int):
     return count()
 
 
-async def main():
+async def _main_async():
     close_log_sinks()
     register_log_sink(SqliteLogger(SQLITE_LOG_PATH))
     try:
@@ -241,5 +242,9 @@ async def main():
         close_log_sinks()
 
 
+def main():
+    return asyncio.run(_main_async())
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
