@@ -143,14 +143,24 @@ async def _main_async():
                 if pool_monitor is not None:
                     try:
                         pool_info = await pool_monitor.get_pool_info()
-                        current_price = float(pool_info.get("price"))
-                        log(
-                            f"[Uniswap V3] ETH/USDC Price: {current_price:.4f} USDC | "
-                            f"Liquidity: {float(pool_info.get('liquidity', 0) or 0):,.0f} | "
-                            f"Volatility(30m): {float(pool_info.get('volatility', 0) or 0):.2f}%"
-                        )
-                        mid = current_price
-                        source = "uniswap_v3_pool_monitor"
+                        pool_status = str(pool_info.get("status", "unknown"))
+                        pool_price = pool_info.get("price")
+                        if pool_status == "ok" and pool_price is not None:
+                            current_price = float(pool_price)
+                            log(
+                                f"[Uniswap V3] ETH/USDC Price: {current_price:.4f} USDC | "
+                                f"Liquidity: {float(pool_info.get('liquidity', 0) or 0):,.0f} | "
+                                f"Volatility(30m): {float(pool_info.get('volatility', 0) or 0):.2f}% | "
+                                f"Cached: {bool(pool_info.get('cached', False))}"
+                            )
+                            mid = current_price
+                            source = "uniswap_v3_pool_monitor"
+                        else:
+                            log("Uniswap V3 pool price unavailable, falling back to DexClient")
+                            error_reason = pool_info.get("error_reason")
+                            if error_reason:
+                                log(f"Uniswap V3 pool info status={pool_status} reason={error_reason}")
+                            mid, source = dex.get_price()
                     except Exception as exc:
                         log(f"Failed to get Uniswap V3 pool info: {exc}")
                         mid, source = dex.get_price()
