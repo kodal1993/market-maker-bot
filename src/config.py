@@ -125,8 +125,11 @@ def _env_drawdown_ratio(primary_name: str, legacy_name: str, default_ratio: floa
 CORE = CoreConfig(
     bot_mode=_env_str("BOT_MODE", "paper"),
     chain=_env_str("CHAIN", "base"),
-    rpc_url=_env_str("RPC_URL", ""),
-    rpc_urls=normalize_rpc_urls(_env_str("RPC_URL", ""), _env_list("RPC_URLS")),
+    rpc_url=_env_str("RPC_URL", _env_str("BASE_RPC_URL", "")),
+    rpc_urls=normalize_rpc_urls(
+        _env_str("RPC_URL", _env_str("BASE_RPC_URL", "")),
+        _env_list("RPC_URLS", _env_str("BASE_RPC_URLS", "")),
+    ),
     rpc_timeout_sec=_env_float("RPC_TIMEOUT_SEC", 10.0),
     rpc_max_retries=_env_int("RPC_MAX_RETRIES", 3),
     rpc_retry_backoff_sec=_env_float("RPC_RETRY_BACKOFF_SEC", 2.0),
