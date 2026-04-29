@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,8 @@ from logger import log
 if TYPE_CHECKING:
     from bot_runner import BotRuntime
 
+
+from security_redaction import redact_secrets
 
 def _escape_markdown_v2(value: object) -> str:
     text = str(value)
@@ -249,7 +252,7 @@ class TelegramNotifier:
             if attempt < self.api_max_retries:
                 self.sleep_fn(min(1.0 * (attempt + 1), 3.0))
 
-        log(f"Telegram API failed | method {method} | error {last_error}")
+        log(f"Telegram API failed | method {method} | error {redact_secrets(last_error)}")
         return {"ok": False, "description": last_error, "result": []}
 
     def _throttle(self) -> None:
@@ -284,7 +287,7 @@ class TelegramNotifier:
                 lines.append(f"TELEGRAM_CHAT_ID={self.chat_id}")
             self.env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         except OSError as exc:
-            log(f"Telegram chat id persist failed: {exc}")
+            log(f"Telegram chat id persist failed: {redact_secrets(exc)}")
 
     def discover_chat_id(self) -> str:
         if self.chat_id or not self.is_enabled():
@@ -546,7 +549,7 @@ class TelegramNotifier:
             [
                 "*Bot Error*",
                 f"Context: {_plain(context_message)}",
-                f"Error: {_plain(exc)}",
+                f"Error: {_plain(redact_secrets(exc))}",
                 f"Time: {_plain(self.now_fn().isoformat(timespec='seconds'))}",
             ]
         )

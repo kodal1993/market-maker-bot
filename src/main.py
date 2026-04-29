@@ -40,6 +40,7 @@ from performance import build_report, write_report_csv, write_report_json
 from price_history import load_bootstrap_prices
 from sqlite_logger import SqliteLogger
 from startup_validation import validate_startup_config
+from security_redaction import redact_secrets
 from telegram_notifier import TelegramNotifier
 from state_persistence import apply_state, dump_state, load_state
 
@@ -76,7 +77,7 @@ async def _main_async():
             try:
                 notifier.notify_error("startup", "; ".join(startup_errors[:3]))
             except Exception as exc:  # noqa: BLE001 - notifications must not break shutdown
-                log(f"Telegram startup notify failed: {exc}")
+                log(f"Telegram startup notify failed: {redact_secrets(exc)}")
             return
 
         trades_path = Path(TRADES_CSV)
@@ -122,7 +123,7 @@ async def _main_async():
             dex_executor = DexExecutor()
             log("Uniswap V3 modules initialized for paper mode integration")
         except Exception as exc:
-            log(f"Uniswap V3 modules unavailable, falling back to DexClient price feed: {exc}")
+            log(f"Uniswap V3 modules unavailable, falling back to DexClient price feed: {redact_secrets(exc)}")
         manual_stop_requested = False
         log(
             "Trade activity config | "
@@ -140,7 +141,7 @@ async def _main_async():
                 try:
                     notifier.handle_commands(runtime, build_summary)
                 except Exception as exc:  # noqa: BLE001 - notifications must not break the bot
-                    log(f"Telegram command handling failed: {exc}")
+                    log(f"Telegram command handling failed: {redact_secrets(exc)}")
 
                 current_price = None
                 if pool_monitor is not None:
@@ -165,7 +166,7 @@ async def _main_async():
                                 log(f"Uniswap V3 pool info status={pool_status} reason={error_reason}")
                             mid, source = dex.get_price()
                     except Exception as exc:
-                        log(f"Failed to get Uniswap V3 pool info: {exc}")
+                        log(f"Failed to get Uniswap V3 pool info: {redact_secrets(exc)}")
                         mid, source = dex.get_price()
                 else:
                     mid, source = dex.get_price()
@@ -219,7 +220,7 @@ async def _main_async():
                 try:
                     notifier.maybe_send_daily_report(runtime, build_summary)
                 except Exception as exc:  # noqa: BLE001 - notifications must not break the bot
-                    log(f"Telegram daily report failed: {exc}")
+                    log(f"Telegram daily report failed: {redact_secrets(exc)}")
                 if not should_continue:
                     break
                 if RUNTIME_STATE_ENABLED:
@@ -230,15 +231,15 @@ async def _main_async():
                 log("Manual stop requested | graceful shutdown")
                 break
             except Exception as exc:
-                log(f"loop error: {exc}")
+                log(f"loop error: {redact_secrets(exc)}")
                 try:
                     notifier.notify_error("main_loop", exc)
                 except Exception as notify_exc:  # noqa: BLE001 - notifications must not break the bot
-                    log(f"Telegram error notify failed: {notify_exc}")
+                    log(f"Telegram error notify failed: {redact_secrets(notify_exc)}")
                 try:
                     notifier.handle_commands(runtime, build_summary)
                 except Exception as command_exc:  # noqa: BLE001 - notifications must not break the bot
-                    log(f"Telegram command handling failed during recovery: {command_exc}")
+                    log(f"Telegram command handling failed during recovery: {redact_secrets(command_exc)}")
                 await asyncio.sleep(LOOP_SECONDS)
 
         if runtime is None:
