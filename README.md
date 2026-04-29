@@ -156,3 +156,17 @@ python src/startup_validation.py
 python src/main.py
 python scripts/monitor_aggressive_paper.py --once
 ```
+
+## Official VPS paper startup
+
+Use the official aggressive Base paper profile with one command:
+
+```bash
+bash scripts/start_paper_vps.sh
+```
+
+Optional one-shot monitor check:
+
+```bash
+bash scripts/monitor_once.sh
+```
