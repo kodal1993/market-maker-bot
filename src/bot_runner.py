@@ -453,6 +453,10 @@ class BotRuntime:
     summary_window_edge_total: float = 0.0
     summary_window_edge_samples: int = 0
     summary_window_block_reasons: dict[str, int] = field(default_factory=dict)
+    hourly_trade_count: int = 0
+    hourly_skip_count: int = 0
+    hourly_skip_reasons: dict[str, int] = field(default_factory=dict)
+    hourly_window_cycle_count: int = 0
     last_freeze_block_summary_cycle: int | None = None
     adaptive_pending_fill_checks: deque = field(default_factory=lambda: deque(maxlen=128))
     adaptive_fill_quality_events: deque = field(default_factory=lambda: deque(maxlen=256))
@@ -1975,26 +1979,36 @@ def _record_adaptive_cycle_history(runtime: BotRuntime, cycle_index: int, block_
 
 
 def _maybe_log_hourly_report(runtime: BotRuntime, cycle_index: int) -> None:
-    if runtime.adaptive_config is None or not runtime.adaptive_config.logging_enabled:
-        return
     report_every_cycles = max(int(round((60.0 * 60.0) / max(runtime.cycle_seconds, 1.0))), 1)
-    if (cycle_index + 1) < report_every_cycles:
+    if runtime.hourly_window_cycle_count < report_every_cycles:
         return
-    if runtime.adaptive_last_hourly_report_cycle is not None and (cycle_index - runtime.adaptive_last_hourly_report_cycle) < report_every_cycles:
-        return
-    report = build_hourly_report(runtime, cycle_index)
-    if not report:
-        return
-    runtime.adaptive_last_hourly_report_cycle = cycle_index
+
+    reasons_text = _top_block_reasons_text(runtime.hourly_skip_reasons, limit=8)
     log(
-        "hourly report | "
-        f"trades {report['trade_count']} | "
-        f"pnl {report['pnl_usd']:.2f} | "
-        f"drawdown {report['drawdown_pct']:.2%} | "
-        f"modes {report['mode_distribution']} | "
-        f"skips {report['skip_reasons']} | "
-        f"toxic_fill_ratio {report['toxic_fill_ratio']:.2f}"
+        "Trades this hour: "
+        f"{runtime.hourly_trade_count} | "
+        f"Skipped: {runtime.hourly_skip_count} | "
+        f"Reasons: {reasons_text}"
     )
+
+    if runtime.adaptive_config is not None and runtime.adaptive_config.logging_enabled:
+        report = build_hourly_report(runtime, cycle_index)
+        if report:
+            runtime.adaptive_last_hourly_report_cycle = cycle_index
+            log(
+                "hourly report | "
+                f"trades {report['trade_count']} | "
+                f"pnl {report['pnl_usd']:.2f} | "
+                f"drawdown {report['drawdown_pct']:.2%} | "
+                f"modes {report['mode_distribution']} | "
+                f"skips {report['skip_reasons']} | "
+                f"toxic_fill_ratio {report['toxic_fill_ratio']:.2f}"
+            )
+
+    runtime.hourly_trade_count = 0
+    runtime.hourly_skip_count = 0
+    runtime.hourly_skip_reasons = {}
+    runtime.hourly_window_cycle_count = 0
 
 
 def _paper_mode_enabled() -> bool:
@@ -2173,6 +2187,7 @@ def _record_cycle_summary(
         return token.replace(" ", "_")
 
     runtime.summary_window_cycles += 1
+    runtime.hourly_window_cycle_count += 1
     runtime.summary_window_spread_total += max(spread_bps, 0.0)
     if runtime.current_quote_enabled:
         runtime.summary_window_quotes_posted += 1
@@ -2192,9 +2207,13 @@ def _record_cycle_summary(
         runtime.summary_window_block_reasons[normalized_block_reason] = (
             runtime.summary_window_block_reasons.get(normalized_block_reason, 0) + 1
         )
+        runtime.hourly_skip_count += 1
+        runtime.hourly_skip_reasons[normalized_block_reason] = runtime.hourly_skip_reasons.get(normalized_block_reason, 0) + 1
         runtime.no_trade_reason_counts[normalized_no_trade_reason] = (
             runtime.no_trade_reason_counts.get(normalized_no_trade_reason, 0) + 1
         )
+    elif runtime.last_allow_trade and runtime.last_final_action in {"BUY", "SELL"}:
+        runtime.hourly_trade_count += 1
     _record_adaptive_cycle_history(runtime, cycle_index, normalized_block_reason)
 
     summary_window_cycles = max(int(round(900.0 / max(runtime.cycle_seconds, 1.0))), 1)
