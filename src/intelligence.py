@@ -416,15 +416,14 @@ class IntelligenceEngine:
             spread_multiplier *= 0.94
             blockers.append("low_vol_tighter_quotes")
         elif market.volatility_state == "HIGH":
-            spread_multiplier *= 1.08
-            trade_size_multiplier *= 0.86
-            blockers.append("high_vol_size_reduce")
+            spread_multiplier *= 1.03
+            trade_size_multiplier *= 0.94
+            blockers.append("high_vol_relaxed")
         elif market.volatility_state == "EXTREME":
-            spread_multiplier *= 1.18
-            trade_size_multiplier *= 0.68
-            active_regime = "NO_TRADE"
+            spread_multiplier *= 1.14
+            trade_size_multiplier *= 0.78
             mm_mode = "defensive_mm"
-            blockers.append("extreme_vol_no_trade")
+            blockers.append("extreme_vol_defensive")
 
         if low_activity_active:
             activity_state = "low_activity_relax"
@@ -443,12 +442,18 @@ class IntelligenceEngine:
         if fill_quality_tier in {"weak", "poor"}:
             blockers.append(f"fill_quality_{fill_quality_tier}")
 
+        range_maker_aggression_factor = 1.0
+        if strategy_mode == "RANGE_MAKER" or active_regime == "RANGE":
+            range_maker_aggression_factor = 0.88
+            entry_trigger_multiplier *= range_maker_aggression_factor
+            min_edge_multiplier *= 0.90
+
         trend_threshold_multiplier = clamp(
             adaptive.threshold_multiplier
             * entry_trigger_multiplier
             * (1.0 + max(risk_score - 0.72, 0.0) * 0.12),
-            0.60,
-            1.45,
+            0.52,
+            1.30,
         )
         max_chase_bps_multiplier = clamp(
             0.98 - (risk_score * 0.20) + max(market.market_score, 0.0) * 0.10,
@@ -491,14 +496,14 @@ class IntelligenceEngine:
             quote_enabled = False
             blockers.append("warmup")
         elif drawdown_stage == "pause":
-            strategy_mode = "NO_TRADE"
-            quote_enabled = False
-            mm_mode = "defensive_mm"
-            blockers.append("drawdown_pause")
-        elif market.volatility_state == "EXTREME":
-            strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "NO_TRADE"
+            strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
             quote_enabled = strategy_mode != "NO_TRADE"
-            blockers.append("capital_preservation")
+            mm_mode = "defensive_mm"
+            blockers.append("drawdown_pause_softened")
+        elif market.volatility_state == "EXTREME":
+            strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
+            quote_enabled = True
+            blockers.append("capital_preservation_softened")
         elif inventory_usd > max(severe_inventory_exit_threshold, 0.0):
             strategy_mode = "OVERWEIGHT_EXIT"
             mm_mode = "defensive_mm"
@@ -544,7 +549,7 @@ class IntelligenceEngine:
             if strategy_mode == "TREND_UP":
                 strategy_mode = "RANGE_MAKER"
 
-        buy_enabled = strategy_mode in {"TREND_UP", "RANGE_MAKER"} and risk_score < 1.20
+        buy_enabled = strategy_mode in {"TREND_UP", "RANGE_MAKER"} and risk_score < 1.30
         sell_enabled = strategy_mode in {"TREND_UP", "RANGE_MAKER", "OVERWEIGHT_EXIT"}
 
         if not quote_enabled or strategy_mode == "NO_TRADE":
