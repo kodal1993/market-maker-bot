@@ -125,7 +125,7 @@ def _env_drawdown_ratio(primary_name: str, legacy_name: str, default_ratio: floa
 CORE = CoreConfig(
     bot_mode=_env_str("BOT_MODE", "paper"),
     chain=_env_str("CHAIN", "base"),
-    rpc_url=_env_str("RPC_URL", ""),
+    rpc_url=_env_str("RPC_URL", _env_str("BASE_RPC_URL", "")),
     rpc_urls=normalize_rpc_urls(_env_str("RPC_URL", ""), _env_list("RPC_URLS")),
     rpc_timeout_sec=_env_float("RPC_TIMEOUT_SEC", 10.0),
     rpc_max_retries=_env_int("RPC_MAX_RETRIES", 3),
@@ -1253,3 +1253,10 @@ ADAPTIVE_PERF_SKEW_UPPER_BOUND = _adaptive_profile_float("ADAPTIVE_PERF_SKEW_UPP
 
 def has_env_value(name: str) -> bool:
     return _env_has_value(name)
+
+
+BASE_RPC_URL = _env_str("BASE_RPC_URL", "https://mainnet.base.org")
+CHAIN_ID = _env_int("CHAIN_ID", 8453)
+WETH_ADDRESS = _env_str("WETH_ADDRESS", "0x4200000000000000000000000000000000000006")
+USDC_ADDRESS = _env_str("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+PAPER_TRADING = _env_bool("PAPER_TRADING", True)

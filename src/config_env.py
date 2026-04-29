@@ -7,8 +7,14 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_PATH = BASE_DIR / ".env"
+PROFILE_ENV_PATH = os.getenv("BOT_ENV_PROFILE", "").strip()
 
+# Alap .env, majd opcionális profil felülírások
 load_dotenv(ENV_PATH, override=False)
+if PROFILE_ENV_PATH:
+    profile_path = (BASE_DIR / PROFILE_ENV_PATH).resolve()
+    if profile_path.exists():
+        load_dotenv(profile_path, override=True)
 
 
 def env_str(name: str, default: str = "") -> str:
