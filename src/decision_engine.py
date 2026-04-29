@@ -185,6 +185,28 @@ class DecisionEngine:
                 "candidate_source": candidate.source,
                 "candidate_size_usd": round(candidate.size_usd, 6),
             })
+
+        normalized = str(reason or "").lower()
+        reason_tags: list[str] = []
+        tag_keywords = {
+            "cooldown": "cooldown",
+            "profit": "profit_threshold",
+            "inventory": "inventory_limit",
+            "signal": "signal_alignment",
+            "drawdown": "drawdown_protection",
+            "loss": "loss_control",
+            "reentry": "reentry_wait",
+            "size": "size_limit",
+            "edge": "edge_threshold",
+            "spread": "spread_constraint",
+        }
+        for keyword, label in tag_keywords.items():
+            if keyword in normalized:
+                reason_tags.append(label)
+        if not reason_tags:
+            reason_tags.append("other")
+        details["skip_conditions"] = sorted(set(reason_tags))
+
         if extra:
             details.update(extra)
         logger.info("Trade skipped because: %s", details)
