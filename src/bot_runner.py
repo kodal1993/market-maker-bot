@@ -457,6 +457,11 @@ class BotRuntime:
     hourly_skip_count: int = 0
     hourly_skip_reasons: dict[str, int] = field(default_factory=dict)
     hourly_window_cycle_count: int = 0
+    total_trade_count: int = 0
+    total_skip_count: int = 0
+    total_skip_reasons: dict[str, int] = field(default_factory=dict)
+    total_attempted_trade_count: int = 0
+    total_attempted_expected_profit_usd: float = 0.0
     last_freeze_block_summary_cycle: int | None = None
     adaptive_pending_fill_checks: deque = field(default_factory=lambda: deque(maxlen=128))
     adaptive_fill_quality_events: deque = field(default_factory=lambda: deque(maxlen=256))
@@ -1984,11 +1989,24 @@ def _maybe_log_hourly_report(runtime: BotRuntime, cycle_index: int) -> None:
         return
 
     reasons_text = _top_block_reasons_text(runtime.hourly_skip_reasons, limit=8)
+    total_reasons_text = _top_block_reasons_text(runtime.total_skip_reasons, limit=5)
+    avg_expected_profit = (
+        runtime.total_attempted_expected_profit_usd / runtime.total_attempted_trade_count
+        if runtime.total_attempted_trade_count > 0
+        else 0.0
+    )
     log(
-        "Trades this hour: "
+        "Hourly summary | Trades this hour: "
         f"{runtime.hourly_trade_count} | "
         f"Skipped: {runtime.hourly_skip_count} | "
-        f"Reasons: {reasons_text}"
+        f"Reasons: {reasons_text} | "
+        f"Avg expected profit/attempt: {avg_expected_profit:.6f} USD | "
+        f"Inventory skew: {runtime.current_inventory_ratio*100:.2f}% | "
+        f"Regime: {runtime.current_strategy_mode} | "
+        f"Volatility: {runtime.current_volatility_bucket} ({runtime.intelligence.volatility:.6f}) | "
+        f"Total trades: {runtime.total_trade_count} | "
+        f"Total skips: {runtime.total_skip_count} | "
+        f"Top skip reasons (all-time): {total_reasons_text}"
     )
 
     if runtime.adaptive_config is not None and runtime.adaptive_config.logging_enabled:
@@ -2208,12 +2226,23 @@ def _record_cycle_summary(
             runtime.summary_window_block_reasons.get(normalized_block_reason, 0) + 1
         )
         runtime.hourly_skip_count += 1
+        runtime.total_skip_count += 1
         runtime.hourly_skip_reasons[normalized_block_reason] = runtime.hourly_skip_reasons.get(normalized_block_reason, 0) + 1
+        runtime.total_skip_reasons[normalized_block_reason] = runtime.total_skip_reasons.get(normalized_block_reason, 0) + 1
         runtime.no_trade_reason_counts[normalized_no_trade_reason] = (
             runtime.no_trade_reason_counts.get(normalized_no_trade_reason, 0) + 1
         )
     elif runtime.last_allow_trade and runtime.last_final_action in {"BUY", "SELL"}:
         runtime.hourly_trade_count += 1
+        runtime.total_trade_count += 1
+        runtime.total_attempted_trade_count += 1
+        attempted_size_usd = max(float(getattr(runtime, "last_decision_size_usd", 0.0) or 0.0), 0.0)
+        expected_edge_bps = (
+            runtime.current_edge_assessment.expected_edge_bps
+            if runtime.current_edge_assessment is not None
+            else 0.0
+        )
+        runtime.total_attempted_expected_profit_usd += max(attempted_size_usd * expected_edge_bps / 10000.0, 0.0)
     _record_adaptive_cycle_history(runtime, cycle_index, normalized_block_reason)
 
     summary_window_cycles = max(int(round(900.0 / max(runtime.cycle_seconds, 1.0))), 1)
