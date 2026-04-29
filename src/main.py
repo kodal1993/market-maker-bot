@@ -143,12 +143,13 @@ def main():
                 except Exception as exc:  # noqa: BLE001 - notifications must not break the bot
                     log(f"Telegram command handling failed: {exc}")
 
+                current_price = None
                 if pool_monitor is not None:
                     pool_info = asyncio.run(get_uniswap_price_and_info(pool_monitor))
                     if pool_info and pool_info.get("price") is not None:
                         current_price = float(pool_info["price"])
                         log(
-                            f"[Uniswap V3] Price: {current_price:.2f} USDC | "
+                            f"[Uniswap V3] ETH/USDC Price: {current_price:.4f} | "
                             f"Liquidity: {float(pool_info.get('liquidity', 0) or 0):.2f} | "
                             f"Volatility: {float(pool_info.get('volatility', 0) or 0):.2f}%"
                         )
