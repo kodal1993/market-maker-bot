@@ -1,26 +1,43 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
-import statistics
+import os
 import time
-from dataclasses import dataclass
+from statistics import mean
 from typing import Any
 
 from web3 import Web3
 
+logger = logging.getLogger(__name__)
 
-UNISWAP_V3_POOL_ABI = [
+UNISWAP_V3_FACTORY_ABI: list[dict[str, Any]] = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "tokenA", "type": "address"},
+            {"internalType": "address", "name": "tokenB", "type": "address"},
+            {"internalType": "uint24", "name": "fee", "type": "uint24"},
+        ],
+        "name": "getPool",
+        "outputs": [{"internalType": "address", "name": "pool", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+UNISWAP_V3_POOL_ABI: list[dict[str, Any]] = [
     {
         "inputs": [],
         "name": "slot0",
         "outputs": [
-            {"name": "sqrtPriceX96", "type": "uint160"},
-            {"name": "tick", "type": "int24"},
-            {"name": "observationIndex", "type": "uint16"},
-            {"name": "observationCardinality", "type": "uint16"},
-            {"name": "observationCardinalityNext", "type": "uint16"},
-            {"name": "feeProtocol", "type": "uint8"},
-            {"name": "unlocked", "type": "bool"},
+            {"internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160"},
+            {"internalType": "int24", "name": "tick", "type": "int24"},
+            {"internalType": "uint16", "name": "observationIndex", "type": "uint16"},
+            {"internalType": "uint16", "name": "observationCardinality", "type": "uint16"},
+            {"internalType": "uint16", "name": "observationCardinalityNext", "type": "uint16"},
+            {"internalType": "uint8", "name": "feeProtocol", "type": "uint8"},
+            {"internalType": "bool", "name": "unlocked", "type": "bool"},
         ],
         "stateMutability": "view",
         "type": "function",
@@ -28,20 +45,20 @@ UNISWAP_V3_POOL_ABI = [
     {
         "inputs": [],
         "name": "liquidity",
-        "outputs": [{"name": "", "type": "uint128"}],
+        "outputs": [{"internalType": "uint128", "name": "", "type": "uint128"}],
         "stateMutability": "view",
         "type": "function",
     },
     {
         "anonymous": False,
         "inputs": [
-            {"indexed": True, "name": "sender", "type": "address"},
-            {"indexed": True, "name": "recipient", "type": "address"},
-            {"indexed": False, "name": "amount0", "type": "int256"},
-            {"indexed": False, "name": "amount1", "type": "int256"},
-            {"indexed": False, "name": "sqrtPriceX96", "type": "uint160"},
-            {"indexed": False, "name": "liquidity", "type": "uint128"},
-            {"indexed": False, "name": "tick", "type": "int24"},
+            {"indexed": True, "internalType": "address", "name": "sender", "type": "address"},
+            {"indexed": True, "internalType": "address", "name": "recipient", "type": "address"},
+            {"indexed": False, "internalType": "int256", "name": "amount0", "type": "int256"},
+            {"indexed": False, "internalType": "int256", "name": "amount1", "type": "int256"},
+            {"indexed": False, "internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160"},
+            {"indexed": False, "internalType": "uint128", "name": "liquidity", "type": "uint128"},
+            {"indexed": False, "internalType": "int24", "name": "tick", "type": "int24"},
         ],
         "name": "Swap",
         "type": "event",
@@ -49,121 +66,147 @@ UNISWAP_V3_POOL_ABI = [
 ]
 
 
-@dataclass(slots=True)
-class PoolMonitorConfig:
-    rpc_url: str
-    pool_address: str
-    token0_decimals: int = 18
-    token1_decimals: int = 6
-    token0_is_eth: bool = True
-    abi: list[dict[str, Any]] | None = None
-    chain_id: int | None = 8453
-    block_time_seconds: int = 2
-    paper_mode: bool = True
-
-
 class PoolMonitor:
-    """ETH/USDC pool monitor Base chainre, paper és live kompatibilitással."""
+    """Realtime Uniswap V3 ETH/USDC pool monitor for Base chain (paper mode compatible)."""
 
-    def __init__(self, config: PoolMonitorConfig) -> None:
-        self.config = config
-        self.web3 = Web3(Web3.HTTPProvider(config.rpc_url))
-        self.pool_contract = self.web3.eth.contract(
-            address=Web3.to_checksum_address(config.pool_address),
-            abi=config.abi or UNISWAP_V3_POOL_ABI,
+    def __init__(self, fee_tier: int = 500, block_time_seconds: int = 2) -> None:
+        self.rpc_url = os.getenv("BASE_RPC_URL", "https://mainnet.base.org").strip()
+        self.weth_address = Web3.to_checksum_address(
+            os.getenv("WETH_ADDRESS", "0x4200000000000000000000000000000000000006").strip()
+        )
+        self.usdc_address = Web3.to_checksum_address(
+            os.getenv("USDC_ADDRESS", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").strip()
+        )
+        self.uniswap_v3_factory = Web3.to_checksum_address(
+            os.getenv("UNISWAP_V3_FACTORY", "0x33128a8fC17869897dcE68Ed026d694621f6FDfD").strip()
+        )
+        self.fee_tier = int(os.getenv("UNISWAP_V3_POOL_FEE", str(fee_tier)))
+        self.block_time_seconds = int(block_time_seconds)
+
+        self.web3 = Web3(Web3.HTTPProvider(self.rpc_url))
+        self.factory = self.web3.eth.contract(address=self.uniswap_v3_factory, abi=UNISWAP_V3_FACTORY_ABI)
+
+        self.pool_address = self._resolve_pool_address()
+        self.pool = self.web3.eth.contract(address=self.pool_address, abi=UNISWAP_V3_POOL_ABI)
+
+        logger.info("PoolMonitor initialized for pool: %s", self.pool_address)
+
+    def _resolve_pool_address(self) -> str:
+        pool_address = self.factory.functions.getPool(
+            self.weth_address,
+            self.usdc_address,
+            int(self.fee_tier),
+        ).call()
+        if int(pool_address, 16) == 0:
+            raise ValueError("No Uniswap V3 pool found for WETH/USDC on selected fee tier")
+        return Web3.to_checksum_address(pool_address)
+
+    async def _safe_rpc_call(self, fn: Any, default: Any = None) -> Any:
+        try:
+            return await asyncio.to_thread(fn)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("RPC call failed: %s", exc)
+            return default
+
+    def _tick_to_price_usdc_per_eth(self, tick: int) -> float:
+        # price(token1/token0)=1.0001^tick; adjust decimals token0=WETH(18), token1=USDC(6)
+        raw_price = math.pow(1.0001, tick)
+        return raw_price * math.pow(10, 18 - 6)
+
+    async def get_current_price(self) -> float | None:
+        slot0 = await self._safe_rpc_call(self.pool.functions.slot0().call)
+        if not slot0:
+            return None
+
+        tick = int(slot0[1])
+        price = self._tick_to_price_usdc_per_eth(tick)
+        logger.info("Current ETH/USDC price: %.2f USDC", price)
+        return price
+
+    async def get_pool_liquidity(self) -> float | None:
+        liquidity_raw = await self._safe_rpc_call(self.pool.functions.liquidity().call)
+        if liquidity_raw is None:
+            return None
+
+        price = await self.get_current_price()
+        if not price:
+            return float(liquidity_raw)
+
+        # Simplified ETH-equivalent approximation for monitoring dashboards.
+        liquidity_eth_equiv = float(liquidity_raw) / 1e18
+        logger.info("Pool liquidity: %.2f ETH equivalent", liquidity_eth_equiv)
+        return liquidity_eth_equiv
+
+    async def get_recent_volume(self, minutes: int = 60) -> float | None:
+        latest_block = await self._safe_rpc_call(lambda: self.web3.eth.block_number)
+        if latest_block is None:
+            return None
+
+        lookback_blocks = max(1, int((minutes * 60) / max(1, self.block_time_seconds)))
+        from_block = max(0, int(latest_block) - lookback_blocks)
+
+        def _fetch_logs() -> list[dict[str, Any]]:
+            event = self.pool.events.Swap()
+            return event.get_logs(from_block=from_block, to_block=latest_block)
+
+        logs = await self._safe_rpc_call(_fetch_logs, default=[])
+        if logs is None:
+            return None
+
+        usdc_volume = 0.0
+        for log in logs:
+            amount1 = float(abs(log["args"]["amount1"]))
+            usdc_volume += amount1 / 1e6
+
+        logger.info("Recent swap volume (%sm): %.2f USDC", minutes, usdc_volume)
+        return usdc_volume
+
+    async def get_volatility(self, period_minutes: int = 30) -> float | None:
+        latest_block = await self._safe_rpc_call(lambda: self.web3.eth.block_number)
+        if latest_block is None:
+            return None
+
+        lookback_blocks = max(2, int((period_minutes * 60) / max(1, self.block_time_seconds)))
+        from_block = max(0, int(latest_block) - lookback_blocks)
+
+        def _collect_ticks() -> list[int]:
+            ticks: list[int] = []
+            for block_number in range(from_block, int(latest_block) + 1, max(1, lookback_blocks // 20)):
+                block_identifier = min(block_number, int(latest_block))
+                slot0 = self.pool.functions.slot0().call(block_identifier=block_identifier)
+                ticks.append(int(slot0[1]))
+            return ticks
+
+        ticks = await self._safe_rpc_call(_collect_ticks, default=[])
+        if not ticks:
+            return None
+
+        prices = [self._tick_to_price_usdc_per_eth(tick) for tick in ticks]
+        avg_price = mean(prices)
+        if avg_price <= 0:
+            return None
+
+        pct_change = ((max(prices) - min(prices)) / avg_price) * 100.0
+        logger.info("Volatility (%sm): %.2f%%", period_minutes, pct_change)
+        return pct_change
+
+    async def get_pool_info(self) -> dict[str, float | int | None]:
+        started_at = time.time()
+
+        price, liquidity, volatility, recent_volume = await asyncio.gather(
+            self.get_current_price(),
+            self.get_pool_liquidity(),
+            self.get_volatility(),
+            self.get_recent_volume(),
         )
 
-    def get_current_price(self) -> float:
-        """Aktuális ETH/USDC ár (USDC per ETH)."""
-        slot0 = self.pool_contract.functions.slot0().call()
-        sqrt_price_x96 = slot0[0]
-        raw_price = (sqrt_price_x96**2) / (2**192)
-        price_token1_per_token0 = raw_price * (10 ** (self.config.token0_decimals - self.config.token1_decimals))
+        payload: dict[str, float | int | None] = {
+            "price": price,
+            "liquidity": liquidity,
+            "volatility": volatility,
+            "recent_volume": recent_volume,
+            "pool_fee": int(self.fee_tier),
+        }
 
-        if self.config.token0_is_eth:
-            return float(price_token1_per_token0)
-        if price_token1_per_token0 <= 0:
-            raise ValueError("invalid_pool_price")
-        return float(1 / price_token1_per_token0)
-
-    def get_pool_liquidity(self) -> float:
-        """Pool likviditás (V3 liquidity + becsült USDC notional)."""
-        liquidity_raw = float(self.pool_contract.functions.liquidity().call())
-        price = self.get_current_price()
-        if liquidity_raw <= 0 or price <= 0:
-            return 0.0
-
-        # Egyszerű, paper módra stabil becslés: sqrt(k) ~ liquidity, notional ~ 2*L*sqrt(P)
-        liquidity_notional = 2.0 * liquidity_raw * math.sqrt(price) / (10 ** self.config.token1_decimals)
-        return float(liquidity_notional)
-
-    def get_recent_volume(self, timeframe_minutes: int = 60) -> float:
-        """Swap volume becslése USD-ben adott időablakra."""
-        timeframe_minutes = max(int(timeframe_minutes), 1)
-        current_block = self.web3.eth.block_number
-        blocks_back = max(int((timeframe_minutes * 60) / self.config.block_time_seconds), 1)
-        from_block = max(current_block - blocks_back, 0)
-
-        logs = self.pool_contract.events.Swap.get_logs(from_block=from_block, to_block=current_block)
-        volume_usd = 0.0
-
-        for event in logs:
-            amount0 = abs(int(event["args"]["amount0"])) / (10 ** self.config.token0_decimals)
-            amount1 = abs(int(event["args"]["amount1"])) / (10 ** self.config.token1_decimals)
-            # ETH/USDC párnál az USDC oldal közvetlenül USD notional.
-            volume_usd += max(amount1, amount0 * self.get_current_price())
-
-        return float(volume_usd)
-
-    def get_volatility(self, lookback_minutes: int = 60, sample_count: int = 30) -> float:
-        """Rövid távú volatilitás (log-return stddev) becslése."""
-        lookback_minutes = max(int(lookback_minutes), 5)
-        sample_count = max(int(sample_count), 5)
-
-        current_block = self.web3.eth.block_number
-        total_blocks = max(int((lookback_minutes * 60) / self.config.block_time_seconds), sample_count)
-        step = max(total_blocks // sample_count, 1)
-
-        prices: list[float] = []
-        for i in range(sample_count):
-            block_number = max(current_block - (sample_count - i) * step, 0)
-            try:
-                slot0 = self.pool_contract.functions.slot0().call(block_identifier=block_number)
-            except Exception:
-                continue
-            sqrt_price_x96 = slot0[0]
-            raw_price = (sqrt_price_x96**2) / (2**192)
-            price = raw_price * (10 ** (self.config.token0_decimals - self.config.token1_decimals))
-            if self.config.token0_is_eth:
-                prices.append(float(price))
-            elif price > 0:
-                prices.append(float(1 / price))
-
-        if len(prices) < 2:
-            return 0.0
-
-        returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices)) if prices[i - 1] > 0 and prices[i] > 0]
-        if len(returns) < 2:
-            return 0.0
-        return float(statistics.pstdev(returns))
-
-
-if __name__ == "__main__":
-    monitor = PoolMonitor(
-        PoolMonitorConfig(
-            rpc_url="https://mainnet.base.org",
-            pool_address="0xd0b53D9277642d899DF5C87A3966A349A798F224",
-            token0_decimals=18,
-            token1_decimals=6,
-            token0_is_eth=True,
-            paper_mode=True,
-        )
-    )
-
-    print({
-        "price": monitor.get_current_price(),
-        "liquidity": monitor.get_pool_liquidity(),
-        "volume_1h": monitor.get_recent_volume(60),
-        "volatility": monitor.get_volatility(),
-        "ts": int(time.time()),
-    })
+        logger.info("Pool info fetched in %.2fs: %s", time.time() - started_at, payload)
+        return payload
