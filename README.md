@@ -152,10 +152,29 @@ $env:ONCHAIN_RSS_URLS='data\signals\sample_onchain.json'
 
 ```bash
 cp profiles/aggressive_base_paper.env .env
+cat >> .env <<'EOF'
+TELEGRAM_ENABLED=true
+TELEGRAM_POLL_COMMANDS=true
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+EOF
 python src/startup_validation.py
 python src/main.py
 python scripts/monitor_aggressive_paper.py --once
 ```
+
+Telegram titkokhoz ajanlott a helyi feluliras:
+
+```bash
+cat > .env.local <<'EOF'
+TELEGRAM_ENABLED=true
+TELEGRAM_POLL_COMMANDS=true
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+EOF
+```
+
+`src/config_env.py` most `.env` utan betolti a `.env.local`-t, es a `.env.local` felulirja a `.env` ertekeket.
 
 ## Official VPS paper startup
 

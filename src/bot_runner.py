@@ -16,9 +16,9 @@ from adaptive_market_maker import (
     update_quote_decision_runtime,
 )
 from config import (
+    BOT_MODE,
     BOT_CONFIG_PROFILE,
     BOT_GIT_COMMIT,
-    BOT_MODE,
     COOLDOWN_AGGRESSIVE_SEC,
     COOLDOWN_BASE_SEC,
     COOLDOWN_DEFENSIVE_SEC,
@@ -122,6 +122,7 @@ from config import (
     ENABLE_TREND_MODE,
     MAX_CONSECUTIVE_LOSSES,
     MAX_DAILY_LOSS,
+    MAX_TRADES_PER_DAY,
     MAX_LEVERAGE,
     RISK_PER_TRADE,
 )
@@ -7479,6 +7480,12 @@ def build_summary(runtime: BotRuntime) -> dict:
         "regime_reason": runtime.current_regime_reason,
         "edge_components": dict(runtime.current_edge_components),
         "activity_floor_state": runtime.current_activity_floor_state,
+        "hourly_trade_count": runtime.hourly_trade_count,
+        "hourly_skip_count": runtime.hourly_skip_count,
+        "hourly_skip_reasons": dict(runtime.hourly_skip_reasons),
+        "total_skip_reasons": dict(runtime.total_skip_reasons),
+        "total_trade_count": runtime.total_trade_count,
+        "total_skip_count": runtime.total_skip_count,
         "inactivity_cycles": runtime.current_inactivity_cycles,
         "paper_activity_override": runtime.current_paper_activity_override,
         "inventory_pressure_score": runtime.current_inventory_pressure_score,
@@ -7556,6 +7563,18 @@ def build_summary(runtime: BotRuntime) -> dict:
         "maker_count": runtime.maker_count,
         "taker_count": runtime.taker_count,
         "avg_slippage_bps": (runtime.total_slippage_bps / trade_count) if trade_count else 0.0,
+        "last_trade_reason": runtime.last_trade_reason,
+        "last_execution_mode": runtime.last_execution_analytics.execution_mode,
+        "last_mev_risk_score": runtime.last_execution_analytics.mev_risk_score,
+        "last_slippage_bps": runtime.last_execution_analytics.realized_slippage_bps,
+        "last_final_action": runtime.last_execution_analytics.execution_mode or runtime.last_execution_type or "n/a",
+        "bot_mode": BOT_MODE,
+        "max_trades_per_day": MAX_TRADES_PER_DAY,
+        "loop_status": "running",
+        "last_error": "",
+        "startup_config_status": "ok",
+        "uniswap_v3_status": "unknown",
+        "price_source": getattr(runtime, "last_source", ""),
     }
     return summary
 
