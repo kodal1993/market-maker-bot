@@ -4,35 +4,9 @@ A dokumentáció a jelenlegi stratégiai modellhez lett igazítva: `adaptive_ree
 
 ## Gyors indítás
 
-Windows alatt van egy egygombos indito fajl a projekt gyokerben:
-
-```powershell
-.\start_trading.bat
-```
-
-Ez a jelenlegi `.env` beallitasokkal inditja a botot. Ha csak ellenorizni akarod, hogy minden keszen all-e, futtasd ezt:
-
-```powershell
-.\start_trading.bat --check
-```
-
-A `--check` ugyanazt a startup validaciot futtatja, mint a normal inditas, es hiba eseten nem engedi elindulni a botot.
-
 Ha azt akarod, hogy a bot folyamatosan fusson, a `.env`-ben hagyd a `MAX_LOOPS=0` beallitast. Ez a projektben azt jelenti, hogy a bot addig megy, amig kezzel le nem allitod, peldaul `Ctrl+C`-vel.
 
 Rövid architektúra leírás: [ARCHITECTURE.md](ARCHITECTURE.md).
-
-### Magas aktivitású paper profil
-
-Ha a cel sok (de kontrollalt) paper trade, hasznalhatsz egy kiindulo profilt:
-
-- `profiles/high_activity_paper.env`
-
-Gyors hasznalat:
-
-1. Masold `profiles/high_activity_paper.env` -> `.env`
-2. Allitsd be a sajat `RPC_URL` (es opcionisan `NEWS_RSS_URLS`, `MACRO_RSS_URLS`, `ONCHAIN_RSS_URLS`) ertekeket
-3. Inditsd a botot paper modban
 
 ## Többjelű Intelligence réteg
 
