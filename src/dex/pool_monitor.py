@@ -82,6 +82,10 @@ class PoolMonitor:
         )
         self.fee_tier = int(os.getenv("UNISWAP_V3_POOL_FEE", str(fee_tier)))
         self.block_time_seconds = int(block_time_seconds)
+        self.min_interval_seconds = float(os.getenv("POOL_MONITOR_MIN_INTERVAL_SECONDS", "8"))
+        self._last_successful_pool_info: dict[str, Any] | None = None
+        self._last_successful_at: float = 0.0
+        self._last_rpc_error: str | None = None
 
         self.web3 = Web3(Web3.HTTPProvider(self.rpc_url))
         self.factory = self.web3.eth.contract(address=self.uniswap_v3_factory, abi=UNISWAP_V3_FACTORY_ABI)
@@ -103,8 +107,10 @@ class PoolMonitor:
 
     async def _safe_rpc_call(self, fn: Any, default: Any = None) -> Any:
         try:
+            self._last_rpc_error = None
             return await asyncio.to_thread(fn)
         except Exception as exc:  # noqa: BLE001
+            self._last_rpc_error = str(exc)
             logger.exception("RPC call failed: %s", exc)
             return default
 
@@ -190,7 +196,16 @@ class PoolMonitor:
         logger.info("Volatility (%sm): %.2f%%", period_minutes, pct_change)
         return pct_change
 
-    async def get_pool_info(self) -> dict[str, float | int | None]:
+    async def get_pool_info(self) -> dict[str, Any]:
+        now = time.time()
+        if (
+            self._last_successful_pool_info is not None
+            and (now - self._last_successful_at) < self.min_interval_seconds
+        ):
+            cached = dict(self._last_successful_pool_info)
+            cached["cached"] = True
+            return cached
+
         started_at = time.time()
 
         price, liquidity, volatility, recent_volume = await asyncio.gather(
@@ -200,13 +215,27 @@ class PoolMonitor:
             self.get_recent_volume(),
         )
 
-        payload: dict[str, float | int | None] = {
+        if price is None:
+            payload: dict[str, Any] = {
+                "status": "rpc_error",
+                "error_reason": self._last_rpc_error or "price_unavailable",
+                "pool_fee": int(self.fee_tier),
+                "cached": False,
+            }
+            logger.warning("Pool info fetch failed in %.2fs: %s", time.time() - started_at, payload)
+            return payload
+
+        payload = {
+            "status": "ok",
             "price": price,
             "liquidity": liquidity,
             "volatility": volatility,
             "recent_volume": recent_volume,
             "pool_fee": int(self.fee_tier),
+            "cached": False,
         }
+        self._last_successful_pool_info = dict(payload)
+        self._last_successful_at = now
 
         logger.info("Pool info fetched in %.2fs: %s", time.time() - started_at, payload)
         return payload

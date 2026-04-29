@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from contextlib import ExitStack
 from itertools import islice
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,58 @@ class MainLoopControlTests(unittest.TestCase):
             main_module.main()
 
         self.assertEqual(notifier_calls, [None, None])
+
+    def test_main_falls_back_when_pool_price_missing(self) -> None:
+        class SilentNotifier:
+            def handle_commands(self, runtime, build_summary_fn) -> int:
+                return 0
+
+            def notify_error(self, context_message: str, exc: Exception | str) -> bool:
+                return True
+
+            def maybe_send_daily_report(self, runtime, build_summary_fn) -> bool:
+                return False
+
+        class FakeDex:
+            def get_price(self):
+                return 3210.0, "dex_fallback"
+
+        class FakePoolMonitor:
+            async def get_pool_info(self):
+                return {"status": "rpc_error", "error_reason": "429 Too Many Requests"}
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(main_module, "close_log_sinks"))
+            stack.enter_context(patch.object(main_module, "register_log_sink"))
+            stack.enter_context(patch.object(main_module, "SqliteLogger", return_value=SimpleNamespace()))
+            stack.enter_context(patch.object(main_module, "TelegramNotifier", return_value=SilentNotifier()))
+            stack.enter_context(patch.object(main_module, "validate_startup_config", return_value=[]))
+            stack.enter_context(patch.object(main_module, "cleanup_logs_for_run", return_value={}))
+            stack.enter_context(patch.object(main_module, "format_cleanup_result", return_value="ok"))
+            stack.enter_context(patch.object(main_module, "CsvLogger", return_value=SimpleNamespace()))
+            stack.enter_context(patch.object(main_module, "required_bootstrap_price_rows", return_value=0))
+            stack.enter_context(patch.object(main_module, "load_bootstrap_prices", return_value=[]))
+            stack.enter_context(patch.object(main_module, "DexClient", return_value=FakeDex()))
+            stack.enter_context(patch.object(main_module, "PoolMonitor", return_value=FakePoolMonitor()))
+            stack.enter_context(patch.object(main_module, "DexExecutor", return_value=SimpleNamespace()))
+            process_mock = stack.enter_context(patch.object(main_module, "process_price_tick", return_value=False))
+            stack.enter_context(patch.object(main_module, "resolve_start_balances", return_value=(100.0, 1.0)))
+            stack.enter_context(patch.object(main_module, "create_runtime", return_value=SimpleNamespace()))
+            stack.enter_context(patch.object(main_module, "build_summary", return_value={}))
+            stack.enter_context(patch.object(main_module, "log_summary"))
+            stack.enter_context(patch.object(main_module, "build_report", return_value={}))
+            stack.enter_context(patch.object(main_module, "write_report_json"))
+            stack.enter_context(patch.object(main_module, "write_report_csv"))
+            log_mock = stack.enter_context(patch.object(main_module, "log"))
+            stack.enter_context(patch.object(main_module, "MAX_LOOPS", 1))
+            stack.enter_context(patch.object(main_module, "LOOP_SECONDS", 0.0))
+            stack.enter_context(patch.object(main_module, "RUNTIME_STATE_ENABLED", False))
+            main_module.main()
+
+        self.assertEqual(process_mock.call_args.kwargs["mid"], 3210.0)
+        self.assertEqual(process_mock.call_args.kwargs["source"], "dex_fallback")
+        logs = [str(call.args[0]) for call in log_mock.call_args_list]
+        self.assertIn("Uniswap V3 pool price unavailable, falling back to DexClient", logs)
 
 
 if __name__ == "__main__":
