@@ -1,6 +1,8 @@
 # Market Maker Bot
 
-## Gyors Inditas
+A dokumentáció a jelenlegi stratégiai modellhez lett igazítva: `adaptive_reentry_execution` a referencia futtatási variáns.
+
+## Gyors indítás
 
 Windows alatt van egy egygombos indito fajl a projekt gyokerben:
 
@@ -18,9 +20,9 @@ A `--check` ugyanazt a startup validaciot futtatja, mint a normal inditas, es hi
 
 Ha azt akarod, hogy a bot folyamatosan fusson, a `.env`-ben hagyd a `MAX_LOOPS=0` beallitast. Ez a projektben azt jelenti, hogy a bot addig megy, amig kezzel le nem allitod, peldaul `Ctrl+C`-vel.
 
-Rovid architektura leiras: [ARCHITECTURE.md](ARCHITECTURE.md).
+Rövid architektúra leírás: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-### High-activity paper profil
+### Magas aktivitású paper profil
 
 Ha a cel sok (de kontrollalt) paper trade, hasznalhatsz egy kiindulo profilt:
 
@@ -32,7 +34,7 @@ Gyors hasznalat:
 2. Allitsd be a sajat `RPC_URL` (es opcionisan `NEWS_RSS_URLS`, `MACRO_RSS_URLS`, `ONCHAIN_RSS_URLS`) ertekeket
 3. Inditsd a botot paper modban
 
-## Tobbjelu Intelligence Reteg
+## Többjelű Intelligence réteg
 
 A bot most mar egy tobbretegu decision engine-t hasznal a price loop tetejen. Egy ciklusban egyszerre tudja figyelembe venni:
 
@@ -80,7 +82,7 @@ Hasznos environment valtozok:
 
 Peldakent hasznalhato lokalis tesztbemenetek a `data\signals\` mappaban vannak.
 
-## Tortenelmi Adatok
+## Történelmi adatok
 
 Valos Coinbase spot candle adatok letolthetok olyan CSV-be, amely mar illeszkedik a backtest folyamathoz:
 
@@ -96,7 +98,7 @@ Tobb timeframe osszehasonlitasa ugyanazon a tortenelmi idoszakon:
 .\.venv\Scripts\python.exe src\timeframe_benchmark.py --product ETH-USD --days 30 --granularities 60,300,900,3600 --seeds 41,42,43,44,45
 ```
 
-## Visszateszteles
+## Visszatesztelés
 
 Barmely CSV fajl tortenelmi arai alapjan visszajatszhatod az aktualis strategiat:
 
@@ -137,7 +139,7 @@ Az osszehasonlitas most negy varianshoz ir kimenetet:
 - `adaptive_reentry`
 - `adaptive_reentry_execution`
 
-### Visszateszteles Lokalis Signal Mintakkal
+### Visszatesztelés Lokalis Signal Mintakkal
 
 Az intelligence layer live feedek nelkul is smoke-tesztelheto:
 
@@ -148,7 +150,7 @@ $env:ONCHAIN_RSS_URLS='data\signals\sample_onchain.json'
 .\.venv\Scripts\python.exe src\backtest.py --input data\historical\eth_usd_300s_20260220_20260322.csv --price-column close --limit 150 --label multi_signal_smoke
 ```
 
-## Linux VPS gyors startup ellenőrzés
+## Linux VPS gyors startup-ellenőrzés
 
 ```bash
 cp profiles/aggressive_base_paper.env .env
@@ -176,15 +178,15 @@ EOF
 
 `src/config_env.py` most `.env` utan betolti a `.env.local`-t, es a `.env.local` felulirja a `.env` ertekeket.
 
-## Official VPS paper startup
+## Hivatalos VPS paper indítás
 
-Use the official aggressive Base paper profile with one command:
+Használd a hivatalos agresszív Base paper profilt egyetlen paranccsal:
 
 ```bash
 bash scripts/start_paper_vps.sh
 ```
 
-Optional one-shot monitor check:
+Opcionális egyszeri monitor ellenőrzés:
 
 ```bash
 bash scripts/monitor_once.sh
