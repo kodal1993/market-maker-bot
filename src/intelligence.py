@@ -117,6 +117,7 @@ def _resolve_target_inventory_pct(
     adaptive_score: float,
     risk_score: float,
     feed_state: str,
+    momentum_bps: float,
 ) -> float:
     if regime == "RISK_OFF":
         base_target = RISK_OFF_TARGET_INVENTORY_MAX
@@ -139,8 +140,13 @@ def _resolve_target_inventory_pct(
     elif feed_state == "BLOCK":
         base_target = min(base_target, max(RISK_OFF_TARGET_INVENTORY_MAX, RANGE_TARGET_INVENTORY_MIN - 0.08))
 
-    lower_bound = 0.18 if regime == "RISK_OFF" else 0.25
-    return clamp(base_target, lower_bound, 0.90)
+    momentum_bias = clamp(momentum_bps / 120.0, -0.02, 0.02)
+    if regime != "RISK_OFF":
+        base_target += momentum_bias
+
+    lower_bound = 0.18 if regime == "RISK_OFF" else 0.22
+    upper_bound = 0.86 if regime == "RISK_OFF" else 0.78
+    return clamp(base_target, lower_bound, upper_bound)
 
 
 def _resolve_inventory_cap_floor_pct(regime: str) -> float:
@@ -394,12 +400,14 @@ class IntelligenceEngine:
             trade_size_multiplier *= 1.10
         trade_size_multiplier *= fill_quality_size_multiplier
 
+        momentum_bps = _recent_momentum_bps(prices, lookback=3)
         target_inventory_pct = _resolve_target_inventory_pct(
             regime=market.regime,
             market_score=market.market_score,
             adaptive_score=adaptive.performance_score,
             risk_score=risk_score,
             feed_state=feed_state,
+            momentum_bps=momentum_bps,
         )
         regime_cap_floor_usd = current_equity * clamp(_resolve_inventory_cap_floor_pct(market.regime), 0.0, 1.0)
         reference_equity = resolve_reference_equity_usd(current_equity)
@@ -465,10 +473,12 @@ class IntelligenceEngine:
         elif feed_state == "BLOCK":
             max_chase_bps_multiplier *= 0.82
 
+        momentum_skew = clamp(momentum_bps / 500.0, -0.04, 0.08)
         inventory_skew_multiplier = clamp(
             1.0
             + (risk_score * 0.18)
             + (activity_boost * 0.10)
+            + momentum_skew
             + (0.08 if mm_mode == "aggressive" else -0.03 if mm_mode == "defensive_mm" else 0.0)
             + (0.05 if feed_state == "CAUTION" else 0.12 if feed_state == "BLOCK" else 0.0),
             0.80,

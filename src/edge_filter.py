@@ -320,6 +320,10 @@ class EdgeFilter:
                 required_edge_usd = max(required_edge_usd, EXPECTED_EDGE_MIN_USD * threshold_multiplier)
         required_edge_score = EDGE_SCORE_MIN * threshold_multiplier
         required_reentry_score = max(EDGE_SCORE_MIN_REENTRY, REENTRY_EDGE_SCORE_MIN) * threshold_multiplier
+        inventory_balance_ratio = abs(inventory_usd - target_base_usd) / max(target_base_usd, 1.0)
+        balanced_inventory = inventory_balance_ratio <= 0.08
+        effective_reentry_pullback_min = REENTRY_MIN_PULLBACK_PCT * (0.60 if balanced_inventory else 1.0)
+        effective_reentry_score = required_reentry_score * (0.92 if balanced_inventory else 1.0)
 
         spread_quality = clamp(1.0 - (context.spread_bps / max(expected_capture_bps, 12.0)), 0.0, 1.0)
         edge_score = clamp(
@@ -396,7 +400,7 @@ class EdgeFilter:
             inventory_skew_multiplier = min(inventory_skew_multiplier, 0.90)
             cooldown_multiplier = max(cooldown_multiplier, 1.12)
             edge_penalty_reason = "expected_edge_below_min"
-        elif is_reentry_reason(signal.reason) and pullback_depth_pct < REENTRY_MIN_PULLBACK_PCT:
+        elif is_reentry_reason(signal.reason) and pullback_depth_pct < effective_reentry_pullback_min:
             edge_reject_reason = "reentry_low_pullback"
         elif (
             is_reentry_reason(signal.reason)
@@ -418,7 +422,7 @@ class EdgeFilter:
             edge_reject_reason = "reentry_rejected_bad_regime"
         elif is_reentry_reason(signal.reason) and regime_assessment.volatility_score >= 75.0:
             edge_reject_reason = "reentry_high_volatility_shock"
-        elif is_reentry_reason(signal.reason) and edge_score < required_reentry_score and not recovery_mode_active:
+        elif is_reentry_reason(signal.reason) and edge_score < effective_reentry_score and not recovery_mode_active:
             edge_reject_reason = "reentry_rejected_low_edge"
         elif not edge_override_reason and edge_bucket == "bad" and edge_score < required_edge_score:
             size_multiplier = min(size_multiplier, 0.72)
