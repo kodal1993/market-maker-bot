@@ -28,8 +28,8 @@ class InventoryManager:
             upper_bound = INVENTORY_DOWNTREND_MAX
         else:
             regime_label = "normal"
-            lower_bound = INVENTORY_NORMAL_MIN
-            upper_bound = INVENTORY_NORMAL_MAX
+            lower_bound = min(INVENTORY_NORMAL_MIN, 0.22)
+            upper_bound = max(INVENTORY_NORMAL_MAX, 0.78)
 
         inventory_ratio = (inventory_usd / equity_usd) if equity_usd > 0 else 0.0
         hard_limit_pct = upper_bound * max(INVENTORY_HARD_LIMIT_PCT, 0.0)
