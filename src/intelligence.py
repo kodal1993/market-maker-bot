@@ -424,9 +424,9 @@ class IntelligenceEngine:
             spread_multiplier *= 0.94
             blockers.append("low_vol_tighter_quotes")
         elif market.volatility_state == "HIGH":
-            spread_multiplier *= 1.03
-            trade_size_multiplier *= 0.94
-            blockers.append("high_vol_relaxed")
+            spread_multiplier *= 1.01
+            trade_size_multiplier *= 0.98
+            blockers.append("high_vol_aggressive_relax")
         elif market.volatility_state == "EXTREME":
             spread_multiplier *= 1.14
             trade_size_multiplier *= 0.78
@@ -451,10 +451,10 @@ class IntelligenceEngine:
             blockers.append(f"fill_quality_{fill_quality_tier}")
 
         range_maker_aggression_factor = 1.0
-        if strategy_mode == "RANGE_MAKER" or active_regime == "RANGE":
-            range_maker_aggression_factor = 0.88
+        if active_regime == "RANGE":
+            range_maker_aggression_factor = 0.82
             entry_trigger_multiplier *= range_maker_aggression_factor
-            min_edge_multiplier *= 0.90
+            min_edge_multiplier *= 0.82
 
         trend_threshold_multiplier = clamp(
             adaptive.threshold_multiplier
@@ -506,10 +506,10 @@ class IntelligenceEngine:
             quote_enabled = False
             blockers.append("warmup")
         elif drawdown_stage == "pause":
-            strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
+            strategy_mode = "NO_TRADE" if inventory_usd <= 0 else "OVERWEIGHT_EXIT"
             quote_enabled = strategy_mode != "NO_TRADE"
             mm_mode = "defensive_mm"
-            blockers.append("drawdown_pause_softened")
+            blockers.append("drawdown_pause_hard_stop")
         elif market.volatility_state == "EXTREME":
             strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
             quote_enabled = True
@@ -540,8 +540,8 @@ class IntelligenceEngine:
         if drawdown_stage in {"size_reduce", "aggression_reduce", "pause"}:
             blockers.append("drawdown_size_reduce")
             max_inventory_multiplier = min(max_inventory_multiplier, 0.88)
-            trade_size_multiplier = min(trade_size_multiplier, 0.72)
-            spread_multiplier = max(spread_multiplier, 1.08)
+            trade_size_multiplier = min(trade_size_multiplier, 0.82)
+            spread_multiplier = max(spread_multiplier, 1.04)
             target_inventory_pct = min(target_inventory_pct, 0.52)
             if strategy_mode == "TREND_UP":
                 strategy_mode = "RANGE_MAKER"
@@ -550,10 +550,10 @@ class IntelligenceEngine:
 
         if drawdown_stage in {"aggression_reduce", "pause"}:
             blockers.append("drawdown_aggression_reduce")
-            confidence = clamp(confidence * 0.78, 0.0, 1.0)
-            spread_multiplier = max(spread_multiplier, 1.15)
-            max_chase_bps_multiplier = clamp(max_chase_bps_multiplier * 0.68, 0.35, 1.02)
-            directional_bias *= 0.58
+            confidence = clamp(confidence * 0.88, 0.0, 1.0)
+            spread_multiplier = max(spread_multiplier, 1.08)
+            max_chase_bps_multiplier = clamp(max_chase_bps_multiplier * 0.82, 0.35, 1.02)
+            directional_bias *= 0.72
             target_inventory_pct = min(target_inventory_pct, 0.44)
             mm_mode = "defensive_mm"
             if strategy_mode == "TREND_UP":

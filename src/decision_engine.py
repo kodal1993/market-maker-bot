@@ -209,7 +209,22 @@ class DecisionEngine:
 
         if extra:
             details.update(extra)
-        logger.info("Trade skipped because: %s", details)
+        reason_message = f"Trade skipped: reason={reason}"
+        if reason == "expected_profit_below_threshold":
+            expected_profit = float(details.get("expected_profit_pct", 0.0))
+            min_required = float(details.get("min_expected_profit_pct", 0.0))
+            reason_message += (
+                f" | expected_profit={expected_profit:.2f}%"
+                f" | min_required={min_required:.2f}%"
+            )
+        elif "cooldown" in normalized:
+            remaining_seconds = details.get("dynamic_cooldown_sec", details.get("cooldown_remaining_sec", 0.0))
+            reason_message += f" | remaining_seconds={float(remaining_seconds):.0f}"
+        elif "inventory" in normalized:
+            current_skew = details.get("inventory_ratio", details.get("inventory_skew", 0.0))
+            max_allowed = details.get("inventory_cap_ratio", details.get("max_inventory_ratio", 0.0))
+            reason_message += f" | current_skew={float(current_skew):.2f} | max_allowed={float(max_allowed):.2f}"
+        logger.info("%s | details=%s", reason_message, details)
 
     def decide(
         self,
