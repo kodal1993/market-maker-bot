@@ -12,6 +12,7 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from security_redaction import redact_secrets
 from telegram_notifier import TelegramNotifier
 
 TEST_ROOT = Path(__file__).resolve().parents[1]
@@ -437,6 +438,35 @@ class TelegramNotifierTests(unittest.TestCase):
 
         self.assertFalse(response["ok"])
         self.assertIn("can't parse entities", response["description"])
+
+    def test_notify_error_redacts_infura_rpc_url(self) -> None:
+        sent_payloads: list[dict[str, object]] = []
+
+        def api_caller(method: str, payload: dict[str, object]) -> dict[str, object]:
+            if method == "sendMessage":
+                sent_payloads.append(payload)
+                return {"ok": True, "result": {"message_id": 1}}
+            return {"ok": True, "result": []}
+
+        notifier = TelegramNotifier(enabled=True, bot_token="token", chat_id="123", rate_limit_seconds=0.0, api_caller=api_caller)
+        err = "RPC failed: https://base-mainnet.infura.io/v3/abc123secret"
+        self.assertTrue(notifier.notify_error("main_loop", err))
+        text = str(sent_payloads[0]["text"])
+        self.assertIn(r"https://base\-mainnet\.infura\.io", text)
+        self.assertNotIn("/v3/abc123secret", text)
+
+    def test_redact_secrets_masks_private_key_hex(self) -> None:
+        secret = "0x" + "a" * 64
+        sanitized = redact_secrets(f"wallet key leaked: {secret}")
+        self.assertIn("[REDACTED_PRIVATE_KEY]", sanitized)
+        self.assertNotIn(secret, sanitized)
+
+    def test_redact_secrets_masks_telegram_token(self) -> None:
+        token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"
+        sanitized = redact_secrets(f"token={token}")
+        self.assertIn("[REDACTED_TELEGRAM_BOT_TOKEN]", sanitized)
+        self.assertNotIn(token, sanitized)
+
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import time
 from urllib.parse import urlsplit
 
 from logger import log
+from security_redaction import redact_secrets
 from wallet import connect_web3
 
 
@@ -118,7 +119,7 @@ class RpcFailoverClient:
                 reason = classify_rpc_error(exc)
                 log(
                     f"{self.label} rpc error | operation {operation_name} | endpoint {endpoint_label} | "
-                    f"attempt {attempt + 1}/{total_attempts} | retryable {int(retryable)} | error {exc}"
+                    f"attempt {attempt + 1}/{total_attempts} | retryable {int(retryable)} | error {redact_secrets(exc)}"
                 )
                 if attempt >= total_attempts - 1:
                     break
