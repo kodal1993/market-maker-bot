@@ -507,10 +507,9 @@ class IntelligenceEngine:
             quote_enabled = False
             blockers.append("warmup")
         elif drawdown_stage == "pause":
-            strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
-            quote_enabled = True
-            mm_mode = "defensive_mm"
-            blockers.append("drawdown_pause_softened")
+            strategy_mode = "NO_TRADE"
+            quote_enabled = False
+            blockers.append("drawdown_pause")
         elif market.volatility_state == "EXTREME":
             strategy_mode = "OVERWEIGHT_EXIT" if inventory_usd > 0 else "RANGE_MAKER"
             quote_enabled = True

@@ -1540,7 +1540,7 @@ def select_mode(
     trend_confidence = confidence_score >= ADAPTIVE_REGIME_TREND_CONFIDENCE
     extreme_event_risk = float(regime.sub_scores.get("CHAOS", 0.0) or 0.0) >= ADAPTIVE_REGIME_EXTREME_EVENT_SCORE
     severe_illiquidity = _severe_illiquidity_score(snapshot) >= ADAPTIVE_REGIME_SEVERE_ILLIQUID_SCORE
-    if risk.stage >= 4 or (edge_posture == "standby" and (extreme_event_risk or severe_illiquidity)):
+    if risk.stage >= 4 or extreme_event_risk or severe_illiquidity:
         reason = "hard_pause"
         if risk.stage < 4:
             reason = "extreme_event_risk" if extreme_event_risk else "severe_illiquidity"
