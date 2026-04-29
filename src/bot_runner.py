@@ -1995,13 +1995,18 @@ def _maybe_log_hourly_report(runtime: BotRuntime, cycle_index: int) -> None:
         if runtime.total_attempted_trade_count > 0
         else 0.0
     )
+    inventory_ratio = runtime.portfolio.inventory_value_usd(runtime.last_mid) / max(
+        runtime.portfolio.equity(runtime.last_mid),
+        1e-9,
+    )
+
     log(
         "Hourly summary | Trades this hour: "
         f"{runtime.hourly_trade_count} | "
         f"Skipped: {runtime.hourly_skip_count} | "
         f"Reasons: {reasons_text} | "
         f"Avg expected profit/attempt: {avg_expected_profit:.6f} USD | "
-        f"Inventory skew: {runtime.current_inventory_ratio*100:.2f}% | "
+        f"Inventory skew: {inventory_ratio*100:.2f}% | "
         f"Regime: {runtime.current_strategy_mode} | "
         f"Volatility: {runtime.current_volatility_bucket} ({runtime.intelligence.volatility:.6f}) | "
         f"Total trades: {runtime.total_trade_count} | "

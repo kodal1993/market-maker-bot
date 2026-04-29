@@ -147,3 +147,12 @@ $env:MACRO_RSS_URLS='data\signals\sample_macro.json'
 $env:ONCHAIN_RSS_URLS='data\signals\sample_onchain.json'
 .\.venv\Scripts\python.exe src\backtest.py --input data\historical\eth_usd_300s_20260220_20260322.csv --price-column close --limit 150 --label multi_signal_smoke
 ```
+
+## Linux VPS gyors startup ellenőrzés
+
+```bash
+cp profiles/aggressive_base_paper.env .env
+python src/startup_validation.py
+python src/main.py
+python scripts/monitor_aggressive_paper.py --once
+```

@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from config import EXECUTION_MIN_EXPECTED_PROFIT_PCT
 from execution_engine import ExecutionEngine
 from trade_filter import TradeFilter
 from types_bot import Quote, ReentryState
@@ -60,7 +59,7 @@ class TradePermissionTuningTests(unittest.TestCase):
 
         self.assertTrue(decision.allow_trade)
         self.assertGreater(decision.expected_profit_pct, 0.0)
-        self.assertLess(decision.expected_profit_pct, EXECUTION_MIN_EXPECTED_PROFIT_PCT)
+        self.assertLess(decision.expected_profit_pct, 0.20)
 
     def test_trade_filter_softens_when_min_time_between_trades_not_met(self) -> None:
         trade_filter = TradeFilter(cycle_seconds=60.0)

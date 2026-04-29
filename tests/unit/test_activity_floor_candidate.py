@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -180,6 +181,7 @@ class ActivityFloorCandidateTests(unittest.TestCase):
 
     def test_paper_exit_sell_cap_preserves_target_inventory(self) -> None:
         runtime, _ = prepare_activity_runtime(start_usdc=250.0, start_eth=2.5)
+        runtime.adaptive_config = replace(runtime.adaptive_config, enabled=True)
 
         with patch("bot_runner.BOT_MODE", "paper"):
             capped = _cap_paper_activity_exit_sell_size(
@@ -194,6 +196,7 @@ class ActivityFloorCandidateTests(unittest.TestCase):
 
     def test_paper_exit_sell_cap_uses_force_size_when_above_target(self) -> None:
         runtime, _ = prepare_activity_runtime(start_usdc=200.0, start_eth=3.5)
+        runtime.adaptive_config = replace(runtime.adaptive_config, enabled=True)
         expected_cap = max(runtime.current_sizing.force_trade_size_usd, runtime.current_sizing.min_notional_usd)
 
         with patch("bot_runner.BOT_MODE", "paper"):
