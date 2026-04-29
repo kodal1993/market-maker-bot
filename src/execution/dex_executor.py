@@ -130,13 +130,13 @@ class DexExecutor:
             raise ValueError("amount_in must be positive")
 
         if is_buy:
-            token_in, token_out = self.weth, self.usdc
-            side = "BUY"
-            print(f"Simulating BUY {amount_in} ETH for USDC...")
-        else:
             token_in, token_out = self.usdc, self.weth
+            side = "BUY"
+            print(f"Simulating BUY ETH with USDC... amount={amount_in}")
+        else:
+            token_in, token_out = self.weth, self.usdc
             side = "SELL"
-            print(f"Simulating SELL {amount_in} USDC for ETH...")
+            print(f"Simulating SELL ETH for USDC... amount={amount_in}")
 
         amount_in_base = self._to_wei_amount(amount_in, token_in)
 
