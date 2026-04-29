@@ -114,6 +114,11 @@ def _market_gate_lines(summary: dict[str, object]) -> list[str]:
 
 
 def _pnl_lines(summary: dict[str, object]) -> list[str]:
+    win_loss = "n/a"
+    if summary.get("win_rate") is not None:
+        wins = summary.get("win_count", summary.get("winning_trades", "n/a"))
+        losses = summary.get("loss_count", summary.get("losing_trades", "n/a"))
+        win_loss = f"{wins}/{losses} ({_formatted(summary.get('win_rate', 0.0), 2)}%)"
     return [
         *_balance_pnl_trade_count_lines(summary),
         f"Start equity: {_money(summary.get('starting_equity', summary.get('start_equity', 0.0)))}",
@@ -124,6 +129,8 @@ def _pnl_lines(summary: dict[str, object]) -> list[str]:
         f"Avg trade PnL: {_money(summary.get('average_trade_pnl_usd', 0.0))}",
         f"Fees: {_money(summary.get('fees_paid_usd', 0.0))} | Gas est: {_money(summary.get('estimated_gas_cost_usd', 0.0))}",
         f"Slippage est: {_money(summary.get('estimated_slippage_cost_usd', 0.0))}",
+        f"Max drawdown: {_pct(summary.get('max_drawdown_pct', 0.0))}",
+        f"Win/Loss: {_plain(win_loss)}",
         f"Most common no-trade: {_plain(summary.get('most_common_no_trade_reason', 'n/a'))}",
         f"Regime: {_plain(summary.get('active_regime', summary.get('market_regime', 'n/a')))}",
         f"Inventory ratio: {_pct(_as_float(summary.get('inventory_ratio', 0.0)) * 100.0)}",
@@ -133,6 +140,14 @@ def _pnl_lines(summary: dict[str, object]) -> list[str]:
             f"annual proj {_pct(summary.get('projected_annualized_return_pct', 0.0))}"
         ),
     ]
+
+
+def _top_skip_reason(summary: dict[str, object]) -> str:
+    reasons = summary.get("hourly_skip_reasons", {})
+    if isinstance(reasons, dict) and reasons:
+        reason, count = max(reasons.items(), key=lambda item: item[1])
+        return f"{reason} ({count})"
+    return str(summary.get("most_common_no_trade_reason", "n/a"))
 
 
 def _drawdown_stage_label(stage: object) -> str:
@@ -376,12 +391,29 @@ class TelegramNotifier:
         return messages
 
     def _summary_text(self, runtime: BotRuntime, summary: dict[str, object]) -> str:
+        top_skip_reason = _top_skip_reason(summary)
         return "\n".join(
             [
                 "*Statusz*",
-                *_balance_pnl_trade_count_lines(summary),
-                *_market_gate_lines(summary),
-                *_sizing_lines(summary),
+                f"Final equity: {_money(summary.get('final_equity', 0.0))}",
+                f"PnL: {_money(summary.get('final_pnl', summary.get('total_pnl', 0.0)))}",
+                f"Total trade count: {_plain(summary.get('trade_count', 0))}",
+                f"Hourly trade count: {_plain(summary.get('hourly_trade_count', 0))}",
+                f"Hourly skip count: {_plain(summary.get('hourly_skip_count', 0))}",
+                f"Top skip reason: {_plain(top_skip_reason)}",
+                f"Current strategy mode: {_plain(summary.get('strategy_mode', summary.get('current_strategy_mode', 'n/a')))}",
+                f"Current adaptive mode: {_plain(summary.get('adaptive_mode', 'n/a'))}",
+                f"Current adaptive regime: {_plain(summary.get('adaptive_regime', 'n/a'))}",
+                f"Risk governor state: {_plain(summary.get('risk_governor_state', 'n/a'))}",
+                f"Drawdown stage: {_plain(summary.get('defensive_stage', summary.get('drawdown_guard_stage', 'n/a')))}",
+                f"Current volatility bucket: {_plain(summary.get('volatility_bucket', summary.get('edge_bucket', 'n/a')))}",
+                f"Inventory ratio: {_pct(_as_float(summary.get('inventory_ratio', 0.0)) * 100.0)}",
+                f"Last final action: {_plain(summary.get('last_final_action', 'n/a'))}",
+                f"Last block reason: {_plain(summary.get('blocked_reason', summary.get('last_decision_block_reason', 'n/a')))}",
+                f"Last trade reason: {_plain(summary.get('last_trade_reason', 'n/a'))}",
+                f"Last execution mode: {_plain(summary.get('last_execution_mode', 'n/a'))}",
+                f"MEV risk score: {_plain(_formatted(summary.get('last_mev_risk_score', 0.0), 2))}",
+                f"Slippage bps: {_bps(summary.get('last_slippage_bps', 0.0))}",
             ]
         )
 
@@ -390,6 +422,22 @@ class TelegramNotifier:
             [
                 "*PnL osszefoglalo*",
                 *_pnl_lines(summary),
+            ]
+        )
+
+    def _health_text(self, runtime: BotRuntime, summary: dict[str, object]) -> str:
+        return "\n".join(
+            [
+                "*Health*",
+                f"Bot mode: {_plain(summary.get('bot_mode', 'n/a'))}",
+                f"Profile: {_plain(summary.get('config_profile', 'n/a'))}",
+                f"Price source: {_plain(summary.get('price_source', summary.get('last_price_source', 'n/a')))}",
+                f"Uniswap V3 status: {_plain(summary.get('uniswap_v3_status', 'n/a'))}",
+                f"Startup config: {_plain(summary.get('startup_config_status', 'n/a'))}",
+                f"Runtime state: {_plain(summary.get('final_state', 'n/a'))}",
+                f"Loop status: {_plain(summary.get('loop_status', 'running'))}",
+                f"Last error: {_plain(summary.get('last_error', 'n/a'))}",
+                f"Daily trades: {_plain(summary.get('daily_trade_count', 0))}/{_plain(summary.get('max_trades_per_day', 'n/a'))}",
             ]
         )
 
@@ -415,8 +463,10 @@ class TelegramNotifier:
                     reply = self._summary_text(runtime, summary)
                 elif command == "/pnl":
                     reply = self._pnl_text(summary)
+                elif command == "/health":
+                    reply = self._health_text(runtime, summary)
                 else:
-                    reply = "*Parancsok*\n`/status`\n`/pnl`"
+                    reply = "*Parancsok*\n`/status`\n`/pnl`\n`/health`"
 
             if self.send_message(reply, markdown=False):
                 sent_count += 1

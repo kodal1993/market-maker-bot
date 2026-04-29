@@ -54,6 +54,7 @@ def build_summary_stub() -> dict[str, float]:
         "final_pnl": 34.25,
         "current_drawdown_pct": 0.031,
         "drawdown_guard_stage": "size_reduce",
+        "defensive_stage": "size_reduce",
         "total_pnl": 34.25,
         "equity": 1034.25,
         "trade_size_usd": 50.0,
@@ -90,6 +91,30 @@ def build_summary_stub() -> dict[str, float]:
             "avg_loss": -3.25,
             "avg_loss_abs_usd": 3.25,
         },
+        "hourly_trade_count": 2,
+        "hourly_skip_count": 5,
+        "hourly_skip_reasons": {"risk_cap": 3, "spread_too_wide": 2},
+        "strategy_mode": "RANGE_MAKER",
+        "adaptive_mode": "balanced",
+        "adaptive_regime": "RANGE",
+        "risk_governor_state": "normal",
+        "edge_bucket": "mid_vol",
+        "inventory_ratio": 0.42,
+        "last_final_action": "buy",
+        "last_trade_reason": "quoted_buy",
+        "last_execution_mode": "private_tx",
+        "last_mev_risk_score": 27.5,
+        "last_slippage_bps": 3.4,
+        "bot_mode": "paper",
+        "config_profile": "aggressive_base_paper",
+        "price_source": "uniswap_v3_pool_monitor",
+        "uniswap_v3_status": "active",
+        "startup_config_status": "ok",
+        "final_state": "ACCUMULATING",
+        "loop_status": "running",
+        "last_error": "",
+        "daily_trade_count": 7,
+        "max_trades_per_day": 48,
     }
 
 
@@ -170,12 +195,12 @@ class TelegramNotifierTests(unittest.TestCase):
         self.assertIn("TELEGRAM_CHAT_ID=987", env_path.read_text(encoding="utf-8"))
         self.assertIn("Statusz", str(sent_payloads[0]["text"]))
         self.assertNotIn("parse_mode", sent_payloads[0])
-        self.assertIn("Egyenleg", str(sent_payloads[0]["text"]))
-        self.assertIn("Trade-ek szama", str(sent_payloads[0]["text"]))
-        self.assertIn("Trade meret", str(sent_payloads[0]["text"]))
-        self.assertIn("Max trade meret", str(sent_payloads[0]["text"]))
-        self.assertIn("Piaci rezsim", str(sent_payloads[0]["text"]))
-        self.assertIn("Edge pontszam", str(sent_payloads[0]["text"]))
+        self.assertIn("Final equity", str(sent_payloads[0]["text"]))
+        self.assertIn("Total trade count", str(sent_payloads[0]["text"]))
+        self.assertIn("Current strategy mode", str(sent_payloads[0]["text"]))
+        self.assertIn("Current adaptive mode", str(sent_payloads[0]["text"]))
+        self.assertIn("Risk governor state", str(sent_payloads[0]["text"]))
+        self.assertIn("Hourly skip count", str(sent_payloads[0]["text"]))
         self.assertNotIn("Realizalt", str(sent_payloads[0]["text"]))
 
         self.assertEqual(notifier.handle_commands(runtime, lambda _: summary), 1)
@@ -183,7 +208,33 @@ class TelegramNotifierTests(unittest.TestCase):
         self.assertNotIn("parse_mode", sent_payloads[1])
         self.assertIn("Nem realizalt", str(sent_payloads[1]["text"]))
         self.assertIn("Realizalt", str(sent_payloads[1]["text"]))
+        self.assertIn("Win/Loss", str(sent_payloads[1]["text"]))
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_health_command_works(self) -> None:
+        runtime = build_runtime_stub()
+        summary = build_summary_stub()
+        sent_payloads: list[dict[str, object]] = []
+
+        def api_caller(method: str, payload: dict[str, object]) -> dict[str, object]:
+            if method == "getUpdates":
+                return {"ok": True, "result": [{"update_id": 1, "message": {"chat": {"id": "987"}, "text": "/health"}}]}
+            if method == "sendMessage":
+                sent_payloads.append(payload)
+                return {"ok": True, "result": {"message_id": 1}}
+            return {"ok": True, "result": []}
+
+        notifier = TelegramNotifier(enabled=True, bot_token="token", chat_id="987", poll_commands=True, api_caller=api_caller)
+        self.assertEqual(notifier.handle_commands(runtime, lambda _: summary), 1)
+        text = str(sent_payloads[0]["text"])
+        self.assertIn("Health", text)
+        self.assertIn("Uniswap V3 status", text)
+        self.assertIn("Daily trades", text)
+
+    def test_telegram_disabled_mode_does_not_crash(self) -> None:
+        notifier = TelegramNotifier(enabled=False, bot_token="", chat_id="", poll_commands=True)
+        self.assertEqual(notifier.handle_commands(None, lambda _: {}), 0)
+        self.assertFalse(notifier.send_message("hello", markdown=False))
 
     def test_daily_report_sends_once_per_day(self) -> None:
         runtime = build_runtime_stub()
