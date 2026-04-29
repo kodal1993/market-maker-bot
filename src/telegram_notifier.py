@@ -414,6 +414,10 @@ class TelegramNotifier:
                 f"Last execution mode: {_plain(summary.get('last_execution_mode', 'n/a'))}",
                 f"MEV risk score: {_plain(_formatted(summary.get('last_mev_risk_score', 0.0), 2))}",
                 f"Slippage bps: {_bps(summary.get('last_slippage_bps', 0.0))}",
+                f"Gas cost usd: {_money(summary.get('last_gas_cost_usd', 0.0), decimals=4)}",
+                f"Expected profit usd: {_money(summary.get('last_expected_profit_usd', 0.0), decimals=4)}",
+                f"Gas/profit ratio: {_plain(_formatted(summary.get('last_gas_profit_ratio', 0.0), 4))}",
+                f"Max gas/profit ratio: {_plain(_formatted(summary.get('max_gas_to_profit_ratio', 0.0), 4))}",
             ]
         )
 

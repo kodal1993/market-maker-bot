@@ -52,6 +52,7 @@ from config import (
     MAX_CONSECUTIVE_LOSSES_BEFORE_PAUSE,
     MAX_DAILY_LOSS_USD,
     MAX_EXPOSURE_USD,
+    MAX_GAS_TO_PROFIT_RATIO,
     MAX_INVENTORY_USD,
     MAX_TRADE_SIZE_USD,
     MAX_TREND_CHASE_BPS,
@@ -3967,8 +3968,8 @@ def _log_trade_intent(runtime: BotRuntime, cycle_index: int) -> None:
     logging_helpers.log_trade_intent(runtime, cycle_index)
 
 
-def _kill_switch_allows_continue(pnl_usd: float, log_progress: bool) -> bool:
-    return logging_helpers.kill_switch_allows_continue(pnl_usd, log_progress)
+def _kill_switch_allows_continue(runtime: BotRuntime, pnl_usd: float, log_progress: bool) -> bool:
+    return logging_helpers.kill_switch_allows_continue(runtime, pnl_usd, log_progress)
 
 
 def _append_equity_row(
@@ -5490,7 +5491,7 @@ def _process_price_tick_with_decision_engine(
             _record_cycle_summary(runtime, cycle_index=cycle_index, spread_bps=spread, block_reason=no_trade_reason)
             _maybe_log_freeze_block_summary(runtime, cycle_index)
             _append_equity_row(**equity_row_kwargs)
-            return _kill_switch_allows_continue(pnl_usd, log_progress)
+            return _kill_switch_allows_continue(runtime, pnl_usd, log_progress)
 
     fill = None
     if decision.action in {"BUY", "SELL"}:
@@ -5932,7 +5933,7 @@ def _process_price_tick_with_decision_engine(
     _append_equity_row(**equity_row_kwargs)
     if post_cycle_limit_decision.stop_trading:
         return False
-    return _kill_switch_allows_continue(pnl_usd, log_progress)
+    return _kill_switch_allows_continue(runtime, pnl_usd, log_progress)
 
 
 def process_price_tick(
@@ -6249,7 +6250,7 @@ def process_price_tick(
         _maybe_log_freeze_block_summary(runtime, cycle_index)
         _append_equity_row(**equity_row_kwargs)
 
-        return _kill_switch_allows_continue(pnl_usd, log_progress)
+        return _kill_switch_allows_continue(runtime, pnl_usd, log_progress)
 
     quote = build_quotes(
         mid=strategy_mid,
@@ -7319,7 +7320,7 @@ def process_price_tick(
     _append_equity_row(**equity_row_kwargs)
     if post_cycle_limit_decision.stop_trading:
         return False
-    return _kill_switch_allows_continue(pnl_usd, log_progress)
+    return _kill_switch_allows_continue(runtime, pnl_usd, log_progress)
 
 
 def build_summary(runtime: BotRuntime) -> dict:
@@ -7351,7 +7352,9 @@ def build_summary(runtime: BotRuntime) -> dict:
     total_fees = float(runtime.portfolio.fees_paid_usd)
     total_gas = float(runtime.total_estimated_gas_cost_usd)
     total_slippage_cost = float(runtime.total_estimated_slippage_cost_usd)
-    net_pnl = gross_pnl - total_fees - total_gas - total_slippage_cost
+    realized_pnl = float(performance_summary.get("realized_pnl_usd", performance_summary.get("realized_pnl", 0.0)) or 0.0)
+    no_realized_trades = trade_count == 0 and abs(realized_pnl) < 1e-9
+    net_pnl = gross_pnl if no_realized_trades else (gross_pnl - total_fees - total_gas - total_slippage_cost)
     days_running = max(total_cycles * runtime.cycle_seconds / 86400.0, 0.0)
     current_return_pct = (net_pnl / starting_equity) * 100.0 if starting_equity > 0 else 0.0
     projected_90d_return_pct = (current_return_pct / days_running) * 90.0 if days_running > 0 else 0.0
@@ -7568,6 +7571,10 @@ def build_summary(runtime: BotRuntime) -> dict:
         "last_mev_risk_score": runtime.last_execution_analytics.mev_risk_score,
         "last_slippage_bps": runtime.last_execution_analytics.realized_slippage_bps,
         "last_final_action": runtime.last_execution_analytics.execution_mode or runtime.last_execution_type or "n/a",
+        "last_gas_cost_usd": float(runtime.last_execution_metadata.get("estimated_gas_cost_usd", 0.0) or 0.0),
+        "last_expected_profit_usd": float(runtime.last_execution_metadata.get("expected_profit_usd", 0.0) or 0.0),
+        "last_gas_profit_ratio": float(runtime.last_execution_metadata.get("gas_to_profit_ratio", 0.0) or 0.0),
+        "max_gas_to_profit_ratio": MAX_GAS_TO_PROFIT_RATIO,
         "bot_mode": BOT_MODE,
         "max_trades_per_day": MAX_TRADES_PER_DAY,
         "loop_status": "running",

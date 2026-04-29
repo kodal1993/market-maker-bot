@@ -23,6 +23,8 @@ from config import (
     EQUITY_CSV,
     PRICE_BOOTSTRAP_ROWS,
     PRICE_HISTORY_MAX_AGE_SECONDS,
+    BOT_MODE,
+    RESET_PAPER_STATE_ON_START,
     RUNTIME_STATE_ENABLED,
     RUNTIME_STATE_PATH,
     SQLITE_LOG_PATH,
@@ -110,7 +112,8 @@ async def _main_async():
             )
 
         runtime = None
-        persisted_state = load_state(RUNTIME_STATE_PATH) if RUNTIME_STATE_ENABLED else {}
+        should_restore_state = RUNTIME_STATE_ENABLED and not (BOT_MODE == "paper" and RESET_PAPER_STATE_ON_START)
+        persisted_state = load_state(RUNTIME_STATE_PATH) if should_restore_state else {}
         dex = DexClient()
         pool_monitor = None
         dex_executor = None
@@ -178,7 +181,18 @@ async def _main_async():
                             )
                             eth_cost_basis = portfolio_state.get("eth_cost_basis")
                             runtime.portfolio.eth_cost_basis = None if eth_cost_basis is None else float(eth_cost_basis)
+                        restored_equity = runtime.portfolio.total_equity_usd(mid) if mid > 0 else runtime.portfolio.usdc
+                        runtime.start_usdc = runtime.portfolio.usdc
+                        runtime.start_eth = runtime.portfolio.eth
+                        runtime.performance.start_usdc = runtime.portfolio.usdc
+                        runtime.performance.start_eth = runtime.portfolio.eth
+                        runtime.performance.start_price = mid if mid > 0 else runtime.performance.start_price
+                        runtime.performance.start_value = restored_equity
+                        runtime.start_eq = restored_equity
+                        runtime.equity_peak = restored_equity
                         log(f"Runtime state restored from {RUNTIME_STATE_PATH}")
+                elif RUNTIME_STATE_ENABLED and BOT_MODE == "paper" and RESET_PAPER_STATE_ON_START:
+                    log("Runtime state restore skipped | RESET_PAPER_STATE_ON_START=true | bot_mode=paper")
                     log(
                         f"start portfolio resolved | ref {mid:.2f} | usdc {start_usdc:.2f} | "
                         f"eth {start_eth:.8f}"
