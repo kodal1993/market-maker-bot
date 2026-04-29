@@ -12,6 +12,9 @@ class Portfolio:
     def total_equity_usd(self, mid_price: float) -> float:
         return self.usdc + (self.eth * mid_price)
 
+    def inventory_value_usd(self, mid_price: float) -> float:
+        return self.inventory_usd(mid_price)
+
     def ensure_cost_basis(self, reference_price: float) -> None:
         if self.eth > 0 and self.eth_cost_basis is None:
             self.eth_cost_basis = reference_price

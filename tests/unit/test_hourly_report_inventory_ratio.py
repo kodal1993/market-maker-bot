@@ -4,10 +4,10 @@ from src.bot_runner import _maybe_log_hourly_report
 
 
 class _Portfolio:
-    def inventory_value_usd(self, _mid: float) -> float:
+    def inventory_usd(self, _mid: float) -> float:
         return 25.0
 
-    def equity(self, _mid: float) -> float:
+    def total_equity_usd(self, _mid: float) -> float:
         return 100.0
 
 
