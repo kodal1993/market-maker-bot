@@ -232,6 +232,26 @@ class TelegramNotifierTests(unittest.TestCase):
         self.assertIn("Uniswap V3 status", text)
         self.assertIn("Daily trades", text)
 
+    def test_status_command_handles_missing_volatility_fields(self) -> None:
+        runtime = build_runtime_stub()
+        summary = build_summary_stub()
+        summary.pop("volatility_bucket", None)
+        summary.pop("edge_bucket", None)
+        sent_payloads: list[dict[str, object]] = []
+
+        def api_caller(method: str, payload: dict[str, object]) -> dict[str, object]:
+            if method == "getUpdates":
+                return {"ok": True, "result": [{"update_id": 1, "message": {"chat": {"id": "987"}, "text": "/status"}}]}
+            if method == "sendMessage":
+                sent_payloads.append(payload)
+                return {"ok": True, "result": {"message_id": 1}}
+            return {"ok": True, "result": []}
+
+        notifier = TelegramNotifier(enabled=True, bot_token="token", chat_id="987", poll_commands=True, api_caller=api_caller)
+        self.assertEqual(notifier.handle_commands(runtime, lambda _: summary), 1)
+        text = str(sent_payloads[0]["text"])
+        self.assertIn("Current volatility bucket: n/a", text)
+
     def test_telegram_disabled_mode_does_not_crash(self) -> None:
         notifier = TelegramNotifier(enabled=False, bot_token="", chat_id="", poll_commands=True)
         self.assertEqual(notifier.handle_commands(None, lambda _: {}), 0)

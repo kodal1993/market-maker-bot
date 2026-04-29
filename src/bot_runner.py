@@ -2002,6 +2002,9 @@ def _maybe_log_hourly_report(runtime: BotRuntime, cycle_index: int) -> None:
         1e-9,
     )
 
+    volatility_value = getattr(getattr(runtime, "intelligence", None), "volatility", None)
+    volatility_display = f"{float(volatility_value):.6f}" if isinstance(volatility_value, (int, float)) else "n/a"
+
     log(
         "Hourly summary | Trades this hour: "
         f"{runtime.hourly_trade_count} | "
@@ -2010,7 +2013,7 @@ def _maybe_log_hourly_report(runtime: BotRuntime, cycle_index: int) -> None:
         f"Avg expected profit/attempt: {avg_expected_profit:.6f} USD | "
         f"Inventory skew: {inventory_ratio*100:.2f}% | "
         f"Regime: {runtime.current_strategy_mode} | "
-        f"Volatility: {runtime.current_volatility_bucket} ({runtime.intelligence.volatility:.6f}) | "
+        f"Volatility: {runtime.current_volatility_bucket} ({volatility_display}) | "
         f"Total trades: {runtime.total_trade_count} | "
         f"Total skips: {runtime.total_skip_count} | "
         f"Top skip reasons (all-time): {total_reasons_text}"
