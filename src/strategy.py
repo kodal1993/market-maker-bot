@@ -318,6 +318,61 @@ def build_quotes(
     )
 
 
+
+
+def calculate_spread_and_size(
+    volatility: float,
+    pool_liquidity_usd: float,
+    equity_usd: float,
+    *,
+    paper_mode: bool = True,
+    max_paper_trade_pct: float = 0.04,
+) -> tuple[float, float]:
+    """Calculate adaptive quote spread (bps) and position size (USD).
+
+    Spread bands by volatility regime:
+    - low volatility: 0.08% - 0.18%  (8-18 bps)
+    - medium volatility: 0.20% - 0.35% (20-35 bps)
+    - high volatility: 0.40%+ (>=40 bps)
+
+    Position sizing is linked to both pool liquidity and account equity.
+    In paper mode the position is capped to 2-4% of equity per trade.
+    """
+    normalized_volatility = max(volatility, 0.0)
+    high_threshold = max(HIGH_VOL_THRESHOLD, 1e-9)
+    low_threshold = max(high_threshold * LOW_VOL_THRESHOLD_MULTIPLIER, 0.0)
+
+    if low_threshold > 0 and normalized_volatility <= low_threshold:
+        ratio = clamp(normalized_volatility / low_threshold, 0.0, 1.0)
+        spread_bps = 8.0 + (ratio * 10.0)
+    elif normalized_volatility < high_threshold:
+        width = max(high_threshold - low_threshold, 1e-9)
+        ratio = clamp((normalized_volatility - low_threshold) / width, 0.0, 1.0)
+        spread_bps = 20.0 + (ratio * 15.0)
+    else:
+        ratio = min((normalized_volatility - high_threshold) / high_threshold, 3.0)
+        spread_bps = 40.0 + (ratio * 12.0)
+
+    spread_bps = max(spread_bps, 8.0)
+
+    safe_equity_usd = max(equity_usd, 0.0)
+    safe_pool_liquidity_usd = max(pool_liquidity_usd, 0.0)
+
+    liquidity_cap_usd = safe_pool_liquidity_usd * 0.0025
+    regime_equity_pct = 0.02 if spread_bps <= 18.0 else (0.03 if spread_bps <= 35.0 else 0.04)
+
+    if paper_mode:
+        equity_cap_pct = clamp(max_paper_trade_pct, 0.02, 0.04)
+        equity_cap_usd = safe_equity_usd * min(regime_equity_pct, equity_cap_pct)
+    else:
+        equity_cap_usd = safe_equity_usd * regime_equity_pct
+
+    size_usd = min(equity_cap_usd, liquidity_cap_usd) if liquidity_cap_usd > 0 else equity_cap_usd
+    size_usd = max(size_usd, 0.0)
+
+    return spread_bps, size_usd
+
+
 def choose_trade_size_usd(
     mode: str,
     base_size: float,
